@@ -1,6 +1,6 @@
 # WARP 代理池 - Docker 镜像构建与推送
 # 触发：push 到 main 或 master 分支
-# 效果：构建镜像并同时打 zhoushu44/warp-pool:2.0 与 zhoushu44/warp-pool:latest 两个标签推送到 Docker Hub
+# 效果：构建镜像并同时打 zhoushu1/warp-pool:2.0 与 zhoushu1/warp-pool:latest 两个标签推送到 Docker Hub
 # 前置：仓库 Settings → Secrets and variables → Actions 配置两个 Secret：
 #   DOCKER_HUB_USERNAME = Docker Hub 用户名
 #   DOCKER_HUB_TOKEN    = Docker Hub Access Token（需已创建，勾选 Read/Write/Delete）
@@ -38,6 +38,6 @@ jobs:
           tags: |
             ${{ secrets.DOCKER_HUB_USERNAME }}/warp-pool:2.0
             ${{ secrets.DOCKER_HUB_USERNAME }}/warp-pool:latest
-          # 利用 GitHub Actions 缓存加速重复构建
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # 注意：曾出现 gha 缓存命中旧 COPY 层导致推送镜像不含最新代码，
+          # 因此禁用构建缓存，每次强制全量重建（构建仅约 1-2 分钟，可接受）
+          no-cache: true
