@@ -444,7 +444,7 @@ async function checkOpenAIAccess(port) {
 const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
 const ipRiskCache = new Map(); // ip -> { score, risk, ts }
 
-async function checkIpRiskScore(ip) {
+async function checkIpRiskScore(ip, port) {
   if (!ip || !config.ip_risk_check) return null;
 
   // 缓存命中（同IP在TTL内不重复请求）
@@ -457,8 +457,10 @@ async function checkIpRiskScore(ip) {
   try {
     const t0 = Date.now();
     const url = `${config.ip_risk_check_url}${ip}`;
+    // 走实例出口检测，与业务出口一致（服务器直连易被 scamalytics 反爬拦截）
+    const proxy = port ? `--socks5-hostname 127.0.0.1:${port}` : '';
     const html = await runCmdFast(
-      `curl -s --max-time 12 -A "${BROWSER_UA}" ${url}`, 15000
+      `curl -s --max-time 12 -A "${BROWSER_UA}" ${proxy} ${url}`, 15000
     ).catch(() => '');
 
     const scoreMatch = html.match(/Fraud Score:\s*(\d+)/);
@@ -586,7 +588,7 @@ async function checkInstanceHealth(poolKey) {
   // ---- L1.5: 出口IP风控值检测 ----
   if (config.ip_risk_check) {
     logger.debug('HEALTH_CHECK', `${tag} L1.5阶段: 检测出口IP风控值...`);
-    const risk = await checkIpRiskScore(ip);
+    const risk = await checkIpRiskScore(ip, entry.host_port);
     entry.ip_risk = risk ? risk.score : null;
     entry.ip_risk_label = risk ? getRiskLabel(risk.risk) : null;
 
@@ -764,7 +766,7 @@ async function rotateInstanceIP(poolKey) {
       // 风控验收（warp-sh式"刷完验收"）：新IP风控值高则继续换，最后一次尝试时接受
       let newRisk = null;
       if (config.ip_risk_check && !isDuplicate) {
-        newRisk = await checkIpRiskScore(newIP);
+        newRisk = await checkIpRiskScore(newIP, entry.host_port);
         if (newRisk && newRisk.score >= config.ip_risk_threshold) {
           if (attempt < config.max_rebuild_attempts - 1) {
             logger.warn('ROTATE', `${tag} 第${attemptNum}次: 新IP ${newIP} 风控值${newRisk.score}(${getRiskLabel(newRisk.risk)}) ≥ ${config.ip_risk_threshold}，验收不通过，继续重试 (${Date.now() - attemptT0}ms)`);
@@ -1193,7 +1195,7 @@ app.get('/api/check', async (req, res) => {
       singboxVersion = await runCmdFast(`${SINGBOX_BIN} version 2>&1 | head -1`, 5000);
     } catch (e) { }
     try {
-      wgcfVersion = await runCmdFast(`${WGCF_BIN} --version 2>&1 | head -1`, 5000);
+      wgcfVersion = await runCmdFast(`${WGCF_BIN} version 2>&1 | head -1`, 5000);
     } catch (e) { }
     success(res, {
       singbox: singboxVersion || (singboxExists ? 'found' : 'not found'),

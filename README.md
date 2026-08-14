@@ -308,7 +308,7 @@ WARP 对端（endpoint）就是 sing-box WireGuard 配置中 `peers[].address` �
 出口 IP 组合数 ≈ 账号数 × 可用 endpoint 数
 ```
 
-系统内置 5 个实测可用的 endpoint：
+系统内置 4 个实测可用的 endpoint：
 
 | endpoint 地址 | 端口 | 说明 |
 |---|---:|---|
@@ -316,16 +316,15 @@ WARP 对端（endpoint）就是 sing-box WireGuard 配置中 `peers[].address` �
 | `188.114.97.1` | 2408 | 洛杉矶节点 |
 | `188.114.96.2` | 2408 | 洛杉矶节点 |
 | `188.114.96.3` | 2408 | 洛杉矶节点 |
-| `162.159.192.1` | 2408 | 备用节点 |
 
 **工作机制：**
 
-1. **启动探针**：服务启动时 `probeEndpoints()` 对 5 个候选端点做 UDP 连通性探测，剔除不可用项，生成 `availableEndpoints` 列表。
-2. **新建实例分配**：`getEndpointForInstance(idx) = availableEndpoints[idx % 列表长度]`。相邻实例分配不同 endpoint，出口 IP 更分散。20 实例 × 5 端点 = 每端点恰好 4 个实例。
+1. **启动探针**：服务启动时 `probeEndpoints()` 对 4 个候选端点做 UDP 连通性探测，剔除不可用项，生成 `availableEndpoints` 列表。
+2. **新建实例分配**：`getEndpointForInstance(idx) = availableEndpoints[idx % 列表长度]`。相邻实例分配不同 endpoint，出口 IP 更分散。20 实例 × 4 端点 = 每端点恰好 5 个实例。
 3. **换 IP 时端点轮换**：`nextEndpointForInstance(idx) = availableEndpoints[(idx+1) % 长度]`。自动换 IP 时轮换到下一个 endpoint 再注册新账号，避免同一 endpoint 换 IP 后出口仍相同。
 4. **元数据记录**：每个实例的 `meta.json` 记录 `endpoint` 字段，`/api/containers` 返回每实例的 endpoint 与 ipv6，端点分配可观测。
 
-> 注意：部分 endpoint（如 `162.159.193.1`）虽能完成 UDP 握手，但实际无法承载流量（出口 IP 检测超时），已被从候选列表剔除。若某个实例频繁出现"隧道已建立但无出口 IP"，大概率是该 endpoint 或该账号的瞬时故障，重建实例即可恢复。
+> 注意：部分 endpoint（如 `162.159.192.1`、`162.159.193.1`）虽能完成 UDP 握手，但实际无法承载流量（出口 IP 检测全部超时），已从候选列表剔除。若某个实例频繁出现"隧道已建立但无出口 IP"，大概率是该 endpoint 或该账号的瞬时故障——实例会走 RECOVERY 复用失败自动清理进程并重新注册（见下方部署章节），无需人工干预。
 
 ### 账号注册机制与注册 API 解析
 
@@ -549,9 +548,14 @@ docker compose ps            # 查看状态
 docker logs -f warp          # 查看日志
 ```
 
-**发布新版本**：改代码 → `git push` 到 `main`/`master` → GitHub Actions 自动构建推送 → 服务器 `docker compose pull && docker compose up -d` 升级，全程不碰本地构建。
+**发布新版本**：改代码 → `git push` 到 `main`/`master` → GitHub Actions 自动构建推送（`2.0` + `latest` 双标签）→ 服务器 `docker compose pull && docker compose up -d` 升级，全程不碰本地构建。
 
-容器启动后 RECOVERY 机制自动扫描 `/root/warp-instances` 重建缺失实例、恢复已有实例入池，无需初始化脚本。
+容器启动后 RECOVERY 机制自动扫描 `/root/warp-instances`：
+- **复用已有配置启动**：实例目录已有 `singbox.json` 时直接复用（不重新注册账号），每个实例约 9 秒恢复（8 秒等待隧道建立 + 出口检测），秒级恢复 20/20。
+- **复用失败自动降级**：出口 IP 检测失败（配置损坏 / endpoint 不可达）时自动清理 sing-box 进程、移出代理池，转为重新注册 WARP 账号，无需人工干预。
+- 重建缺失实例、恢复已有实例入池，无需初始化脚本。
+
+> ⚠️ 服务器若配置了 Docker registry mirror（如 `mirror.gcr.io`），`docker compose pull` 可能长期拉到缓存的旧镜像。若新版本不生效，先检查 `/etc/docker/daemon.json` 移除 `registry-mirrors` 再 `systemctl restart docker`。
 
 > 首次使用前需在 GitHub 仓库 **Settings → Secrets and variables → Actions** 配置：
 > - `DOCKER_HUB_USERNAME`：Docker Hub 用户名
