@@ -1998,13 +1998,25 @@ async function adjustResidentCount() {
 
   // 创建缺失的实例
   for (let i = 0; i < config.resident_count; i++) {
-    if (!runningIndices.has(i)) {
-      logger.info('RECOVERY', `创建实例 warp-${i}`);
+    if (runningIndices.has(i)) continue;
+    const singboxPath = path.join(getInstanceDir(i), 'singbox.json');
+
+    // 已有配置 → 复用启动（服务重启/容器重建后不重新注册账号，秒级恢复）
+    if (fs.existsSync(singboxPath)) {
       try {
-        await createWarpInstance(i);
+        const ok = await reuseExistingInstance(i);
+        if (ok) continue;
+        logger.warn('RECOVERY', `warp-${i} 复用配置启动失败，转为重新注册`);
       } catch (e) {
-        logger.error('RECOVERY', `创建实例 warp-${i} 失败: ${e.message}`);
+        logger.error('RECOVERY', `warp-${i} 复用配置异常: ${e.message}`);
       }
+    }
+
+    logger.info('RECOVERY', `创建实例 warp-${i}`);
+    try {
+      await createWarpInstance(i);
+    } catch (e) {
+      logger.error('RECOVERY', `创建实例 warp-${i} 失败: ${e.message}`);
     }
   }
 
@@ -2019,6 +2031,58 @@ async function adjustResidentCount() {
       }
     }
   }
+}
+
+// 复用已有 singbox.json 配置启动实例（不重新注册账号，供服务重启/容器重建后快速恢复）
+async function reuseExistingInstance(instanceIndex) {
+  const name = getInstanceName(instanceIndex);
+  const port = getInstancePort(instanceIndex);
+  const dir = getInstanceDir(instanceIndex);
+  const configPath = path.join(dir, 'singbox.json');
+  const metaPath = path.join(dir, 'meta.json');
+
+  logger.info('RECOVERY', `复用已有配置启动 ${name} (端口:${port})`);
+
+  // 清理可能残留的旧进程
+  let oldMeta = {};
+  try {
+    if (fs.existsSync(metaPath)) oldMeta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+  } catch (e) { }
+  if (oldMeta.pid) stopSingbox(oldMeta.pid);
+
+  // 启动 sing-box
+  const pid = startSingbox(instanceIndex, configPath);
+  logger.info('INSTANCE', `[${name}] sing-box已启动 (PID:${pid})`);
+
+  // 等待隧道建立
+  await sleep(8000);
+
+  // 检测出口 IP（v6 优先重试）
+  const poolKey = `${instanceIndex}`;
+  const ip = await checkExitIP(port);
+
+  // L2 检测
+  const httpCode = await checkOpenAIAccess(port);
+  const isHealthy = (httpCode === 200 || httpCode === 302 || httpCode === 403);
+
+  // 更新元数据
+  const meta = { ...oldMeta, pid, port, ip, endpoint: oldMeta.endpoint || null, updatedAt: Date.now() };
+  fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+
+  pool.set(poolKey, {
+    container: name,
+    instance_index: instanceIndex,
+    host_port: port,
+    ip,
+    health: ip ? (isHealthy ? 'healthy' : 'unhealthy') : 'unknown',
+    status: 'available',
+    cf_check_count: 1,
+    cf_403_count: httpCode === 403 ? 1 : 0,
+    cf_last_code: httpCode,
+  });
+
+  logger.info('RECOVERY', `[${name}] 复用启动完成, IP:${ip} health=${ip ? (isHealthy ? 'healthy' : 'unhealthy') : 'unknown'} CF:${httpCode}`);
+  return !!ip;
 }
 
 // ==================== 优雅关闭 ====================
