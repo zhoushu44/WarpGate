@@ -889,7 +889,7 @@
         if (c.pool_status === 'stopped') {
           actions += `<button class="btn-sm btn-sm-start" onclick="startContainer('${c.container}')">启动</button>`;
         } else if (c.pool_status !== 'stopped' && c.instance_index >= 0) {
-          actions += `<button class="btn-sm btn-sm-rotate" onclick="rotateOne('${c.container}', ${c.instance_index})">换IP</button>`;
+          actions += `<button class="btn-sm btn-sm-rotate" onclick="rotateOne('${c.container}', ${c.instance_index}, '${c.pool_key || ''}')">换IP</button>`;
           actions += `<button class="btn-sm btn-sm-stop" onclick="stopContainer('${c.container}')">停止</button>`;
         }
         actions += `<button class="btn-sm btn-sm-delete" onclick="deleteOne('${c.container}')">删除</button>`;
@@ -1121,17 +1121,15 @@
     }
 
     // ==================== 单个操作 ====================
-    async function rotateOne(container, instanceIndex) {
-      // 通过 pool_key 换单个实例的IP
-      // 从容器名解析容器索引
-      const m = container.match(/warp-(\d+)/);
-      if (!m) return showToast('无法解析容器索引', 'error');
-      const poolKey = `${parseInt(m[1])}:${instanceIndex}`;
+    async function rotateOne(container, instanceIndex, poolKey) {
+      // 通过 pool_key 换单个实例的IP（pool key 即实例索引，如 "0"）
+      const key = (poolKey && poolKey !== '') ? poolKey : `${instanceIndex}`;
+      if (key === '') return showToast('无法解析实例索引', 'error');
 
       try {
         const resp = await api('/api/pool/rotate', {
           method: 'POST',
-          body: JSON.stringify({ pool_key: poolKey }),
+          body: JSON.stringify({ pool_key: key }),
         });
         if (!resp.success) return showToast(resp.error?.message || '换IP失败', 'error');
 

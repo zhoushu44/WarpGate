@@ -1235,6 +1235,7 @@ app.get('/api/containers', async (req, res) => {
         instances.push({
           container: inst.name,
           instance_index: poolEntry.instance_index,
+          pool_key: poolKey,
           host_port: poolEntry.host_port,
           ip: poolEntry.ip,
           endpoint: inst.endpoint,
