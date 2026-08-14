@@ -459,9 +459,15 @@ async function checkIpRiskScore(ip, port) {
     const url = `${config.ip_risk_check_url}${ip}`;
     // 走实例出口检测，与业务出口一致（服务器直连易被 scamalytics 反爬拦截）
     const proxy = port ? `--socks5-hostname 127.0.0.1:${port}` : '';
-    const html = await runCmdFast(
-      `curl -s --max-time 12 -A "${BROWSER_UA}" ${proxy} ${url}`, 15000
-    ).catch(() => '');
+    // scamalytics 对高频请求间歇返回验证页，解析失败时重试 1 次
+    let html = '';
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      html = await runCmdFast(
+        `curl -s --max-time 12 -A "${BROWSER_UA}" ${proxy} ${url}`, 15000
+      ).catch(() => '');
+      if (/Fraud Score:\s*\d+/.test(html)) break;
+      if (attempt === 1) await sleep(3000);
+    }
 
     const scoreMatch = html.match(/Fraud Score:\s*(\d+)/);
     const riskMatch = html.match(/"risk"\s*:\s*"(\w+)"/);
@@ -1194,9 +1200,8 @@ app.get('/api/check', async (req, res) => {
     try {
       singboxVersion = await runCmdFast(`${SINGBOX_BIN} version 2>&1 | head -1`, 5000);
     } catch (e) { }
-    try {
-      wgcfVersion = await runCmdFast(`${WGCF_BIN} version 2>&1 | head -1`, 5000);
-    } catch (e) { }
+    // wgcf 2.2.32 无 version 子命令（--version / version 均报错），仅确认二进制存在
+    wgcfVersion = '';
     success(res, {
       singbox: singboxVersion || (singboxExists ? 'found' : 'not found'),
       wgcf: wgcfVersion || (wgcfExists ? 'found' : 'not found'),
