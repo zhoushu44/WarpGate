@@ -273,7 +273,7 @@
     .badge-in-use { background: rgba(251,191,36,0.15); color: var(--warning); }
     .badge-stopped { background: rgba(239,68,68,0.15); color: var(--danger); }
 
-    .ip-cell { font-family: 'Consolas', monospace; }
+    .ip-cell { font-family: 'Consolas', monospace; white-space: nowrap; }
 
     .row-actions { display: flex; gap: 4px; }
 
@@ -765,7 +765,7 @@
         if (data.success) {
           appConfig = data.data;
           if (document.getElementById('instanceCount') && !document.activeElement.matches('#instanceCount')) {
-            document.getElementById('instanceCount').value = appConfig.warp_instances_per_container;
+            document.getElementById('instanceCount').value = appConfig.resident_count;
           }
           if (document.getElementById('stickyMinutes') && !document.activeElement.matches('#stickyMinutes')) {
             document.getElementById('stickyMinutes').value = appConfig.sticky_minutes;
@@ -778,9 +778,11 @@
             document.getElementById('cf403Threshold').value = appConfig.cf_403_threshold || 50;
           }
           // 更新端口范围显示
+          const portStart = document.getElementById('portRangeStart');
           const portEnd = document.getElementById('portRangeEnd');
-          if (portEnd && appConfig.base_host_port) {
-            portEnd.textContent = (appConfig.base_host_port + appConfig.warp_instances_per_container - 1);
+          if (portStart && portEnd && appConfig.base_port) {
+            portStart.textContent = appConfig.base_port;
+            portEnd.textContent = (appConfig.base_port + appConfig.resident_count - 1);
           }
         }
       } catch (e) {}
@@ -957,7 +959,7 @@
     function showCreateModal() {
       // 从配置预填实例数
       if (appConfig) {
-        document.getElementById('createInstanceCount').value = appConfig.warp_instances_per_container;
+        document.getElementById('createInstanceCount').value = appConfig.resident_count;
       }
       document.getElementById('createModal').classList.add('show');
     }
@@ -969,22 +971,36 @@
       if (!count || count < 1) return showToast('请输入有效数量', 'error');
       if (count > 200) return showToast('最大 200 个实例', 'error');
 
+      const btn = event.target;
+      const orig = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = '调整中...';
+
       try {
+        // resident_count 生效：服务端自动动态增减实例（已有配置直接复用、多余实例自动删除），无需重建容器
         const resp = await api('/api/config', {
           method: 'POST',
-          body: JSON.stringify({ warp_instances_per_container: count }),
+          body: JSON.stringify({ resident_count: count }),
         });
         if (resp.success) {
-          showToast(`实例数已设为 ${count}，需重建容器生效`, 'success');
+          showToast(`实例数已动态调整为 ${count}`, 'success');
           // 更新端口范围显示
+          const portStart = document.getElementById('portRangeStart');
           const portEnd = document.getElementById('portRangeEnd');
-          if (portEnd && appConfig.base_host_port) {
-            portEnd.textContent = (appConfig.base_host_port + count - 1);
+          if (portStart && portEnd && appConfig.base_port) {
+            portStart.textContent = appConfig.base_port;
+            portEnd.textContent = (appConfig.base_port + count - 1);
           }
+          refreshAll();
         } else {
           showToast(resp.error?.message || '设置失败', 'error');
         }
-      } catch (e) { showToast(e.message, 'error'); }
+      } catch (e) {
+        showToast(e.message, 'error');
+      } finally {
+        btn.disabled = false;
+        btn.textContent = orig;
+      }
     }
 
     async function applyStickyMinutes() {
