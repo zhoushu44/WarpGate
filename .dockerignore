@@ -1,0 +1,13 @@
+.git
+.github
+node_modules
+logs
+test
+README.md
+REQUIREMENTS.md
+.trae
+*.ps1
+*.sh
+Dockerfile
+docker-compose.yml
+.dockerignore
