@@ -1,0 +1,9 @@
+# 依赖
+node_modules/
+
+# 日志
+logs/
+*.log
+
+# 运行时生成
+config.local.json

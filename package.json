@@ -1,0 +1,13 @@
+{
+  "name": "warp-manager",
+  "version": "1.0.0",
+  "description": "WARP容器批量管理系统 - 自动重建直到换到新IP",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0"
+  }
+}

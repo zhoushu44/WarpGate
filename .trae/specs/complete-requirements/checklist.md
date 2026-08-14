@@ -1,0 +1,10 @@
+- [x] REQUIREMENTS.md 中 API acquire 响应的 proxy 字段使用公网 IP 而非 127.0.0.1
+- [x] 配置结构中新增 public_ip 配置项
+- [x] 方案 C 多容器端口分配公式和示例表已写入
+- [x] 代理池内存数据结构（pool Map + sessions Map）已定义
+- [x] 并发安全说明（异步锁）已写入 3.1.4
+- [x] 粘性会话超时清理机制（定时+惰性）已写入 3.1.2
+- [x] 新增配置项 session_cleanup_interval 已加入配置结构
+- [x] 方案 C docker run 完整命令示例已写入
+- [x] 前端 Web UI 鉴权流程已写入 3.6.1
+- [x] 方案 C 跨实例 IP 去重逻辑已写入

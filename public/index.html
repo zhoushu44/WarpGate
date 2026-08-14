@@ -1,0 +1,1290 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WARP 容器管理系统</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --card: #1a1d27;
+      --card-hover: #222632;
+      --border: #2d3142;
+      --text: #e4e6eb;
+      --text-dim: #8b8f9a;
+      --primary: #f97316;
+      --primary-hover: #ea580c;
+      --success: #22c55e;
+      --danger: #ef4444;
+      --warning: #fbbf24;
+      --info: #3b82f6;
+      --purple: #8b5cf6;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    .header {
+      background: linear-gradient(135deg, #1a1d27 0%, #0f1117 100%);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .header-left { display: flex; align-items: center; gap: 12px; }
+    .logo {
+      width: 40px; height: 40px;
+      background: var(--primary);
+      border-radius: 10px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 22px; font-weight: bold;
+      color: #fff;
+    }
+    .header h1 { font-size: 20px; font-weight: 600; }
+    .header-right { display: flex; gap: 12px; align-items: center; }
+    .docker-status {
+      display: flex; align-items: center; gap: 8px;
+      padding: 6px 14px;
+      background: var(--card);
+      border-radius: 20px;
+      font-size: 13px;
+    }
+    .status-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--success);
+    }
+    .status-dot.offline { background: var(--danger); }
+    .status-dot.checking { background: var(--warning); animation: pulse 1s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+    .api-key-badge {
+      display: flex; align-items: center; gap: 6px;
+      padding: 6px 14px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      font-size: 13px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .api-key-badge:hover { border-color: var(--primary); }
+    .api-key-badge.no-key { border-color: var(--danger); color: var(--danger); }
+
+    .stats-bar {
+      display: flex;
+      gap: 12px;
+      padding: 16px 24px;
+      flex-wrap: wrap;
+    }
+    .stat-card {
+      flex: 1;
+      min-width: 100px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px 16px;
+    }
+    .stat-label { font-size: 12px; color: var(--text-dim); margin-bottom: 4px; }
+    .stat-value { font-size: 24px; font-weight: 700; }
+    .stat-value.running { color: var(--success); }
+    .stat-value.stopped { color: var(--danger); }
+    .stat-value.available { color: var(--info); }
+    .stat-value.in-use { color: var(--warning); }
+    .stat-value.unhealthy { color: var(--danger); }
+    .stat-value.unique { color: var(--purple); }
+
+    .config-bar {
+      display: flex;
+      gap: 12px;
+      padding: 0 24px 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .config-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 6px 12px;
+    }
+    .config-label { font-size: 13px; color: var(--text-dim); white-space: nowrap; }
+    .config-input {
+      width: 60px;
+      padding: 4px 8px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      font-size: 14px;
+      outline: none;
+      text-align: center;
+    }
+    .config-input:focus { border-color: var(--primary); }
+    .toggle-switch {
+      position: relative;
+      display: inline-block;
+      width: 36px;
+      height: 20px;
+    }
+    .toggle-switch input { opacity: 0; width: 0; height: 0; }
+    .toggle-slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: var(--border);
+      border-radius: 10px;
+      transition: 0.3s;
+    }
+    .toggle-slider:before {
+      position: absolute;
+      content: "";
+      height: 14px; width: 14px;
+      left: 3px; bottom: 3px;
+      background: white;
+      border-radius: 50%;
+      transition: 0.3s;
+    }
+    .toggle-switch input:checked + .toggle-slider { background: var(--primary); }
+    .toggle-switch input:checked + .toggle-slider:before { transform: translateX(16px); }
+    .cf-report-group {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .toolbar {
+      display: flex;
+      gap: 10px;
+      padding: 0 24px 16px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .btn {
+      padding: 8px 16px;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: 500;
+      transition: all 0.2s;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-primary { background: var(--primary); color: #fff; }
+    .btn-primary:hover:not(:disabled) { background: var(--primary-hover); }
+    .btn-danger { background: var(--danger); color: #fff; }
+    .btn-danger:hover:not(:disabled) { background: #dc2626; }
+    .btn-info { background: var(--info); color: #fff; }
+    .btn-info:hover:not(:disabled) { background: #2563eb; }
+    .btn-purple { background: var(--purple); color: #fff; }
+    .btn-purple:hover:not(:disabled) { background: #7c3aed; }
+    .btn-ghost {
+      background: var(--card);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    .btn-ghost:hover:not(:disabled) { background: var(--card-hover); }
+    .btn-sm {
+      padding: 4px 10px;
+      font-size: 12px;
+      border-radius: 6px;
+      border: none;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .btn-sm:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-sm-rebuild { background: var(--warning); color: #000; }
+    .btn-sm-rebuild:hover:not(:disabled) { background: #f59e0b; }
+    .btn-sm-rotate { background: var(--purple); color: #fff; }
+    .btn-sm-rotate:hover:not(:disabled) { background: #7c3aed; }
+    .btn-sm-start { background: var(--success); color: #fff; }
+    .btn-sm-start:hover:not(:disabled) { background: #16a34a; }
+    .btn-sm-stop { background: var(--danger); color: #fff; }
+    .btn-sm-stop:hover:not(:disabled) { background: #dc2626; }
+    .btn-sm-delete { background: #6b7280; color: #fff; }
+    .btn-sm-delete:hover:not(:disabled) { background: #4b5563; }
+
+    .search-box {
+      flex: 1;
+      min-width: 180px;
+      padding: 8px 14px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 14px;
+      outline: none;
+    }
+    .search-box:focus { border-color: var(--primary); }
+
+    .table-container {
+      margin: 0 24px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    .table-header {
+      display: grid;
+      grid-template-columns: 40px 1fr 60px 70px 130px 100px 80px 60px 120px;
+      padding: 12px 16px;
+      background: var(--card-hover);
+      border-bottom: 1px solid var(--border);
+      font-size: 13px;
+      color: var(--text-dim);
+      font-weight: 600;
+    }
+    .table-row {
+      display: grid;
+      grid-template-columns: 40px 1fr 60px 70px 130px 100px 80px 60px 120px;
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--border);
+      font-size: 13px;
+      align-items: center;
+      transition: background 0.15s;
+    }
+    .table-row:hover { background: var(--card-hover); }
+    .table-row:last-child { border-bottom: none; }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 8px;
+      border-radius: 10px;
+      font-size: 11px;
+      font-weight: 500;
+    }
+    .badge-healthy { background: rgba(34,197,94,0.15); color: var(--success); }
+    .badge-unhealthy { background: rgba(239,68,68,0.15); color: var(--danger); }
+    .badge-unknown { background: rgba(139,143,154,0.15); color: var(--text-dim); }
+    .badge-available { background: rgba(59,130,246,0.15); color: var(--info); }
+    .badge-in-use { background: rgba(251,191,36,0.15); color: var(--warning); }
+    .badge-stopped { background: rgba(239,68,68,0.15); color: var(--danger); }
+
+    .ip-cell { font-family: 'Consolas', monospace; }
+
+    .row-actions { display: flex; gap: 4px; }
+
+    .modal-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.6);
+      z-index: 200;
+      align-items: center;
+      justify-content: center;
+    }
+    .modal-overlay.show { display: flex; }
+    .modal {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 28px;
+      min-width: 400px;
+      max-width: 600px;
+    }
+    .modal h2 { margin-bottom: 20px; font-size: 18px; }
+    .modal-body { margin-bottom: 24px; }
+    .form-group { margin-bottom: 16px; }
+    .form-label { display: block; font-size: 13px; color: var(--text-dim); margin-bottom: 6px; }
+    .form-input {
+      width: 100%;
+      padding: 10px 14px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 14px;
+      outline: none;
+    }
+    .form-input:focus { border-color: var(--primary); }
+    .checkbox-group { display: flex; align-items: center; gap: 8px; }
+    .modal-footer { display: flex; gap: 12px; justify-content: flex-end; }
+    .info-box {
+      padding: 12px;
+      background: var(--bg);
+      border-radius: 8px;
+      font-size: 12px;
+      color: var(--text-dim);
+      line-height: 1.6;
+    }
+
+    .pool-panel {
+      display: none;
+      margin: 0 24px 16px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    .pool-panel.show { display: block; }
+    .pool-panel-header {
+      padding: 12px 16px;
+      background: var(--card-hover);
+      border-bottom: 1px solid var(--border);
+      font-size: 14px;
+      font-weight: 600;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .pool-sessions {
+      padding: 12px 16px;
+      max-height: 300px;
+      overflow-y: auto;
+    }
+    .session-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr 1fr;
+      gap: 8px;
+      padding: 8px 0;
+      border-bottom: 1px solid var(--border);
+      font-size: 12px;
+      font-family: 'Consolas', monospace;
+    }
+    .session-row:last-child { border-bottom: none; }
+
+    .progress-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.8);
+      z-index: 300;
+      align-items: center;
+      justify-content: center;
+    }
+    .progress-overlay.show { display: flex; }
+    .progress-box {
+      background: var(--card);
+      border-radius: 16px;
+      padding: 32px;
+      min-width: 500px;
+      max-width: 700px;
+      text-align: center;
+    }
+    .progress-title { font-size: 18px; margin-bottom: 20px; }
+    .progress-bar-bg {
+      width: 100%;
+      height: 8px;
+      background: var(--bg);
+      border-radius: 4px;
+      overflow: hidden;
+      margin-bottom: 12px;
+    }
+    .progress-bar-fill {
+      height: 100%;
+      background: var(--primary);
+      border-radius: 4px;
+      transition: width 0.3s;
+      width: 0%;
+    }
+    .progress-text { font-size: 14px; color: var(--text-dim); margin-bottom: 16px; }
+    .progress-log {
+      max-height: 300px;
+      overflow-y: auto;
+      text-align: left;
+      background: var(--bg);
+      border-radius: 8px;
+      padding: 12px;
+      font-size: 12px;
+      font-family: 'Consolas', monospace;
+    }
+    .log-line { margin-bottom: 4px; }
+    .log-success { color: var(--success); }
+    .log-fail { color: var(--danger); }
+    .log-info { color: var(--text-dim); }
+
+    .toast {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      padding: 14px 24px;
+      border-radius: 10px;
+      font-size: 14px;
+      z-index: 400;
+      opacity: 0;
+      transform: translateY(20px);
+      transition: all 0.3s;
+    }
+    .toast.show { opacity: 1; transform: translateY(0); }
+    .toast-success { background: var(--success); color: #fff; }
+    .toast-error { background: var(--danger); color: #fff; }
+    .toast-info { background: var(--info); color: #fff; }
+
+    .empty-state {
+      text-align: center;
+      padding: 60px 20px;
+      color: var(--text-dim);
+    }
+    .checkbox {
+      width: 16px; height: 16px;
+      cursor: pointer;
+      accent-color: var(--primary);
+    }
+    .api-panel {
+      margin: 0 24px 12px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+    }
+    .api-panel-title {
+      font-size: 14px;
+      font-weight: 600;
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .api-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    .api-row-label {
+      font-size: 12px;
+      color: var(--text-dim);
+      min-width: 70px;
+    }
+    .api-row-value {
+      flex: 1;
+      padding: 8px 12px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 13px;
+      font-family: 'Consolas', monospace;
+      color: var(--text);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .btn-copy {
+      padding: 8px 12px;
+      background: var(--card-hover);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 12px;
+      color: var(--text);
+      transition: all 0.2s;
+      white-space: nowrap;
+    }
+    .btn-copy:hover { border-color: var(--primary); color: var(--primary); }
+    .btn-copy.copied { background: var(--success); color: #fff; border-color: var(--success); }
+    .acquire-result {
+      display: none;
+      margin-top: 8px;
+      padding: 14px;
+      background: var(--bg);
+      border: 1px solid var(--success);
+      border-radius: 8px;
+    }
+    .acquire-result.show { display: block; }
+    .acquire-result-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
+    .acquire-result-label {
+      font-size: 12px;
+      color: var(--text-dim);
+      min-width: 70px;
+    }
+    .acquire-result-value {
+      flex: 1;
+      font-size: 14px;
+      font-family: 'Consolas', monospace;
+      font-weight: 600;
+    }
+    .acquire-result-value.ip { color: var(--success); }
+    .acquire-result-value.proxy { color: var(--info); }
+
+    .footer {
+      text-align: center;
+      padding: 24px;
+      color: var(--text-dim);
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="header-left">
+      <div class="logo">W</div>
+      <h1>WARP 容器管理系统</h1>
+    </div>
+    <div class="header-right">
+      <div class="docker-status" id="dockerStatus">
+        <span class="status-dot checking"></span>
+        <span>检测中...</span>
+      </div>
+      <button class="btn btn-ghost" onclick="refreshAll()">刷新</button>
+    </div>
+  </div>
+
+  <div class="stats-bar">
+    <div class="stat-card">
+      <div class="stat-label">容器</div>
+      <div class="stat-value" id="statContainers">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">总实例</div>
+      <div class="stat-value" id="statTotalInstances">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">可用</div>
+      <div class="stat-value available" id="statAvailable">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">使用中</div>
+      <div class="stat-value in-use" id="statInUse">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">不健康</div>
+      <div class="stat-value unhealthy" id="statUnhealthy">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">独立IP</div>
+      <div class="stat-value unique" id="statUniqueIP">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">活跃会话</div>
+      <div class="stat-value" id="statSessions">0</div>
+    </div>
+  </div>
+
+  <div class="config-bar">
+    <div class="config-group">
+      <span class="config-label">实例数:</span>
+      <input type="number" class="config-input" id="instanceCount" value="20" min="1" max="200">
+      <button class="btn btn-sm btn-primary" onclick="applyInstanceCount()">应用</button>
+    </div>
+    <div class="config-group">
+      <span class="config-label">粘性会话(分钟):</span>
+      <input type="number" class="config-input" id="stickyMinutes" value="10" min="1" max="1440">
+      <button class="btn btn-sm btn-primary" onclick="applyStickyMinutes()">应用</button>
+    </div>
+    <div class="config-group">
+      <span class="config-label">403自动换IP:</span>
+      <label class="toggle-switch">
+        <input type="checkbox" id="autoRotateToggle" checked onchange="toggleAutoRotate()">
+        <span class="toggle-slider"></span>
+      </label>
+      <span class="config-label">阈值:</span>
+      <input type="number" class="config-input" id="cf403Threshold" value="50" min="10" max="100" style="width:50px">%
+      <button class="btn btn-sm btn-primary" onclick="applyCfThreshold()">应用</button>
+    </div>
+  </div>
+
+  <div class="api-panel">
+    <div class="api-panel-title">
+      <span style="font-size:18px">🔗</span>
+      <span>API 使用</span>
+      <span style="font-size:12px;color:var(--text-dim);font-weight:400;margin-left:8px">每次提取获取不同 IP (Round-Robin)</span>
+    </div>
+    <div class="api-row">
+      <span class="api-row-label">提取代理:</span>
+      <div class="api-row-value" id="acquireUrl">GET /api/pool/acquire</div>
+      <button class="btn-copy" onclick="copyAcquireUrl(this)">复制完整命令</button>
+    </div>
+    <div class="api-row">
+      <span class="api-row-label">粘性提取:</span>
+      <div class="api-row-value">GET /api/pool/acquire?session_id=自定义会话ID</div>
+      <button class="btn-copy" onclick="copyStickyAcquireUrl(this)">复制完整命令</button>
+    </div>
+  </div>
+
+  <div class="toolbar">
+    <button class="btn btn-primary" onclick="showCreateModal()">+ 创建/重建实例</button>
+    <button class="btn btn-danger" onclick="deleteSelected()">删除选中</button>
+    <button class="btn btn-ghost" onclick="deleteAll()">删除全部</button>
+    <button class="btn btn-info" onclick="rebuildSelected()">重建选中</button>
+    <button class="btn btn-purple" onclick="rotateAll()">强制换IP(全部)</button>
+    <button class="btn btn-ghost" onclick="togglePoolPanel()">代理池状态</button>
+    <input type="text" class="search-box" placeholder="搜索容器/IP/端口..." id="searchInput" oninput="renderTable()">
+  </div>
+
+  <div class="pool-panel" id="poolPanel">
+    <div class="pool-panel-header">
+      <span>代理池会话</span>
+      <button class="btn-sm btn-ghost" onclick="togglePoolPanel()">关闭</button>
+    </div>
+    <div class="pool-sessions" id="poolSessions">
+      <div style="text-align:center;color:var(--text-dim);padding:20px;">加载中...</div>
+    </div>
+  </div>
+
+  <div class="table-container">
+    <div class="table-header">
+      <div><input type="checkbox" class="checkbox" id="selectAllCheckbox" onchange="selectAll(this.checked)"></div>
+      <div>容器 / 实例</div>
+      <div>端口</div>
+      <div>池状态</div>
+      <div>出口IP</div>
+      <div>CF 403率</div>
+      <div>健康</div>
+      <div>会话</div>
+      <div>操作</div>
+    </div>
+    <div id="tableBody"></div>
+  </div>
+
+  <div class="footer">
+    WARP Manager v2.0 | 方案C: 多实例单容器 | 每实例独立IP | SOCKS5代理
+  </div>
+
+  <!-- Create Modal -->
+  <div class="modal-overlay" id="createModal">
+    <div class="modal">
+      <h2>创建 / 重建 WARP 实例</h2>
+      <div class="modal-body">
+        <div class="form-group">
+          <label class="form-label">实例数量 (1-200)</label>
+          <input type="number" class="form-input" id="createInstanceCount" value="20" min="1" max="200">
+          <div style="font-size:12px;color:var(--text-dim);margin-top:4px">单容器内运行的独立 WARP 实例数，每个实例有独立 IP</div>
+        </div>
+        <div class="info-box">
+          <strong style="color:var(--info)">单容器多实例:</strong> 1 个 Docker 容器内运行 N 个独立 WARP 实例。<br>
+          每实例独立注册获得独立 IP，换 IP 无需重建容器。<br>
+          端口范围: 10001 ~ <span id="portRangeEnd">10020</span>，创建后自动检测 IP 并去重。
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" onclick="closeModal('createModal')">取消</button>
+        <button class="btn btn-primary" onclick="doCreate()">开始创建</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Progress Overlay -->
+  <div class="progress-overlay" id="progressOverlay">
+    <div class="progress-box">
+      <div class="progress-title" id="progressTitle">处理中...</div>
+      <div class="progress-bar-bg">
+        <div class="progress-bar-fill" id="progressBar"></div>
+      </div>
+      <div class="progress-text" id="progressText">0 / 0</div>
+      <div class="progress-log" id="progressLog"></div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    let instances = [];
+    let poolStatus = null;
+    let selectedNames = new Set();
+    let isProcessing = false;
+    let jobPollTimer = null;
+    let appConfig = null;
+
+    // ==================== 复制功能 ====================
+    function copyText(text, btn) {
+      if (!text || text === '--' || text === '未设置') return;
+      navigator.clipboard.writeText(text).then(() => {
+        const orig = btn.textContent;
+        btn.textContent = '已复制';
+        btn.classList.add('copied');
+        setTimeout(() => { btn.textContent = orig; btn.classList.remove('copied'); }, 1500);
+      }).catch(() => {
+        // 降级方案
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        const orig = btn.textContent;
+        btn.textContent = '已复制';
+        btn.classList.add('copied');
+        setTimeout(() => { btn.textContent = orig; btn.classList.remove('copied'); }, 1500);
+      });
+    }
+
+    function copyAcquireUrl(btn) {
+      const host = window.location.origin;
+      const cmd = `curl -s "${host}/api/pool/acquire"`;
+      copyText(cmd, btn);
+    }
+
+    function copyStickyAcquireUrl(btn) {
+      const host = window.location.origin;
+      const cmd = `curl -s "${host}/api/pool/acquire?session_id=自定义会话ID"`;
+      copyText(cmd, btn);
+    }
+
+    // ==================== API 请求 ====================
+    async function api(url, options = {}) {
+      const headers = { 'Content-Type': 'application/json', ...options.headers };
+      const res = await fetch(url, { ...options, headers });
+      return res.json();
+    }
+
+    // ==================== Docker 检查 ====================
+    async function checkDocker() {
+      try {
+        const data = await api('/api/check');
+        const el = document.getElementById('dockerStatus');
+        if (data.success) {
+          const d = data.data;
+          if (!d.daemonRunning) {
+            el.innerHTML = `<span class="status-dot offline"></span><span>Docker 未运行</span>`;
+          } else if (!d.imageExists) {
+            el.innerHTML = `<span class="status-dot checking"></span><span>Docker 正常 | 镜像未拉取</span>`;
+          } else {
+            el.innerHTML = `<span class="status-dot"></span><span>Docker 正常</span>`;
+          }
+        } else {
+          el.innerHTML = `<span class="status-dot offline"></span><span>Docker 异常</span>`;
+        }
+      } catch (e) {
+        document.getElementById('dockerStatus').innerHTML =
+          `<span class="status-dot offline"></span><span>服务未启动</span>`;
+      }
+    }
+
+    // ==================== 加载配置 ====================
+    async function loadConfig() {
+      try {
+        const data = await api('/api/config');
+        if (data.success) {
+          appConfig = data.data;
+          if (document.getElementById('instanceCount') && !document.activeElement.matches('#instanceCount')) {
+            document.getElementById('instanceCount').value = appConfig.warp_instances_per_container;
+          }
+          if (document.getElementById('stickyMinutes') && !document.activeElement.matches('#stickyMinutes')) {
+            document.getElementById('stickyMinutes').value = appConfig.sticky_minutes;
+          }
+          // 403自动换IP
+          if (document.getElementById('autoRotateToggle')) {
+            document.getElementById('autoRotateToggle').checked = appConfig.auto_rotate_on_high_403 !== false;
+          }
+          if (document.getElementById('cf403Threshold') && !document.activeElement.matches('#cf403Threshold')) {
+            document.getElementById('cf403Threshold').value = appConfig.cf_403_threshold || 50;
+          }
+          // 更新端口范围显示
+          const portEnd = document.getElementById('portRangeEnd');
+          if (portEnd && appConfig.base_host_port) {
+            portEnd.textContent = (appConfig.base_host_port + appConfig.warp_instances_per_container - 1);
+          }
+        }
+      } catch (e) {}
+    }
+
+    // ==================== 加载数据 ====================
+    async function loadStats() {
+      try {
+        const data = await api('/api/stats');
+        if (data.success) {
+          const d = data.data;
+          document.getElementById('statContainers').textContent = d.running_containers;
+          document.getElementById('statTotalInstances').textContent = d.total_instances;
+          document.getElementById('statAvailable').textContent = d.available;
+          document.getElementById('statInUse').textContent = d.in_use;
+          document.getElementById('statUnhealthy').textContent = d.unhealthy;
+          document.getElementById('statUniqueIP').textContent = d.unique_ips;
+          document.getElementById('statSessions').textContent = d.active_sessions;
+        }
+      } catch (e) {}
+    }
+
+    async function loadContainers() {
+      if (isProcessing) return;
+      try {
+        const data = await api('/api/containers');
+        if (data.success) {
+          instances = data.data;
+          renderTable();
+          loadStats();
+        }
+      } catch (e) {}
+    }
+
+    async function loadPoolStatus() {
+      try {
+        const data = await api('/api/pool/status');
+        if (data.success) {
+          poolStatus = data.data;
+          renderPoolSessions();
+        }
+      } catch (e) {}
+    }
+
+    // ==================== 渲染表格 ====================
+    function renderTable() {
+      const search = document.getElementById('searchInput').value.toLowerCase();
+      const tbody = document.getElementById('tableBody');
+
+      let filtered = instances;
+      if (search) {
+        filtered = instances.filter(c =>
+          c.container.toLowerCase().includes(search) ||
+          (c.host_port && c.host_port.toString().includes(search)) ||
+          (c.ip && c.ip.includes(search))
+        );
+      }
+
+      if (filtered.length === 0) {
+        tbody.innerHTML = `<div class="empty-state">${instances.length === 0 ? '暂无实例，点击「创建/重建实例」开始' : '无匹配结果'}</div>`;
+        return;
+      }
+
+      tbody.innerHTML = filtered.map(c => {
+        const id = `${c.container}:${c.instance_index}`;
+        const checked = selectedNames.has(id) ? 'checked' : '';
+
+        const healthBadge = c.health === 'healthy'
+          ? `<span class="badge badge-healthy">健康</span>`
+          : c.health === 'unhealthy'
+          ? `<span class="badge badge-unhealthy">不健康</span>`
+          : `<span class="badge badge-unknown">未知</span>`;
+
+        let poolBadge;
+        if (c.pool_status === 'in_use') {
+          poolBadge = `<span class="badge badge-in-use">使用中</span>`;
+        } else if (c.pool_status === 'available') {
+          poolBadge = `<span class="badge badge-available">可用</span>`;
+        } else if (c.pool_status === 'stopped') {
+          poolBadge = `<span class="badge badge-stopped">已停止</span>`;
+        } else {
+          poolBadge = `<span class="badge badge-unknown">${c.pool_status || '-'}</span>`;
+        }
+
+        const ipCell = c.ip
+          ? `<span class="ip-cell">${c.ip}</span>`
+          : `<span style="color:var(--text-dim)">--</span>`;
+
+        // CF 403率显示
+        let cfCell;
+        if (c.cf_403_rate === null || c.cf_403_rate === undefined) {
+          cfCell = `<span style="color:var(--text-dim)">--</span>`;
+        } else {
+          const rate = c.cf_403_rate;
+          const color = rate === 0 ? 'var(--success)' : rate < 30 ? 'var(--warning)' : 'var(--danger)';
+          const lastCode = c.cf_last_code ? ` (last: ${c.cf_last_code})` : '';
+          cfCell = `<span style="color:${color};font-weight:600;font-size:13px">${rate}%</span>` +
+                   `<span style="font-size:11px;color:var(--text-dim)">${c.cf_403_count}/${c.cf_check_count}${lastCode}</span>`;
+        }
+
+        const sessionInfo = c.pool_status === 'in_use' ? '是' : '-';
+
+        let actions = '';
+        if (c.pool_status === 'stopped') {
+          actions += `<button class="btn-sm btn-sm-start" onclick="startContainer('${c.container}')">启动</button>`;
+        } else if (c.pool_status !== 'stopped' && c.instance_index >= 0) {
+          actions += `<button class="btn-sm btn-sm-rotate" onclick="rotateOne('${c.container}', ${c.instance_index})">换IP</button>`;
+          actions += `<button class="btn-sm btn-sm-stop" onclick="stopContainer('${c.container}')">停止</button>`;
+        }
+        actions += `<button class="btn-sm btn-sm-delete" onclick="deleteOne('${c.container}')">删除</button>`;
+
+        const containerDisplay = c.instance_index >= 0
+          ? `${c.container} <span style="color:var(--text-dim)">#${c.instance_index}</span>`
+          : c.container;
+
+        return `
+          <div class="table-row">
+            <div><input type="checkbox" class="checkbox" ${checked} onchange="toggleSelect('${id}', this.checked)"></div>
+            <div>${containerDisplay}</div>
+            <div style="font-family:Consolas">${c.host_port || '--'}</div>
+            <div>${poolBadge}</div>
+            <div>${ipCell}</div>
+            <div>${cfCell}</div>
+            <div>${healthBadge}</div>
+            <div style="font-size:12px;color:var(--text-dim)">${sessionInfo}</div>
+            <div class="row-actions">${actions}</div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    // ==================== 代理池会话面板 ====================
+    function renderPoolSessions() {
+      const el = document.getElementById('poolSessions');
+      if (!poolStatus || !poolStatus.sessions || poolStatus.sessions.length === 0) {
+        el.innerHTML = '<div style="text-align:center;color:var(--text-dim);padding:20px;">无活跃会话</div>';
+        return;
+      }
+
+      el.innerHTML = poolStatus.sessions.map(s => `
+        <div class="session-row">
+          <div>${s.session_id.substring(0, 12)}...</div>
+          <div>Pool: ${s.pool_key}</div>
+          <div>获取: ${new Date(s.acquired_at).toLocaleTimeString()}</div>
+          <div>过期: ${new Date(s.expires_at).toLocaleTimeString()}</div>
+        </div>
+      `).join('');
+    }
+
+    function togglePoolPanel() {
+      const panel = document.getElementById('poolPanel');
+      if (panel.classList.contains('show')) {
+        panel.classList.remove('show');
+      } else {
+        panel.classList.add('show');
+        loadPoolStatus();
+      }
+    }
+
+    // ==================== 选择 ====================
+    function toggleSelect(id, checked) {
+      if (checked) selectedNames.add(id);
+      else selectedNames.delete(id);
+    }
+    function selectAll(checked) {
+      if (checked) instances.forEach(c => {
+        if (c.instance_index >= 0) selectedNames.add(`${c.container}:${c.instance_index}`);
+      });
+      else selectedNames.clear();
+      renderTable();
+    }
+
+    // ==================== Modal ====================
+    function showCreateModal() {
+      // 从配置预填实例数
+      if (appConfig) {
+        document.getElementById('createInstanceCount').value = appConfig.warp_instances_per_container;
+      }
+      document.getElementById('createModal').classList.add('show');
+    }
+    function closeModal(id) { document.getElementById(id).classList.remove('show'); }
+
+    // ==================== 配置应用 ====================
+    async function applyInstanceCount() {
+      const count = parseInt(document.getElementById('instanceCount').value);
+      if (!count || count < 1) return showToast('请输入有效数量', 'error');
+      if (count > 200) return showToast('最大 200 个实例', 'error');
+
+      try {
+        const resp = await api('/api/config', {
+          method: 'POST',
+          body: JSON.stringify({ warp_instances_per_container: count }),
+        });
+        if (resp.success) {
+          showToast(`实例数已设为 ${count}，需重建容器生效`, 'success');
+          // 更新端口范围显示
+          const portEnd = document.getElementById('portRangeEnd');
+          if (portEnd && appConfig.base_host_port) {
+            portEnd.textContent = (appConfig.base_host_port + count - 1);
+          }
+        } else {
+          showToast(resp.error?.message || '设置失败', 'error');
+        }
+      } catch (e) { showToast(e.message, 'error'); }
+    }
+
+    async function applyStickyMinutes() {
+      const minutes = parseInt(document.getElementById('stickyMinutes').value);
+      if (!minutes || minutes < 1) return showToast('请输入有效分钟数', 'error');
+
+      try {
+        const resp = await api('/api/config', {
+          method: 'POST',
+          body: JSON.stringify({ sticky_minutes: minutes }),
+        });
+        if (resp.success) {
+          showToast(`粘性会话已设为 ${minutes} 分钟`, 'success');
+        } else {
+          showToast(resp.error?.message || '设置失败', 'error');
+        }
+      } catch (e) { showToast(e.message, 'error'); }
+    }
+
+    async function toggleAutoRotate() {
+      const enabled = document.getElementById('autoRotateToggle').checked;
+      try {
+        const resp = await api('/api/config', {
+          method: 'POST',
+          body: JSON.stringify({ auto_rotate_on_high_403: enabled }),
+        });
+        if (resp.success) {
+          showToast(`403自动换IP已${enabled ? '开启' : '关闭'}`, 'success');
+        } else {
+          showToast(resp.error?.message || '设置失败', 'error');
+          document.getElementById('autoRotateToggle').checked = !enabled;
+        }
+      } catch (e) {
+        showToast(e.message, 'error');
+        document.getElementById('autoRotateToggle').checked = !enabled;
+      }
+    }
+
+    async function applyCfThreshold() {
+      const threshold = parseInt(document.getElementById('cf403Threshold').value);
+      if (!threshold || threshold < 10 || threshold > 100) {
+        return showToast('阈值范围 10-100', 'error');
+      }
+      try {
+        const resp = await api('/api/config', {
+          method: 'POST',
+          body: JSON.stringify({ cf_403_threshold: threshold }),
+        });
+        if (resp.success) {
+          showToast(`403率阈值已设为 ${threshold}%`, 'success');
+        } else {
+          showToast(resp.error?.message || '设置失败', 'error');
+        }
+      } catch (e) { showToast(e.message, 'error'); }
+    }
+
+    // ==================== 任务轮询 ====================
+    async function pollJob(jobId, title) {
+      isProcessing = true;
+      showProgress(title, 1);
+
+      return new Promise((resolve) => {
+        jobPollTimer = setInterval(async () => {
+          try {
+            const data = await api(`/api/job/${jobId}`);
+            if (!data.success) { clearInterval(jobPollTimer); resolve(null); return; }
+
+            const job = data.data;
+            updateProgress(job.current, job.total);
+
+            const logEl = document.getElementById('progressLog');
+            logEl.innerHTML = job.logs.map(l =>
+              `<div class="log-line log-${l.level === 'fail' ? 'fail' : l.level === 'success' ? 'success' : 'info'}">${l.msg}</div>`
+            ).join('');
+            logEl.scrollTop = logEl.scrollHeight;
+
+            if (job.status === 'done' || job.status === 'error') {
+              clearInterval(jobPollTimer);
+              isProcessing = false;
+              resolve(job);
+            }
+          } catch (e) {
+            clearInterval(jobPollTimer);
+            isProcessing = false;
+            resolve(null);
+          }
+        }, 1000);
+      });
+    }
+
+    // ==================== 批量创建 ====================
+    async function doCreate() {
+      const instanceCount = parseInt(document.getElementById('createInstanceCount').value);
+      if (!instanceCount || instanceCount < 1) return showToast('请输入有效数量', 'error');
+      if (instanceCount > 200) return showToast('最大 200 个实例', 'error');
+
+      closeModal('createModal');
+
+      try {
+        const resp = await api('/api/create', {
+          method: 'POST',
+          body: JSON.stringify({ instance_count: instanceCount }),
+        });
+        if (!resp.success) return showToast(resp.error?.message || '创建失败', 'error');
+
+        const job = await pollJob(resp.data.jobId, `创建 warp-0（${instanceCount} 实例）`);
+        if (job) {
+          const r = job.results[0];
+          if (r && r.success) {
+            showToast(`创建完成: ${r.healthy}/${instanceCount} 实例健康`, 'success');
+          } else {
+            showToast('创建失败: ' + (r?.error || '未知错误'), 'error');
+          }
+        }
+      } catch (e) { showToast('创建失败: ' + e.message, 'error'); }
+
+      setTimeout(() => { hideProgress(); refreshAll(); }, 2000);
+    }
+
+    // ==================== 单个操作 ====================
+    async function rotateOne(container, instanceIndex) {
+      // 通过 pool_key 换单个实例的IP
+      // 从容器名解析容器索引
+      const m = container.match(/warp-(\d+)/);
+      if (!m) return showToast('无法解析容器索引', 'error');
+      const poolKey = `${parseInt(m[1])}:${instanceIndex}`;
+
+      try {
+        const resp = await api('/api/pool/rotate', {
+          method: 'POST',
+          body: JSON.stringify({ pool_key: poolKey }),
+        });
+        if (!resp.success) return showToast(resp.error?.message || '换IP失败', 'error');
+
+        const job = await pollJob(resp.data.jobId, `换IP ${container} #${instanceIndex}`);
+        if (job && job.results.length > 0) {
+          if (job.results[0].success) {
+            showToast(`${container} #${instanceIndex} 换IP成功: ${job.results[0].old_ip} -> ${job.results[0].new_ip}`, 'success');
+          } else {
+            showToast(`${container} #${instanceIndex} 换IP失败`, 'error');
+          }
+        }
+      } catch (e) { showToast(e.message, 'error'); }
+      setTimeout(() => { hideProgress(); refreshAll(); }, 2000);
+    }
+
+    async function startContainer(name) {
+      try {
+        await api('/api/start', { method: 'POST', body: JSON.stringify({ name }) });
+        showToast(`${name} 已启动`, 'success');
+        setTimeout(() => refreshAll(), 1000);
+      } catch (e) { showToast(e.message, 'error'); }
+    }
+
+    async function stopContainer(name) {
+      try {
+        await api('/api/stop', { method: 'POST', body: JSON.stringify({ name }) });
+        showToast(`${name} 已停止`, 'info');
+        setTimeout(() => refreshAll(), 1000);
+      } catch (e) { showToast(e.message, 'error'); }
+    }
+
+    async function deleteOne(name) {
+      if (!confirm(`确认删除容器 ${name}?`)) return;
+      try {
+        const resp = await api('/api/delete', {
+          method: 'POST',
+          body: JSON.stringify({ names: [name] }),
+        });
+        if (resp.success) {
+          const job = await pollJob(resp.data.jobId, `删除 ${name}`);
+          showToast(`${name} 已删除`, 'info');
+        }
+      } catch (e) { showToast(e.message, 'error'); }
+      setTimeout(() => { hideProgress(); refreshAll(); }, 1500);
+    }
+
+    // ==================== 批量操作 ====================
+    async function deleteSelected() {
+      if (selectedNames.size === 0) return showToast('请先选择实例', 'error');
+      // 提取唯一容器名
+      const containerNames = [...new Set(Array.from(selectedNames).map(s => s.split(':')[0]))];
+      if (!confirm(`确认删除 ${containerNames.length} 个容器?`)) return;
+
+      try {
+        const resp = await api('/api/delete', {
+          method: 'POST',
+          body: JSON.stringify({ names: containerNames }),
+        });
+        if (resp.success) {
+          const job = await pollJob(resp.data.jobId, `批量删除 ${containerNames.length} 个容器`);
+          if (job) {
+            showToast(`删除完成: 成功${job.results.filter(r=>r.success).length}个`, 'success');
+            selectedNames.clear();
+          }
+        }
+      } catch (e) { showToast(e.message, 'error'); }
+      setTimeout(() => { hideProgress(); refreshAll(); }, 1500);
+    }
+
+    async function deleteAll() {
+      if (instances.length === 0) return showToast('没有容器可删除', 'error');
+      if (!confirm(`确认删除全部容器? 此操作不可逆!`)) return;
+
+      try {
+        const resp = await api('/api/delete', {
+          method: 'POST',
+          body: JSON.stringify({ deleteAll: true }),
+        });
+        if (resp.success) {
+          const job = await pollJob(resp.data.jobId, `删除全部容器`);
+          if (job) {
+            showToast(`全部删除完成`, 'success');
+            selectedNames.clear();
+          }
+        }
+      } catch (e) { showToast(e.message, 'error'); }
+      setTimeout(() => { hideProgress(); refreshAll(); }, 1500);
+    }
+
+    async function rebuildSelected() {
+      if (selectedNames.size === 0) return showToast('请先选择实例', 'error');
+      const containerNames = [...new Set(Array.from(selectedNames).map(s => s.split(':')[0]))];
+
+      try {
+        const resp = await api('/api/rebuild', {
+          method: 'POST',
+          body: JSON.stringify({ names: containerNames }),
+        });
+        if (resp.success) {
+          const job = await pollJob(resp.data.jobId, `批量重建 ${containerNames.length} 个容器`);
+          if (job) {
+            const successCount = job.results.filter(r=>r.success).length;
+            showToast(`重建完成: 成功${successCount}个`, 'success');
+          }
+        }
+      } catch (e) { showToast(e.message, 'error'); }
+      setTimeout(() => { hideProgress(); refreshAll(); }, 2000);
+    }
+
+    async function rotateAll() {
+      if (!confirm('确认对所有可用实例执行强制换IP?')) return;
+
+      try {
+        const resp = await api('/api/pool/rotate', {
+          method: 'POST',
+          body: JSON.stringify({}),
+        });
+        if (resp.success) {
+          const job = await pollJob(resp.data.jobId, `批量强制换IP`);
+          if (job) {
+            const successCount = job.results.filter(r=>r.success).length;
+            showToast(`换IP完成: 成功${successCount}个`, 'success');
+          }
+        }
+      } catch (e) { showToast(e.message, 'error'); }
+      setTimeout(() => { hideProgress(); refreshAll(); }, 2000);
+    }
+
+    // ==================== Progress UI ====================
+    function showProgress(title, total) {
+      document.getElementById('progressTitle').textContent = title;
+      document.getElementById('progressBar').style.width = '0%';
+      document.getElementById('progressText').textContent = `0 / ${total}`;
+      document.getElementById('progressLog').innerHTML = '';
+      document.getElementById('progressOverlay').classList.add('show');
+    }
+    function updateProgress(current, total) {
+      const pct = total > 0 ? (current / total * 100) : 100;
+      document.getElementById('progressBar').style.width = pct + '%';
+      document.getElementById('progressText').textContent = `${current} / ${total}`;
+    }
+    function hideProgress() {
+      document.getElementById('progressOverlay').classList.remove('show');
+    }
+
+    // ==================== Toast ====================
+    function showToast(msg, type = 'info') {
+      const toast = document.getElementById('toast');
+      toast.className = `toast toast-${type} show`;
+      toast.textContent = msg;
+      setTimeout(() => toast.classList.remove('show'), 3000);
+    }
+
+    // ==================== 刷新 ====================
+    async function refreshAll() {
+      await loadConfig();
+      await checkDocker();
+      await loadContainers();
+      if (document.getElementById('poolPanel').classList.contains('show')) {
+        loadPoolStatus();
+      }
+    }
+
+    // ==================== 初始化 ====================
+    (async function init() {
+      await refreshAll();
+      setInterval(() => { if (!isProcessing) loadContainers(); }, 30000);
+      setInterval(() => { if (!isProcessing) loadStats(); }, 10000);
+    })();
+  </script>
+</body>
+</html>
