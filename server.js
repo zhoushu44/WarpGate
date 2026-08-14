@@ -15,13 +15,13 @@ const WARP_ENDPOINT_IP = '188.114.96.1';
 const WARP_ENDPOINT_PORT = 2408;
 const WARP_PUBLIC_KEY = 'bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=';
 // 候选WARP对端（endpoint），同一账号连接不同endpoint会得到不同出口IP
-// 实测可用: 162.159.192.1 / 188.114.96.1 / 188.114.97.1 / 188.114.96.2 / 188.114.96.3
+// 实测可用: 188.114.96.1 / 188.114.97.1 / 188.114.96.2 / 188.114.96.3
+// 注: 162.159.192.1 实测链路不通（L1 出口检测全部超时），已从列表移除
 const WARP_ENDPOINTS = [
   { address: '188.114.96.1', port: 2408 },
   { address: '188.114.97.1', port: 2408 },
   { address: '188.114.96.2', port: 2408 },
   { address: '188.114.96.3', port: 2408 },
-  { address: '162.159.192.1', port: 2408 },
 ];
 
 const DEFAULT_CONFIG = {
@@ -2081,8 +2081,16 @@ async function reuseExistingInstance(instanceIndex) {
     cf_last_code: httpCode,
   });
 
+  // 出口检测失败：清理进程、移出代理池，由调用方 fallback 重新注册
+  if (!ip) {
+    try { stopSingbox(pid); } catch (e) { }
+    pool.delete(poolKey);
+    logger.warn('RECOVERY', `[${name}] 出口检测失败，已停止 sing-box 进程并移出代理池`);
+    return false;
+  }
+
   logger.info('RECOVERY', `[${name}] 复用启动完成, IP:${ip} health=${ip ? (isHealthy ? 'healthy' : 'unhealthy') : 'unknown'} CF:${httpCode}`);
-  return !!ip;
+  return true;
 }
 
 // ==================== 优雅关闭 ====================
