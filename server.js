@@ -459,11 +459,12 @@ async function checkIpRiskScore(ip, port) {
     const url = `${config.ip_risk_check_url}${ip}`;
     // 走实例出口检测，与业务出口一致（服务器直连易被 scamalytics 反爬拦截）
     const proxy = port ? `--socks5-hostname 127.0.0.1:${port}` : '';
-    // scamalytics 对高频请求间歇返回验证页，解析失败时重试 1 次
+    // scamalytics 对新 IP 首访返回验证页（无 "Fraud Score"），用 cookie jar 持久化 + 重试绕过
+    const cookieJar = '/tmp/warp-risk-cookie.txt';
     let html = '';
     for (let attempt = 1; attempt <= 2; attempt++) {
       html = await runCmdFast(
-        `curl -s --max-time 12 -A "${BROWSER_UA}" ${proxy} ${url}`, 15000
+        `curl -s --max-time 12 -c ${cookieJar} -b ${cookieJar} -A "${BROWSER_UA}" ${proxy} ${url}`, 15000
       ).catch(() => '');
       if (/Fraud Score:\s*\d+/.test(html)) break;
       if (attempt === 1) await sleep(3000);
