@@ -521,7 +521,7 @@ curl -s --compressed --max-time 25 -X POST "https://api.cloudflareclient.com/v0a
 
 ### 方式 A：Docker 容器（推荐，可移植）
 
-**镜像已发布到 Docker Hub**（`zhoushu44/warp-pool`），由 GitHub Actions 在每次 push 到 `main`/`master` 时自动构建并推送 `2.0` 与 `latest` 两个标签（见 [.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml)），**本地不执行任何推送**。镜像内置 sing-box 与 wgcf 二进制，宿主机无需预装 Node/sing-box/wgcf。
+**镜像已发布到 Docker Hub**（`zhoushu1/warp-pool`），由 GitHub Actions 在每次 push 到 `main`/`master` 时自动构建并推送 `2.0` 与 `latest` 两个标签（见 [.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml)），**本地不执行任何推送**。镜像内置 sing-box 与 wgcf 二进制，宿主机无需预装 Node/sing-box/wgcf。
 
 服务器上只需一份 [docker-compose.yml](docker-compose.yml)：
 
@@ -543,7 +543,7 @@ services:
 
 ```bash
 # 服务器上执行（需已安装 docker + compose 插件）
-docker compose pull          # 拉取 zhoushu44/warp-pool:latest
+docker compose pull          # 拉取 zhoushu1/warp-pool:latest
 docker compose up -d         # 启动（实例目录已存在则直接恢复，无则自动创建）
 docker compose ps            # 查看状态
 docker logs -f warp          # 查看日志

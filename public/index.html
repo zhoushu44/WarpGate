@@ -237,7 +237,7 @@
     }
     .table-header {
       display: grid;
-      grid-template-columns: 40px 1fr 60px 70px 130px 100px 80px 60px 120px;
+      grid-template-columns: 40px 220px 60px 70px 130px 100px 80px 60px 120px;
       padding: 12px 16px;
       background: var(--card-hover);
       border-bottom: 1px solid var(--border);
@@ -247,7 +247,7 @@
     }
     .table-row {
       display: grid;
-      grid-template-columns: 40px 1fr 60px 70px 130px 100px 80px 60px 120px;
+      grid-template-columns: 40px 220px 60px 70px 130px 100px 80px 60px 120px;
       padding: 10px 16px;
       border-bottom: 1px solid var(--border);
       font-size: 13px;
@@ -899,7 +899,7 @@
         return `
           <div class="table-row">
             <div><input type="checkbox" class="checkbox" ${checked} onchange="toggleSelect('${id}', this.checked)"></div>
-            <div>${containerDisplay}</div>
+            <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${containerDisplay}</div>
             <div style="font-family:Consolas">${c.host_port || '--'}</div>
             <div>${poolBadge}</div>
             <div>${ipCell}</div>

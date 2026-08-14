@@ -1,0 +1,22 @@
+services:
+  warp:
+    # Docker Hub 镜像：由 GitHub Actions 在 push 到 main/master 时自动构建并推送（2.0 + latest）
+    # 升级方式：docker compose pull && docker compose up -d
+    # 如需本地源码构建，可临时改用 build: { context: ., dockerfile: Dockerfile } + image: warp-pool:latest
+    image: zhoushu1/warp-pool:latest
+    container_name: warp
+    # host 网络：20+ 个 SOCKS5 端口(10010-10029)+API(4433) 直接暴露，sing-box UDP 2408 出站无 NAT 干扰
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      # 实例数据（meta.json/singbox.json/singbox.log）持久化
+      - /root/warp-instances:/root/warp-instances
+      # 配置（server.js 运行期会写回，需读写挂载）
+      - /root/warp/config.json:/app/config.json
+      # 应用日志
+      - /root/warp/logs:/app/logs
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "3"

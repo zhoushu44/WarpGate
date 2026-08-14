@@ -5,7 +5,7 @@
   "sticky_minutes": 10,
   "auto_rebuild_on_unhealthy": true,
   "health_check_interval": 600,
-  "api_key": "YOUR_API_KEY_HERE",
+  "api_key": "05810fec-5696-47e5-8e3b-28a873a4c2a1",
   "bind_address": "0.0.0.0",
   "mode": "resident",
   "base_port": 10010,

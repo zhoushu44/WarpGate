@@ -50,6 +50,11 @@ const DEFAULT_CONFIG = {
   auto_rotate_on_high_403: true,
   cf_403_threshold: 50,
   cf_min_check_count: 3,
+  // 出口IP风控值检测（scamalytics，带浏览器UA抓取；风控值≥阈值触发换IP）
+  ip_risk_check: true,
+  ip_risk_threshold: 70,
+  ip_risk_ttl: 21600, // 风控值缓存有效期（秒），6小时
+  ip_risk_check_url: 'https://scamalytics.com/ip/',
   log_level: 'info',
   public_ip: 'auto-detect',
   session_cleanup_interval: 30,
@@ -349,8 +354,10 @@ async function checkExitIP(port) {
     const t0 = Date.now();
     try {
       // 强制IPv6: 每个WARP账号分配独立IPv6地址，出口IP必然不同
+      // 注意: --socks5-hostname 下DNS由代理解析(api6.ipify.org仅AAAA→走IPv6出口)，无需 -6
+      //       新版curl(7.88+)加 -6 会因代理地址127.0.0.1是IPv4字面量而立即连接失败
       const ipPrimary = await runCmdFast(
-        `curl -6 -s --max-time 10 --socks5-hostname 127.0.0.1:${port} ${config.ip_check_url_v6}`, 12000
+        `curl -s --max-time 10 --socks5-hostname 127.0.0.1:${port} ${config.ip_check_url_v6}`, 12000
       ).catch(() => '');
       // 回退: IPv4出口（共享NAT，仅用于连通性确认）
       const ipFallback = await runCmdFast(
@@ -366,8 +373,16 @@ async function checkExitIP(port) {
         return primaryTrim;
       }
       
-      // 回退到IPv4
+      // 回退到IPv4（仅当v6始终不可用时才兜底）
       if (fallbackTrim && /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(fallbackTrim)) {
+        if (!primaryTrim) {
+          // v6 未就绪（WireGuard 隧道握手需要数秒），继续重试 v6，IPv4 仅作最终兜底
+          logger.debug('IP_CHECK', `${tag} 第${attempt}次 v6未就绪(仅v4)，继续等待v6...`);
+          if (i < config.ip_check_retries - 1) {
+            await sleep(config.ip_check_interval);
+            continue;
+          }
+        }
         logger.info('IP_CHECK', `${tag} 第${attempt}次成功(回退IPv4) → IP:${fallbackTrim} (v6:${primaryTrim || '无'}) (${elapsed}ms)`);
         return fallbackTrim;
       }
@@ -422,6 +437,55 @@ async function checkOpenAIAccess(port) {
     logger.error('IP_CHECK', `${tag} CF检测异常 (${elapsed}ms): ${e.message}`);
     return 0;
   }
+}
+
+// ==================== L1.5: 出口IP风控值检测（scamalytics） ====================
+// scamalytics 对无UA/短UA的curl返回403，必须带完整浏览器UA
+const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
+const ipRiskCache = new Map(); // ip -> { score, risk, ts }
+
+async function checkIpRiskScore(ip) {
+  if (!ip || !config.ip_risk_check) return null;
+
+  // 缓存命中（同IP在TTL内不重复请求）
+  const cached = ipRiskCache.get(ip);
+  if (cached && Date.now() - cached.ts < config.ip_risk_ttl * 1000) {
+    return cached;
+  }
+
+  const tag = `RISK[${ip.substring(0, 24)}]`;
+  try {
+    const t0 = Date.now();
+    const url = `${config.ip_risk_check_url}${ip}`;
+    const html = await runCmdFast(
+      `curl -s --max-time 12 -A "${BROWSER_UA}" ${url}`, 15000
+    ).catch(() => '');
+
+    const scoreMatch = html.match(/Fraud Score:\s*(\d+)/);
+    const riskMatch = html.match(/"risk"\s*:\s*"(\w+)"/);
+    const score = scoreMatch ? parseInt(scoreMatch[1]) : null;
+
+    if (score === null) {
+      logger.warn('RISK', `${tag} 解析失败 (HTML长度:${html.length})`);
+      return null;
+    }
+
+    const result = {
+      score,
+      risk: riskMatch ? riskMatch[1] : (score >= 70 ? 'high' : score >= 40 ? 'medium' : 'low'),
+      ts: Date.now(),
+    };
+    ipRiskCache.set(ip, result);
+    logger.info('RISK', `${tag} 风控值=${score} (${result.risk}) (${Date.now() - t0}ms)`);
+    return result;
+  } catch (e) {
+    logger.error('RISK', `${tag} 检测异常: ${e.message}`);
+    return null;
+  }
+}
+
+function getRiskLabel(risk) {
+  return risk === 'high' ? '高风险' : risk === 'medium' ? '中风险' : '低风险';
 }
 
 // 实例空闲后执行待处理的自动换IP
@@ -517,6 +581,26 @@ async function checkInstanceHealth(poolKey) {
   if (entry.ip !== ip) {
     logger.info('HEALTH_CHECK', `${tag} IP已变化: ${entry.ip} → ${ip}`);
     entry.ip = ip;
+  }
+
+  // ---- L1.5: 出口IP风控值检测 ----
+  if (config.ip_risk_check) {
+    logger.debug('HEALTH_CHECK', `${tag} L1.5阶段: 检测出口IP风控值...`);
+    const risk = await checkIpRiskScore(ip);
+    entry.ip_risk = risk ? risk.score : null;
+    entry.ip_risk_label = risk ? getRiskLabel(risk.risk) : null;
+
+    if (risk && risk.score >= config.ip_risk_threshold) {
+      logger.warn('HEALTH_CHECK', `${tag} 出口IP风控值${risk.score}(${getRiskLabel(risk.risk)}) ≥ 阈值${config.ip_risk_threshold}，判定为风控IP，触发自动换IP`);
+      if (entry.status === 'available' && !entry.rotate_running) {
+        const ok = await rotateInstanceIP(poolKey);
+        if (ok) {
+          logger.info('HEALTH_CHECK', `${tag} 风控值触发换IP成功`);
+        }
+      }
+      return; // 风控IP不参与CF检测，换完IP后等下次巡检验证
+    }
+    logger.info('HEALTH_CHECK', `${tag} L1.5通过: 风控值=${entry.ip_risk} (${entry.ip_risk_label})`);
   }
 
   // ---- L2: CF可访问性检测 ----
@@ -677,8 +761,23 @@ async function rotateInstanceIP(poolKey) {
         logger.info('ROTATE', `${tag} 最后一次尝试: 接受重复IP ${newIP} (WARP同服务器IP有限)`);
       }
 
+      // 风控验收（warp-sh式"刷完验收"）：新IP风控值高则继续换，最后一次尝试时接受
+      let newRisk = null;
+      if (config.ip_risk_check && !isDuplicate) {
+        newRisk = await checkIpRiskScore(newIP);
+        if (newRisk && newRisk.score >= config.ip_risk_threshold) {
+          if (attempt < config.max_rebuild_attempts - 1) {
+            logger.warn('ROTATE', `${tag} 第${attemptNum}次: 新IP ${newIP} 风控值${newRisk.score}(${getRiskLabel(newRisk.risk)}) ≥ ${config.ip_risk_threshold}，验收不通过，继续重试 (${Date.now() - attemptT0}ms)`);
+            continue;
+          }
+          logger.warn('ROTATE', `${tag} 最后一次尝试: 接受风控值${newRisk.score}的IP ${newIP} (WARP同服务器IP有限)`);
+        }
+      }
+
       // 成功
       entry.ip = newIP;
+      entry.ip_risk = newRisk ? newRisk.score : (config.ip_risk_check && !isDuplicate ? null : entry.ip_risk);
+      entry.ip_risk_label = newRisk ? getRiskLabel(newRisk.risk) : (entry.ip_risk_label || null);
       entry.health = 'healthy';
       entry.cf_check_count = 0;
       entry.cf_403_count = 0;
@@ -1137,6 +1236,8 @@ app.get('/api/containers', async (req, res) => {
           cf_403_count: cf403Count,
           cf_check_count: cfCheckCount,
           cf_last_code: poolEntry.cf_last_code || 0,
+          ip_risk: poolEntry.ip_risk || null,
+          ip_risk_label: poolEntry.ip_risk_label || null,
         });
       } else {
         instances.push({
@@ -1417,6 +1518,7 @@ app.post('/api/config', apiKeyAuth, async (req, res) => {
       'max_rebuild_attempts',
       'cleanup_on_exit', 'rate_limit_enabled', 'rate_limit_per_minute',
       'auto_rotate_on_high_403', 'cf_403_threshold', 'cf_min_check_count',
+      'ip_risk_check', 'ip_risk_threshold', 'ip_risk_ttl', 'ip_risk_check_url',
       'log_level', 'public_ip', 'session_cleanup_interval',
       'team_token',
     ];
@@ -1609,6 +1711,8 @@ app.post('/api/pool/release', async (req, res) => {
     cf_403_rate: entry && entry.cf_check_count > 0 ? Math.round((entry.cf_403_count || 0) / entry.cf_check_count * 100) : null,
     cf_403_count: (entry && entry.cf_403_count) || 0,
     cf_check_count: (entry && entry.cf_check_count) || 0,
+    ip_risk: (entry && entry.ip_risk) || null,
+    ip_risk_label: (entry && entry.ip_risk_label) || null,
   });
 });
 
@@ -1688,6 +1792,8 @@ app.get('/api/pool/status', (req, res) => {
     cf_403_count: entry.cf_403_count || 0,
     cf_check_count: entry.cf_check_count || 0,
     cf_last_code: entry.cf_last_code || 0,
+    ip_risk: entry.ip_risk || null,
+    ip_risk_label: entry.ip_risk_label || null,
   }));
 
   const activeSessions = Array.from(sessions.values()).map(s => {

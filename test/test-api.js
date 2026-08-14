@@ -1,7 +1,7 @@
 // Comprehensive test script for WARP Manager
 const http = require('http');
 
-const API_KEY = 'YOUR_API_KEY_HERE';
+const API_KEY = '05810fec-5696-47e5-8e3b-28a873a4c2a1';
 const BASE = 'http://127.0.0.1:4433';
 
 let passCount = 0;
