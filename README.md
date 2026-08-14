@@ -107,7 +107,7 @@ server.js                  # 与服务器同步的主服务
 deploy-v3.ps1              # 部署脚本（SFTP 上传 + 重启 systemd 服务，进程化方式）
 Dockerfile                 # Docker 镜像定义（内置 sing-box / wgcf 二进制）
 docker-compose.yml         # 容器编排（host 网络 + 挂载卷 + 自启，从 Docker Hub 拉镜像）
-.github/workflows/         # GitHub Actions：push 到 main/master 自动构建并推送镜像（2.0 + latest）
+.github/workflows/         # GitHub Actions：push 到 main/master 自动构建并推送镜像（2.0 / 3.0 / latest）
 test-ipv6-sites.sh         # IPv6 目标网站可达性测试脚本
 test/                      # API / 代理池模拟测试
 ```
@@ -520,14 +520,22 @@ curl -s --compressed --max-time 25 -X POST "https://api.cloudflareclient.com/v0a
 
 ### 方式 A：Docker 容器（推荐，可移植）
 
-**镜像已发布到 Docker Hub**（`zhoushu1/warp-pool`），由 GitHub Actions 在每次 push 到 `main`/`master` 时自动构建并推送 `2.0` 与 `latest` 两个标签（见 [.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml)），**本地不执行任何推送**。镜像内置 sing-box 与 wgcf 二进制，宿主机无需预装 Node/sing-box/wgcf。
+**镜像已发布到 Docker Hub**（`zhoushu1/warp-pool`），由 GitHub Actions 在每次 push 到 `main`/`master` 时自动构建并推送 `2.0`、`3.0` 与 `latest` 三个标签（见 [.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml)），**本地不执行任何推送**。镜像内置 sing-box 与 wgcf 二进制，宿主机无需预装 Node/sing-box/wgcf。
+
+**拉取镜像：**
+
+```bash
+docker pull zhoushu1/warp-pool:latest
+```
+
+#### 方案 1：Docker Compose（推荐）
 
 服务器上只需一份 [docker-compose.yml](docker-compose.yml)：
 
 ```yaml
 services:
   warp:
-    image: zhoushu44/warp-pool:latest   # 每次部署前 docker compose pull 拉取最新
+    image: zhoushu1/warp-pool:latest   # 每次部署前 docker compose pull 拉取最新
     container_name: warp
     network_mode: host        # 需要 host 网络：实例端口 10010-10029 + 服务端口 4433 直接暴露
     restart: unless-stopped   # 开机自启 / 崩溃自动拉起
@@ -538,8 +546,6 @@ services:
     logging: { driver: json-file, options: { max-size: 20m, max-file: "3" } }
 ```
 
-手工部署（服务端）：
-
 ```bash
 # 服务器上执行（需已安装 docker + compose 插件）
 docker compose pull          # 拉取 zhoushu1/warp-pool:latest
@@ -548,7 +554,21 @@ docker compose ps            # 查看状态
 docker logs -f warp          # 查看日志
 ```
 
-**发布新版本**：改代码 → `git push` 到 `main`/`master` → GitHub Actions 自动构建推送（`2.0` + `latest` 双标签）→ 服务器 `docker compose pull && docker compose up -d` 升级，全程不碰本地构建。
+#### 方案 2：docker run 单命令（免 compose）
+
+```bash
+docker run -d --name warp \
+  --network host \
+  --restart unless-stopped \
+  -v /root/warp-instances:/root/warp-instances \
+  -v /root/warp/config.json:/app/config.json \
+  -v /root/warp/logs:/app/logs \
+  zhoushu1/warp-pool:latest
+```
+
+> 必须使用 `--network host`：实例 SOCKS5 端口（10010 起）与 API 端口 4433 直接暴露，sing-box UDP 2408 出站无 NAT 干扰。
+
+**发布新版本**：改代码 → `git push` 到 `main`/`master` → GitHub Actions 自动构建推送（`2.0` / `3.0` / `latest` 三标签）→ 服务器 `docker compose pull && docker compose up -d`（或 `docker pull && docker rm -f warp && docker run ...`）升级，全程不碰本地构建。
 
 容器启动后 RECOVERY 机制自动扫描 `/root/warp-instances`：
 - **复用已有配置启动**：实例目录已有 `singbox.json` 时直接复用（不重新注册账号），每个实例约 9 秒恢复（8 秒等待隧道建立 + 出口检测），秒级恢复 20/20。
@@ -606,6 +626,105 @@ http://<服务器IP>:4433
 4. 启动 sing-box 进程（`detached: true`）
 5. 等待 8 秒，通过 SOCKS5 端口检测 IPv6 出口（最多重试 10 次）
 6. 保存 `meta.json`（pid / ipv6 / endpoint），加入代理池
+
+---
+
+## 管理页面（Web UI）
+
+服务内置一个单页 Web 管理界面（`public/index.html`），浏览器打开即可可视化操作整个代理池：
+
+```text
+http://<服务器IP>:4433
+```
+
+| 区域 | 功能 |
+|---|---|
+| 顶部状态栏 | 服务/Docker 运行状态检测、手动刷新 |
+| 统计卡片 | 容器数、总实例、可用、使用中、不健康、独立 IP 数、活跃会话数 |
+| 配置栏 | 修改实例数、粘性会话时长、403 自动换 IP 开关与阈值（保存即生效） |
+| API 使用面板 | 一键复制普通提取 / 粘性提取的完整 curl 命令 |
+| 工具栏 | 创建/重建实例、删除选中/全部、重建选中、强制换 IP（全部）、代理池会话面板、搜索过滤 |
+| 实例表格 | 每实例：名称/端口/池状态/出口 IP/CF 403 率/健康状态/会话/操作（换 IP、停止、删除、启动） |
+| 任务进度 | 创建/重建/换 IP 等批量任务的实时进度条与日志 |
+
+> 页面所有操作均调用服务端 API（见 [API 参考](#api-参考)），适合人工巡检与运维；业务程序接入请直接用 API（见 [使用说明](#使用说明快速开始)）。
+
+---
+
+## 使用说明（快速开始）
+
+部署完成后，业务程序按 **提取 → 使用 → 归还** 三步接入：
+
+### 1. 提取代理（每次调用轮换出口 IP）
+
+```bash
+curl -s http://127.0.0.1:4433/api/pool/acquire
+```
+
+返回：
+
+```json
+{
+  "success": true,
+  "data": {
+    "session_id": null,
+    "proxy": "socks5://127.0.0.1:10010",
+    "ip": "2a09:bac1:76e0:3d0::48c:5f",
+    "sticky": false
+  }
+}
+```
+
+`proxy` 字段即当前可用的 SOCKS5 代理地址（服务部署在其他机器时，替换为对应公网/内网地址）。
+
+### 2. 通过 SOCKS5 访问目标
+
+```bash
+# 验证出口 IP
+curl -s --socks5-hostname 127.0.0.1:10010 https://api64.ipify.org
+# 走代理调用大模型 API
+curl -s --socks5-hostname 127.0.0.1:10010 https://api.openai.com/v1/models
+```
+
+Python 示例：
+
+```python
+import requests
+resp = requests.get(
+    "https://api64.ipify.org",
+    proxies={"http": "socks5h://127.0.0.1:10010",
+             "https": "socks5h://127.0.0.1:10010"},
+)
+print(resp.text)  # 出口 IPv6（每实例唯一）
+```
+
+### 3. 粘性会话（固定出口 IP）
+
+需要多次请求保持同一出口 IP 时，传自定义 `session_id`：
+
+```bash
+curl -s "http://127.0.0.1:4433/api/pool/acquire?session_id=account-001"
+```
+
+同一 `session_id` 重复调用返回同一代理（默认 10 分钟，超时自动释放）。用完主动归还：
+
+```bash
+curl -s -X POST http://127.0.0.1:4433/api/pool/release \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "account-001"}'
+```
+
+### 4. 上报业务方真实状态码（可选）
+
+SOCKS5 层无法感知 HTTPS 真实响应码，业务拿到 403/429 等状态码后可上报，用于 403 统计与自动换 IP：
+
+```bash
+curl -s -X POST http://127.0.0.1:4433/api/pool/report \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "account-001", "result": 403}'
+```
+
+> 普通提取（非粘性）不占用实例，无需归还；粘性会话建议用完主动 `release`，避免占用到超时。
 
 ---
 
