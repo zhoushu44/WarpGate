@@ -15,10 +15,10 @@
 
 ## 快速部署（Docker）
 
-只用两条命令就能把整套代理池拉起来。镜像由 GitHub Actions 在每次 push 到 `main`/`master` 时自动构建并推送 `1.0` / `latest` 两个标签，**本地无需构建、无需任何推送**：
+只用两条命令就能把整套代理池拉起来。镜像由 GitHub Actions 在每次 push 到 `main`/`master` 时自动构建并推送 `2.0` / `latest` 两个标签，**本地无需构建、无需任何推送**：
 
 ```bash
-# ① 拉取镜像（1.0 与 latest 为同一镜像，随代码更新自动同步）
+# ① 拉取镜像（2.0 与 latest 为同一镜像，随代码更新自动同步）
 docker pull zhoushu1/warp-pool:latest
 
 # ② 启动容器（host 网络 + 实例目录持久化 + 崩溃自启）
@@ -32,6 +32,20 @@ docker run -d --name warp \
 ```
 
 启动后打开管理台 `http://<服务器IP>:4433`，容器会自动恢复/创建 20 个 WARP 实例（SOCKS5 端口 10010～10029）。升级版本：重新 `docker pull` 后 `docker rm -f warp && docker run ...`（或使用 [Docker Compose](#方式-a-docker-容器推荐可移植) 更方便，自带日志轮转与容器管理）。
+
+### 开放端口（安全组/防火墙）
+
+以下为需要在外网访问的功能对应的 **宿主机 TCP 入站端口**（host 网络直监听，Docker 与 systemd 部署要求一致）：
+
+| 端口 | 用途 | 是否需要外网开放 |
+|---|---|---|
+| `4433` | 管理台 / API / 文档 | 必须开放 |
+| `10010 ~ 10029` | 账密模式 SOCKS5（每实例一个端口，`base_port + 索引`） | 账密直连则开放 |
+| `11010 ~ 11029` | 白名单免密 SOCKS5（实例端口 + 1000） | 白名单直连则开放 |
+
+- 端口段随实例数伸缩：实例数 N 对应账密端口 `base_port ~ base_port+N-1`、白名单端口 `+1000`（最大 200 实例）。
+- 只对外开放「管理台 + 白名单提取」时，最小放行 `4433` + `11010~11029`；要走账密直连再放行 `10010~10029`。
+- 入站**无需**开放 UDP 2408（WARP 隧道是出站方向）；若云厂商安全组限制出站，需放行 UDP `2408`（WireGuard 端点）与 UDP/TCP `443`（MASQUE/QUIC 端点）到 Cloudflare。
 
 ---
 
@@ -123,6 +137,7 @@ curl -s "http://<ip>:4433/api/usage?days=30"
 
 - [系统用途](#系统用途)
 - [快速部署（Docker）](#快速部署docker)
+  - [开放端口（安全组/防火墙）](#开放端口安全组防火墙)
 - [商用化接入（v3）](#商用化接入v3)
   - [接入模式：白名单 / 账密](#接入模式白名单--账密)
   - [商用提取 API](#商用提取-api)
@@ -194,7 +209,7 @@ server.js                  # 与服务器同步的主服务
 deploy-v3.ps1              # 部署脚本（SFTP 上传 + 重启 systemd 服务，进程化方式）
 Dockerfile                 # Docker 镜像定义（内置 sing-box / wgcf 二进制）
 docker-compose.yml         # 容器编排（host 网络 + 挂载卷 + 自启，从 Docker Hub 拉镜像）
-.github/workflows/         # GitHub Actions：push 到 main/master 自动构建并推送镜像（1.0 / latest）
+.github/workflows/         # GitHub Actions：push 到 main/master 自动构建并推送镜像（2.0 / latest）
 test-ipv6-sites.sh         # IPv6 目标网站可达性测试脚本
 test/                      # API / 代理池模拟测试
 ```
@@ -607,12 +622,12 @@ curl -s --compressed --max-time 25 -X POST "https://api.cloudflareclient.com/v0a
 
 ### 方式 A：Docker 容器（推荐，可移植）
 
-**镜像已发布到 Docker Hub**（`zhoushu1/warp-pool`），由 GitHub Actions 在每次 push 到 `main`/`master` 时自动构建并推送 `1.0` 与 `latest` 两个标签（见 [.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml)），**本地不执行任何推送**。镜像内置 sing-box 与 wgcf 二进制，宿主机无需预装 Node/sing-box/wgcf。
+**镜像已发布到 Docker Hub**（`zhoushu1/warp-pool`），由 GitHub Actions 在每次 push 到 `main`/`master` 时自动构建并推送 `2.0` 与 `latest` 两个标签（见 [.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml)），**本地不执行任何推送**。镜像内置 sing-box 与 wgcf 二进制，宿主机无需预装 Node/sing-box/wgcf。
 
 **拉取镜像：**
 
 ```bash
-docker pull zhoushu1/warp-pool:latest   # 或 docker pull zhoushu1/warp-pool:1.0（同一镜像）
+docker pull zhoushu1/warp-pool:latest   # 或 docker pull zhoushu1/warp-pool:2.0（同一镜像）
 ```
 
 #### 方案 1：Docker Compose（推荐）
@@ -655,7 +670,7 @@ docker run -d --name warp \
 
 > 必须使用 `--network host`：实例 SOCKS5 端口（10010 起）与 API 端口 4433 直接暴露，sing-box UDP 2408 出站无 NAT 干扰。
 
-**发布新版本**：改代码 → `git push` 到 `main`/`master` → GitHub Actions 自动构建推送（`1.0` / `latest` 两标签）→ 服务器 `docker compose pull && docker compose up -d`（或 `docker pull && docker rm -f warp && docker run ...`）升级，全程不碰本地构建。
+**发布新版本**：改代码 → `git push` 到 `main`/`master` → GitHub Actions 自动构建推送（`2.0` / `latest` 两标签）→ 服务器 `docker compose pull && docker compose up -d`（或 `docker pull && docker rm -f warp && docker run ...`）升级，全程不碰本地构建。
 
 容器启动后 RECOVERY 机制自动扫描 `/root/warp-instances`：
 - **复用已有配置启动**：实例目录已有 `singbox.json` 时直接复用（不重新注册账号），每个实例约 9 秒恢复（8 秒等待隧道建立 + 出口检测），秒级恢复 20/20。
