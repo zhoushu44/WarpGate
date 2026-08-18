@@ -13,6 +13,28 @@
 
 ---
 
+## 快速部署（Docker）
+
+只用两条命令就能把整套代理池拉起来。镜像由 GitHub Actions 在每次 push 到 `main`/`master` 时自动构建并推送 `1.0` / `latest` 两个标签，**本地无需构建、无需任何推送**：
+
+```bash
+# ① 拉取镜像（1.0 与 latest 为同一镜像，随代码更新自动同步）
+docker pull zhoushu1/warp-pool:latest
+
+# ② 启动容器（host 网络 + 实例目录持久化 + 崩溃自启）
+docker run -d --name warp \
+  --network host \
+  --restart unless-stopped \
+  -v /root/warp-instances:/root/warp-instances \
+  -v /root/warp/config.json:/app/config.json \
+  -v /root/warp/logs:/app/logs \
+  zhoushu1/warp-pool:latest
+```
+
+启动后打开管理台 `http://<服务器IP>:4433`，容器会自动恢复/创建 20 个 WARP 实例（SOCKS5 端口 10010～10029）。升级版本：重新 `docker pull` 后 `docker rm -f warp && docker run ...`（或使用 [Docker Compose](#方式-a-docker-容器推荐可移植) 更方便，自带日志轮转与容器管理）。
+
+---
+
 ## 系统用途
 
 **一台服务器 → 多个不同出口 IP 的自动维护代理池**：利用 WARP"每注册账号分配独立 IPv6 出口"的特性，把单台 VPS 扩展为 1～200 个唯一出口 IP，供业务程序按需提取，避免为每个任务单独购买 IP。
@@ -39,9 +61,74 @@ POST /api/pool/release  → 归还实例（可用 /api/pool/report 上报真实 
 
 ---
 
+## 商用化接入（v3）
+
+对齐商用代理平台（CliProxy/MailNest 形态）的接入方式：**无 API Key**，全部通过 **IP 白名单** 鉴权；代理端口支持 **账密 / 白名单免密** 两种模式。
+
+### 接入模式：白名单 / 账密
+
+| 模式 | 对象 | 用法 |
+|---|---|---|
+| **白名单模式** | 白名单内来源 IP | ① 调用全部 API 免任何凭据；② 免密直连代理**白名单端口**（实例端口+1000，如 10010→11010） |
+| **账密模式** | 任何 IP | 代理主端口（10010 起）用 `socks5://user:pass@ip:port`；每实例独立账密，提取响应/管理台可查 |
+
+- 白名单外的 IP 调 API 返回 `401 A0001`（响应带你的 client_ip 和添加命令提示）；服务器本机 `127.0.0.1` 始终放行。
+- 白名单增删/账密开关变更后，系统**热更新全部实例配置**（复用账号不重新注册，出口 IP 不变，进程秒级重启）。
+- 账密模式默认开启（`proxy_auth_enabled`），管理台「实例管理」可开关——**注意：开启后旧的无密码直连脚本会断连**。
+
+### 商用提取 API
+
+```bash
+# 批量提取（CliProxy 风格参数）: num 数量 / type=txt|json / format=n|rn / sid 粘性会话 / time 分钟
+curl -s "http://<ip>:4433/api/proxies?num=5&type=txt&format=n"
+# txt 返回（白名单端口，免密直连）:
+# 192.6.121.16:11010
+# 192.6.121.16:11011
+
+# 粘性提取（同 sid 固定出口，1~1440 分钟）
+curl -s "http://<ip>:4433/api/proxies?num=1&type=json&sid=account-001&time=30"
+
+# 白名单管理
+curl -X POST http://127.0.0.1:4433/api/whitelist -H "Content-Type: application/json" -d '{"add":"1.2.3.4"}'
+
+# 用量统计（数据概览图表数据源）
+curl -s "http://<ip>:4433/api/usage?days=30"
+```
+
+### 长效静态IP（固定绑定）
+
+`POST /api/pool/dedicated/bind` 把一个实例**独占绑定**：锁定其 IPv6 出口，不参与轮换、豁免所有自动换IP/自动重建（403阈值/风控值/健康巡检均跳过），直到 `unbind` 解绑。绑定状态持久化在实例 `meta.json`，服务器重启自动恢复。绑定实例默认拒绝重建/删除（`D0001`，需 `force=true`），缩容/批量换IP自动排除。
+
+> 固定的是每实例唯一的 **IPv6** 出口；IPv4 仍是共享 NAT 池动态轮换（WARP 架构决定）。
+
+### 统一响应与错误码
+
+```json
+{ "code": "00000", "msg": "", "data": {} }
+```
+
+`00000` 成功；`A0001` 不在白名单(401)；`A0002` 限流(429)；`P0001` 无可用代理；`S0001` 会话不存在；`I0001/I0002` 参数/资源错误；`D0001` 固定绑定保护；`R0001` 实例操作失败；`99999` 系统异常。完整文档见内置 `/docs` 页。
+
+### 控制台页面
+
+| 页面 | 路径 | 内容 |
+|---|---|---|
+| 管理台 | `/` | 侧边栏控制台：**数据概览**（统计卡+用量图表+明细+快捷入口）/ **流量代理**（API提取生成器+账密直连+代理列表生成）/ **长效静态IP**（固定绑定列表）/ **实例管理**（原有全部运维功能+账密列） |
+| 白名单管理 | `/whitelist` | 白名单增删/批量删除/一键添加我的IP |
+| API 文档 | `/docs` | 完整接口文档（接入模式/参数表/错误码/curl+Python 示例），左侧导航+右侧目录 |
+
+---
+
 ## 目录
 
 - [系统用途](#系统用途)
+- [快速部署（Docker）](#快速部署docker)
+- [商用化接入（v3）](#商用化接入v3)
+  - [接入模式：白名单 / 账密](#接入模式白名单--账密)
+  - [商用提取 API](#商用提取-api)
+  - [长效静态IP（固定绑定）](#长效静态ip固定绑定)
+  - [统一响应与错误码](#统一响应与错误码)
+  - [控制台页面](#控制台页面)
 - [架构](#架构)
   - [服务器端模块架构](#服务器端模块架构)
 - [技术原理](#技术原理)
@@ -107,7 +194,7 @@ server.js                  # 与服务器同步的主服务
 deploy-v3.ps1              # 部署脚本（SFTP 上传 + 重启 systemd 服务，进程化方式）
 Dockerfile                 # Docker 镜像定义（内置 sing-box / wgcf 二进制）
 docker-compose.yml         # 容器编排（host 网络 + 挂载卷 + 自启，从 Docker Hub 拉镜像）
-.github/workflows/         # GitHub Actions：push 到 main/master 自动构建并推送镜像（2.0 / 3.0 / latest）
+.github/workflows/         # GitHub Actions：push 到 main/master 自动构建并推送镜像（1.0 / latest）
 test-ipv6-sites.sh         # IPv6 目标网站可达性测试脚本
 test/                      # API / 代理池模拟测试
 ```
@@ -520,12 +607,12 @@ curl -s --compressed --max-time 25 -X POST "https://api.cloudflareclient.com/v0a
 
 ### 方式 A：Docker 容器（推荐，可移植）
 
-**镜像已发布到 Docker Hub**（`zhoushu1/warp-pool`），由 GitHub Actions 在每次 push 到 `main`/`master` 时自动构建并推送 `2.0`、`3.0` 与 `latest` 三个标签（见 [.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml)），**本地不执行任何推送**。镜像内置 sing-box 与 wgcf 二进制，宿主机无需预装 Node/sing-box/wgcf。
+**镜像已发布到 Docker Hub**（`zhoushu1/warp-pool`），由 GitHub Actions 在每次 push 到 `main`/`master` 时自动构建并推送 `1.0` 与 `latest` 两个标签（见 [.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml)），**本地不执行任何推送**。镜像内置 sing-box 与 wgcf 二进制，宿主机无需预装 Node/sing-box/wgcf。
 
 **拉取镜像：**
 
 ```bash
-docker pull zhoushu1/warp-pool:latest
+docker pull zhoushu1/warp-pool:latest   # 或 docker pull zhoushu1/warp-pool:1.0（同一镜像）
 ```
 
 #### 方案 1：Docker Compose（推荐）
@@ -568,7 +655,7 @@ docker run -d --name warp \
 
 > 必须使用 `--network host`：实例 SOCKS5 端口（10010 起）与 API 端口 4433 直接暴露，sing-box UDP 2408 出站无 NAT 干扰。
 
-**发布新版本**：改代码 → `git push` 到 `main`/`master` → GitHub Actions 自动构建推送（`2.0` / `3.0` / `latest` 三标签）→ 服务器 `docker compose pull && docker compose up -d`（或 `docker pull && docker rm -f warp && docker run ...`）升级，全程不碰本地构建。
+**发布新版本**：改代码 → `git push` 到 `main`/`master` → GitHub Actions 自动构建推送（`1.0` / `latest` 两标签）→ 服务器 `docker compose pull && docker compose up -d`（或 `docker pull && docker rm -f warp && docker run ...`）升级，全程不碰本地构建。
 
 容器启动后 RECOVERY 机制自动扫描 `/root/warp-instances`：
 - **复用已有配置启动**：实例目录已有 `singbox.json` 时直接复用（不重新注册账号），每个实例约 9 秒恢复（8 秒等待隧道建立 + 出口检测），秒级恢复 20/20。
@@ -1194,4 +1281,10 @@ node --check server.js
 
 ## 安全提示
 
-当前 API 未启用鉴权（`apiKeyAuth` 中间件已预留但默认放行），服务默认监听 `0.0.0.0`。暴露到公网时，应通过防火墙仅放行管理端口，或在反向代理层增加访问控制（API Key），避免任何人创建实例、提取代理或修改配置。SOCKS5 代理端口（10010 起）也应限制访问来源，防止被滥用为公共代理。
+API 通过 **IP 白名单** 鉴权（白名单内免凭据，本机始终放行，白名单外 401）——部署后第一件事是把你的 IP 加入白名单（服务器上执行）：
+
+```bash
+curl -X POST http://127.0.0.1:4433/api/whitelist -H "Content-Type: application/json" -d '{"add":"你的IP"}'
+```
+
+代理端口默认开启**账密模式**（每实例独立 user:pass），无需防火墙也可防滥用；如需免密直连，将来源 IP 加入白名单并使用白名单端口（实例端口+1000）。管理端口 4433 与 SOCKS5 端口仍建议用防火墙收窄来源。

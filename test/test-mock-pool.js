@@ -217,7 +217,8 @@ async function acquire(sessionIdOverride, stickyMinutes) {
 
     const availableKeys = [];
     for (const [key, entry] of pool) {
-      if (entry.status === 'available' && entry.health === 'healthy' && entry.ip) {
+      // 固定IP绑定实例不参与轮换/粘性分配（与 server.js 一致）
+      if (!entry.dedicated && entry.status === 'available' && entry.health === 'healthy' && entry.ip) {
         availableKeys.push(key);
       }
     }
@@ -679,6 +680,48 @@ async function run() {
   test('T13.3 不同显式session轮询到不同IP',
     sticky3.ip !== sticky1.ip,
     `session1=${sticky1.ip} session2=${sticky3.ip}`);
+
+  // ---- T14: 固定IP绑定实例不参与轮换分配 ----
+  console.log('\n--- T14: 固定IP绑定排除 ---');
+  roundRobinIdx = 0;
+  for (const [sid] of sessions) release(sid);
+  for (const [, e] of pool) e.status = 'available';
+
+  // 将 0:0 与 0:1 标记为固定绑定
+  pool.get('0:0').dedicated = true;
+  pool.get('0:1').dedicated = true;
+
+  const nonDedicatedKeys = [];
+  for (const [key, entry] of pool) {
+    if (!entry.dedicated && entry.status === 'available' && entry.health === 'healthy' && entry.ip) {
+      nonDedicatedKeys.push(key);
+    }
+  }
+  test('T14.1 候选列表排除固定绑定实例',
+    nonDedicatedKeys.length === 18 && !nonDedicatedKeys.includes('0:0') && !nonDedicatedKeys.includes('0:1'),
+    `candidates=${nonDedicatedKeys.length}/18`);
+
+  // 连续提取 18 次，均不应命中绑定实例
+  const dedicatedLeak = [];
+  for (let i = 0; i < 18; i++) {
+    const r = await acquire();
+    if (r.pool_key === '0:0' || r.pool_key === '0:1') dedicatedLeak.push(r.pool_key);
+    release(r.session_id);
+  }
+  test('T14.2 18 次提取均未分配到绑定实例',
+    dedicatedLeak.length === 0,
+    `leaks=${dedicatedLeak.join(',') || '无'}`);
+
+  // 解绑后恢复参与
+  delete pool.get('0:0').dedicated;
+  const candidatesAfter = Array.from(pool.keys()).filter(key => {
+    const entry = pool.get(key);
+    return !entry.dedicated && entry.status === 'available' && entry.health === 'healthy' && entry.ip;
+  });
+  test('T14.3 解绑后实例回到候选池',
+    candidatesAfter.length === 19 && candidatesAfter.includes('0:0'),
+    `candidates=${candidatesAfter.length}`);
+  delete pool.get('0:1').dedicated;
 
   // ---- Summary ----
   console.log('\n=== Test Summary ===');

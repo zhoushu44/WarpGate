@@ -5,7 +5,6 @@
   "sticky_minutes": 10,
   "auto_rebuild_on_unhealthy": true,
   "health_check_interval": 600,
-  "api_key": "05810fec-5696-47e5-8e3b-28a873a4c2a1",
   "bind_address": "0.0.0.0",
   "mode": "resident",
   "base_port": 10010,
@@ -24,7 +23,18 @@
   "auto_rotate_on_high_403": true,
   "cf_403_threshold": 50,
   "cf_min_check_count": 3,
+  "ip_risk_check": true,
+  "ip_risk_threshold": 70,
+  "ip_risk_ttl": 21600,
+  "ip_risk_check_url": "https://scamalytics.com/ip/",
   "log_level": "info",
   "public_ip": "auto-detect",
-  "session_cleanup_interval": 30
+  "session_cleanup_interval": 30,
+  "team_token": "",
+  "proxy_auth_enabled": true,
+  "proxy_username": "warpuser",
+  "proxy_password": "test-pass-123",
+  "ip_whitelist": [],
+  "whitelist_port_offset": 1000,
+  "api_key": "05810fec-5696-47e5-8e3b-28a873a4c2a1"
 }

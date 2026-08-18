@@ -6,19 +6,19 @@
   <title>WARP 容器管理系统</title>
   <style>
     :root {
-      --bg: #0f1117;
-      --card: #1a1d27;
-      --card-hover: #222632;
-      --border: #2d3142;
-      --text: #e4e6eb;
-      --text-dim: #8b8f9a;
-      --primary: #f97316;
-      --primary-hover: #ea580c;
-      --success: #22c55e;
-      --danger: #ef4444;
-      --warning: #fbbf24;
-      --info: #3b82f6;
-      --purple: #8b5cf6;
+      --bg: #f5f7fa;
+      --card: #ffffff;
+      --card-hover: #f2f4f8;
+      --border: #e5e8f0;
+      --text: #1f2430;
+      --text-dim: #7a8194;
+      --primary: #7c3aed;
+      --primary-hover: #6d28d9;
+      --success: #16a34a;
+      --danger: #dc2626;
+      --warning: #d97706;
+      --info: #2563eb;
+      --purple: #7c3aed;
     }
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
@@ -28,7 +28,7 @@
       min-height: 100vh;
     }
     .header {
-      background: linear-gradient(135deg, #1a1d27 0%, #0f1117 100%);
+      background: var(--card);
       border-bottom: 1px solid var(--border);
       padding: 16px 24px;
       display: flex;
@@ -76,6 +76,228 @@
     }
     .api-key-badge:hover { border-color: var(--primary); }
     .api-key-badge.no-key { border-color: var(--danger); color: var(--danger); }
+    .nav-link {
+      padding: 6px 14px;
+      border-radius: 8px;
+      font-size: 14px;
+      color: var(--text-dim);
+      text-decoration: none;
+      transition: all 0.2s;
+    }
+    .nav-link:hover { color: var(--text); background: var(--card-hover); }
+    .nav-link.active { color: var(--primary); background: rgba(124,58,237,0.10); }
+    .wl-chip {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 4px 10px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      font-size: 12px;
+      font-family: 'Consolas', monospace;
+    }
+    .wl-chip-x { cursor: pointer; color: var(--text-dim); font-weight: 700; font-size: 14px; }
+    .wl-chip-x:hover { color: var(--danger); }
+
+    /* ===== 控制台布局（侧边栏 + 视图） ===== */
+    .console { display: flex; min-height: calc(100vh - 73px); }
+    .sidebar {
+      width: 220px;
+      flex-shrink: 0;
+      background: var(--card);
+      border-right: 1px solid var(--border);
+      padding: 16px 0;
+      position: sticky;
+      top: 73px;
+      align-self: flex-start;
+      max-height: calc(100vh - 73px);
+      overflow-y: auto;
+    }
+    .nav-group {
+      padding: 12px 20px 4px;
+      font-size: 11px;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+    .side-link {
+      display: block;
+      padding: 9px 20px;
+      font-size: 14px;
+      color: var(--text);
+      text-decoration: none;
+      border-left: 3px solid transparent;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .side-link:hover { background: var(--card-hover); }
+    .side-link.active { border-left-color: var(--primary); color: var(--primary); background: rgba(124,58,237,0.07); }
+    .main-content { flex: 1; min-width: 0; }
+    .view { display: none; }
+    .view.active { display: block; }
+    .view-title { padding: 20px 24px 0; font-size: 18px; font-weight: 600; }
+    .view-desc { padding: 4px 24px 12px; font-size: 13px; color: var(--text-dim); }
+
+    /* ===== 用量图表（数据概览） ===== */
+    .usage-chart {
+      display: flex;
+      align-items: flex-end;
+      gap: 3px;
+      height: 140px;
+      padding: 16px 24px 8px;
+    }
+    .usage-bar-wrap { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 4px; min-width: 0; }
+    .usage-bar {
+      width: 100%;
+      max-width: 28px;
+      background: linear-gradient(180deg, var(--primary) 0%, rgba(124,58,237,0.35) 100%);
+      border-radius: 3px 3px 0 0;
+      min-height: 2px;
+      transition: height 0.3s;
+      cursor: default;
+    }
+    .usage-bar-label { font-size: 9px; color: var(--text-dim); white-space: nowrap; overflow: hidden; }
+    .usage-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .usage-table th { text-align: left; padding: 8px 12px; color: var(--text-dim); font-weight: 600; border-bottom: 1px solid var(--border); }
+    .usage-table td { padding: 7px 12px; border-bottom: 1px solid var(--border); font-family: 'Consolas', monospace; }
+    .usage-table tr:last-child td { border-bottom: none; }
+
+    /* ===== 快捷入口 ===== */
+    .quick-row { display: flex; gap: 12px; padding: 0 24px 16px; flex-wrap: wrap; }
+    .quick-card {
+      flex: 1; min-width: 150px;
+      background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+      padding: 14px 16px; cursor: pointer; transition: all 0.2s;
+    }
+    .quick-card:hover { border-color: var(--primary); background: var(--card-hover); }
+    .quick-card .q-label { font-size: 12px; color: var(--text-dim); margin-bottom: 4px; }
+    .quick-card .q-value { font-size: 22px; font-weight: 700; }
+    .quick-card .q-go { font-size: 12px; color: var(--primary); margin-top: 6px; }
+
+    /* ===== 长效静态IP（CliProxy 复刻） ===== */
+    .page-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      margin: 16px 24px 24px;
+      overflow: hidden;
+    }
+    .static-head {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 20px 24px 14px;
+    }
+    .static-head h2 { font-size: 19px; display: flex; align-items: center; gap: 8px; }
+    .fresh-badge {
+      font-size: 11px; font-weight: 600;
+      background: rgba(22,163,74,0.12); color: var(--success);
+      padding: 2px 8px; border-radius: 10px;
+    }
+    .static-tip { font-size: 12px; color: var(--text-dim); margin-top: 6px; }
+    .static-count { font-size: 13px; color: var(--text-dim); }
+    .static-count b { font-size: 20px; color: var(--purple); margin: 0 2px; }
+    .tab-row {
+      display: flex; align-items: center; gap: 4px;
+      padding: 0 24px; border-bottom: 1px solid var(--border);
+    }
+    .stab {
+      padding: 10px 4px; margin-right: 20px;
+      font-size: 14px; cursor: pointer; color: var(--text);
+      border-bottom: 2px solid transparent;
+      transition: all 0.15s;
+    }
+    .stab.active { color: var(--info); border-bottom-color: var(--info); font-weight: 600; }
+    .stab:hover { color: var(--info); }
+    /* 圆点 radio 风格切换（CliProxy API白名单模式页） */
+    .radio-tab-row {
+      display: flex; align-items: center; gap: 28px;
+      padding: 16px 24px 12px; border-bottom: 1px solid var(--border);
+    }
+    .rtab {
+      display: flex; align-items: center; gap: 7px;
+      font-size: 14px; cursor: pointer; color: var(--text);
+      user-select: none;
+    }
+    .rtab .rdot {
+      width: 14px; height: 14px; border-radius: 50%;
+      border: 2px solid #b6bccb; background: var(--card);
+      transition: all 0.15s;
+    }
+    .rtab.active { color: var(--primary); font-weight: 600; }
+    .rtab.active .rdot { border-color: var(--primary); box-shadow: inset 0 0 0 3px var(--card); background: var(--primary); }
+    .tab-search { margin-left: auto; display: flex; align-items: center; gap: 6px; padding: 8px 0; }
+    .tab-search input {
+      width: 260px; padding: 7px 12px;
+      border: 1px solid var(--border); border-radius: 6px;
+      background: var(--card); color: var(--text); font-size: 13px; outline: none;
+    }
+    .tab-search input:focus { border-color: var(--info); }
+    .icon-btn {
+      padding: 7px 10px; background: var(--card); border: 1px solid var(--border);
+      border-radius: 6px; cursor: pointer; font-size: 13px; color: var(--text-dim);
+    }
+    .icon-btn:hover { border-color: var(--info); color: var(--info); }
+    .batch-bar {
+      display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+      padding: 12px 24px; border-bottom: 1px solid var(--border);
+      font-size: 13px; color: var(--text-dim);
+      background: var(--card);
+    }
+    .batch-bar b { color: var(--text); margin: 0 2px; }
+    .bbtn {
+      padding: 6px 14px; font-size: 12.5px;
+      background: var(--card); border: 1px solid var(--border); border-radius: 6px;
+      color: var(--text); cursor: pointer; transition: all 0.15s;
+    }
+    .bbtn:hover:not(:disabled) { border-color: var(--info); color: var(--info); }
+    .bbtn:disabled { opacity: 0.45; cursor: not-allowed; }
+    .bbtn-primary {
+      padding: 6px 16px; font-size: 12.5px;
+      background: var(--primary); border: none; border-radius: 6px;
+      color: #fff; cursor: pointer; font-weight: 600;
+    }
+    .bbtn-primary:hover { background: var(--primary-hover); }
+    .batch-flex { flex: 1; }
+    .light-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .light-table th {
+      text-align: left; padding: 11px 14px;
+      color: var(--text-dim); font-weight: 600; font-size: 12px;
+      border-bottom: 1px solid var(--border); background: #fafbfd;
+      white-space: nowrap;
+    }
+    .light-table td { padding: 10px 14px; border-bottom: 1px solid var(--border); }
+    .light-table tr:last-child td { border-bottom: none; }
+    .light-table tr:hover td { background: var(--card-hover); }
+    .light-table td.mono { font-family: 'Consolas', monospace; }
+    .remark-cell {
+      cursor: pointer; color: var(--text-dim); font-size: 12.5px;
+      min-width: 90px;
+    }
+    .remark-cell:hover { color: var(--info); }
+    .empty-box { text-align: center; padding: 56px 20px 40px; }
+    .empty-box .icon { font-size: 44px; margin-bottom: 12px; }
+    .empty-box .txt { color: var(--text-dim); font-size: 14px; margin-bottom: 20px; }
+    .btn-purple-big {
+      padding: 10px 28px; background: var(--primary); color: #fff;
+      border: none; border-radius: 8px; font-size: 14px; font-weight: 600;
+      cursor: pointer; box-shadow: 0 2px 8px rgba(124,58,237,0.3);
+    }
+    .btn-purple-big:hover { background: var(--primary-hover); }
+    .op-btn {
+      padding: 3px 10px; font-size: 12px; margin-right: 4px;
+      border: 1px solid var(--border); border-radius: 5px;
+      background: var(--card); cursor: pointer; color: var(--text);
+    }
+    .op-btn:hover { border-color: var(--info); color: var(--info); }
+    .op-btn.danger:hover { border-color: var(--danger); color: var(--danger); }
+    .code-dark {
+      background: #1e2130; color: #e8eaf2;
+      border-radius: 8px; padding: 14px 16px;
+      font-family: 'Consolas', monospace; font-size: 12.5px; line-height: 1.8;
+      white-space: pre-wrap; word-break: break-all;
+      position: relative;
+    }
+    .cred-row { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+    .cred-label { font-size: 12.5px; color: var(--text-dim); width: 66px; flex-shrink: 0; }
+    .cred-row .form-input { flex: 1; padding: 8px 12px; font-size: 13px; }
 
     .stats-bar {
       display: flex;
@@ -214,6 +436,8 @@
     .btn-sm-stop:hover:not(:disabled) { background: #dc2626; }
     .btn-sm-delete { background: #6b7280; color: #fff; }
     .btn-sm-delete:hover:not(:disabled) { background: #4b5563; }
+    .btn-sm-dedicated { background: rgba(139,92,246,0.22); color: var(--purple); }
+    .btn-sm-dedicated:hover:not(:disabled) { background: rgba(139,92,246,0.4); }
 
     .search-box {
       flex: 1;
@@ -237,7 +461,7 @@
     }
     .table-header {
       display: grid;
-      grid-template-columns: 40px 220px 60px 70px 130px 100px 80px 60px 120px;
+      grid-template-columns: 40px 175px 55px 85px 125px 80px 70px 45px 145px 160px;
       padding: 12px 16px;
       background: var(--card-hover);
       border-bottom: 1px solid var(--border);
@@ -247,7 +471,7 @@
     }
     .table-row {
       display: grid;
-      grid-template-columns: 40px 220px 60px 70px 130px 100px 80px 60px 120px;
+      grid-template-columns: 40px 175px 55px 85px 125px 80px 70px 45px 145px 160px;
       padding: 10px 16px;
       border-bottom: 1px solid var(--border);
       font-size: 13px;
@@ -272,6 +496,7 @@
     .badge-available { background: rgba(59,130,246,0.15); color: var(--info); }
     .badge-in-use { background: rgba(251,191,36,0.15); color: var(--warning); }
     .badge-stopped { background: rgba(239,68,68,0.15); color: var(--danger); }
+    .badge-dedicated { background: rgba(139,92,246,0.18); color: var(--purple); }
 
     .ip-cell { font-family: 'Consolas', monospace; white-space: nowrap; }
 
@@ -529,6 +754,9 @@
       <h1>WARP 容器管理系统</h1>
     </div>
     <div class="header-right">
+      <a class="nav-link active" href="/">管理台</a>
+      <a class="nav-link" onclick="switchView('whitelist')" style="cursor:pointer">白名单</a>
+      <a class="nav-link" href="/docs">文档</a>
       <div class="docker-status" id="dockerStatus">
         <span class="status-dot checking"></span>
         <span>检测中...</span>
@@ -537,111 +765,489 @@
     </div>
   </div>
 
-  <div class="stats-bar">
-    <div class="stat-card">
-      <div class="stat-label">容器</div>
-      <div class="stat-value" id="statContainers">0</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">总实例</div>
-      <div class="stat-value" id="statTotalInstances">0</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">可用</div>
-      <div class="stat-value available" id="statAvailable">0</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">使用中</div>
-      <div class="stat-value in-use" id="statInUse">0</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">不健康</div>
-      <div class="stat-value unhealthy" id="statUnhealthy">0</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">独立IP</div>
-      <div class="stat-value unique" id="statUniqueIP">0</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">活跃会话</div>
-      <div class="stat-value" id="statSessions">0</div>
-    </div>
-  </div>
+  <div class="console">
+    <aside class="sidebar">
+      <div class="nav-group">导航</div>
+      <a class="side-link active" data-view="overview" onclick="switchView('overview')">📊 数据概览</a>
+      <div class="nav-group">流量代理</div>
+      <a class="side-link" data-view="traffic-creds" onclick="switchView('traffic-creds')">🔐 账密模式</a>
+      <a class="side-link" data-view="traffic-api" onclick="switchView('traffic-api')">🌐 API白名单模式</a>
+      <div class="nav-group">长效静态ISP</div>
+      <a class="side-link" data-view="static" onclick="switchView('static')">📌 账密模式</a>
+      <a class="side-link" data-view="whitelist" onclick="switchView('whitelist')">🛡️ 白名单管理</a>
+      <div class="nav-group">管理</div>
+      <a class="side-link" data-view="instances" onclick="switchView('instances')">⚙️ 实例管理</a>
+      <a class="side-link" href="/docs">📖 API 文档</a>
+    </aside>
 
-  <div class="config-bar">
-    <div class="config-group">
-      <span class="config-label">实例数:</span>
-      <input type="number" class="config-input" id="instanceCount" value="20" min="1" max="200">
-      <button class="btn btn-sm btn-primary" onclick="applyInstanceCount()">应用</button>
-    </div>
-    <div class="config-group">
-      <span class="config-label">粘性会话(分钟):</span>
-      <input type="number" class="config-input" id="stickyMinutes" value="10" min="1" max="1440">
-      <button class="btn btn-sm btn-primary" onclick="applyStickyMinutes()">应用</button>
-    </div>
-    <div class="config-group">
-      <span class="config-label">403自动换IP:</span>
-      <label class="toggle-switch">
-        <input type="checkbox" id="autoRotateToggle" checked onchange="toggleAutoRotate()">
-        <span class="toggle-slider"></span>
-      </label>
-      <span class="config-label">阈值:</span>
-      <input type="number" class="config-input" id="cf403Threshold" value="50" min="10" max="100" style="width:50px">%
-      <button class="btn btn-sm btn-primary" onclick="applyCfThreshold()">应用</button>
-    </div>
-  </div>
+    <main class="main-content">
+      <!-- ==================== 数据概览 ==================== -->
+      <section class="view active" id="view-overview">
+        <div class="view-title">数据概览</div>
+        <div class="view-desc">代理池运行状态与用量统计（近30天）</div>
 
-  <div class="api-panel">
-    <div class="api-panel-title">
-      <span style="font-size:18px">🔗</span>
-      <span>API 使用</span>
-      <span style="font-size:12px;color:var(--text-dim);font-weight:400;margin-left:8px">每次提取获取不同 IP (Round-Robin)</span>
-    </div>
-    <div class="api-row">
-      <span class="api-row-label">提取代理:</span>
-      <div class="api-row-value" id="acquireUrl">GET /api/pool/acquire</div>
-      <button class="btn-copy" onclick="copyAcquireUrl(this)">复制完整命令</button>
-    </div>
-    <div class="api-row">
-      <span class="api-row-label">粘性提取:</span>
-      <div class="api-row-value">GET /api/pool/acquire?session_id=自定义会话ID</div>
-      <button class="btn-copy" onclick="copyStickyAcquireUrl(this)">复制完整命令</button>
-    </div>
-  </div>
+        <div class="stats-bar">
+          <div class="stat-card">
+            <div class="stat-label">容器</div>
+            <div class="stat-value" id="statContainers">0</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">总实例</div>
+            <div class="stat-value" id="statTotalInstances">0</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">可用</div>
+            <div class="stat-value available" id="statAvailable">0</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">使用中</div>
+            <div class="stat-value in-use" id="statInUse">0</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">不健康</div>
+            <div class="stat-value unhealthy" id="statUnhealthy">0</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">独立IP</div>
+            <div class="stat-value unique" id="statUniqueIP">0</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">固定绑定</div>
+            <div class="stat-value" style="color:var(--purple)" id="statDedicated">0</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">活跃会话</div>
+            <div class="stat-value" id="statSessions">0</div>
+          </div>
+        </div>
 
-  <div class="toolbar">
-    <button class="btn btn-primary" onclick="showCreateModal()">+ 创建/重建实例</button>
-    <button class="btn btn-danger" onclick="deleteSelected()">删除选中</button>
-    <button class="btn btn-ghost" onclick="deleteAll()">删除全部</button>
-    <button class="btn btn-info" onclick="rebuildSelected()">重建选中</button>
-    <button class="btn btn-purple" onclick="rotateAll()">强制换IP(全部)</button>
-    <button class="btn btn-ghost" onclick="togglePoolPanel()">代理池状态</button>
-    <input type="text" class="search-box" placeholder="搜索容器/IP/端口..." id="searchInput" oninput="renderTable()">
-  </div>
+        <div class="quick-row">
+          <div class="quick-card" onclick="switchView('traffic-api')">
+            <div class="q-label">流量代理（轮换提取）</div>
+            <div class="q-value" id="quickTraffic">0</div>
+            <div class="q-go">去使用 →</div>
+          </div>
+          <div class="quick-card" onclick="switchView('static')">
+            <div class="q-label">长效静态IP（固定绑定）</div>
+            <div class="q-value" style="color:var(--purple)" id="quickStatic">0</div>
+            <div class="q-go">去使用 →</div>
+          </div>
+          <div class="quick-card" onclick="switchView('whitelist')">
+            <div class="q-label">IP 白名单</div>
+            <div class="q-value" style="color:var(--info)" id="quickWhitelist">0</div>
+            <div class="q-go">去管理 →</div>
+          </div>
+        </div>
 
-  <div class="pool-panel" id="poolPanel">
-    <div class="pool-panel-header">
-      <span>代理池会话</span>
-      <button class="btn-sm btn-ghost" onclick="togglePoolPanel()">关闭</button>
-    </div>
-    <div class="pool-sessions" id="poolSessions">
-      <div style="text-align:center;color:var(--text-dim);padding:20px;">加载中...</div>
-    </div>
-  </div>
+        <div class="api-panel">
+          <div class="api-panel-title">
+            <span style="font-size:18px">📈</span>
+            <span>用量统计</span>
+            <span style="font-size:12px;color:var(--text-dim);font-weight:400;margin-left:8px">每日提取次数（普通+粘性）</span>
+          </div>
+          <div class="usage-chart" id="usageChart"><div style="color:var(--text-dim);font-size:13px">加载中...</div></div>
+          <div style="margin:0 24px 16px;background:var(--bg);border-radius:8px;max-height:260px;overflow-y:auto">
+            <table class="usage-table">
+              <thead><tr><th>日期</th><th>提取</th><th>粘性</th><th>释放</th><th>上报</th><th>换IP</th><th>绑定</th><th>解绑</th><th>合计</th></tr></thead>
+              <tbody id="usageTableBody"></tbody>
+            </table>
+          </div>
+        </div>
 
-  <div class="table-container">
-    <div class="table-header">
-      <div><input type="checkbox" class="checkbox" id="selectAllCheckbox" onchange="selectAll(this.checked)"></div>
-      <div>容器 / 实例</div>
-      <div>端口</div>
-      <div>池状态</div>
-      <div>出口IP</div>
-      <div>CF 403率</div>
-      <div>健康</div>
-      <div>会话</div>
-      <div>操作</div>
-    </div>
-    <div id="tableBody"></div>
+        <div class="api-panel" id="whitelistPanel" style="margin-bottom:20px">
+          <div class="api-panel-title">
+            <span style="font-size:18px">🛡️</span>
+            <span>IP 白名单</span>
+            <span style="font-size:12px;color:var(--text-dim);font-weight:400;margin-left:8px">白名单内IP: 免Key调API + 免密直连白名单端口（实例端口+1000）</span>
+            <a onclick="switchView('whitelist')" style="margin-left:auto;font-size:12px;color:var(--primary);text-decoration:none;cursor:pointer">白名单管理 →</a>
+          </div>
+          <div id="whitelistChips" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px"></div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <input type="text" class="search-box" style="flex:0 0 260px;min-width:200px" id="wlInput" placeholder="IP 或 CIDR，如 1.2.3.4 或 10.0.0.0/24">
+            <button class="btn btn-primary" style="padding:8px 16px" onclick="addWhitelist()">添加</button>
+            <button class="btn btn-ghost" style="padding:8px 16px" onclick="addMyIP()">添加我的IP (<span id="wlMyIP">…</span>)</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== 流量代理 · API白名单模式（CliProxy 复刻） ==================== -->
+      <section class="view" id="view-traffic-api">
+        <div class="page-card">
+          <div class="radio-tab-row">
+            <div class="rtab active" id="rtabApi" onclick="switchTrafficTab('api')"><span class="rdot"></span>API提取</div>
+            <div class="rtab" id="rtabWl" onclick="switchTrafficTab('wl')"><span class="rdot"></span>白名单列表</div>
+          </div>
+
+          <!-- Tab1: API 提取 -->
+          <div id="trafficApiWrap">
+            <div style="display:flex;gap:14px;flex-wrap:wrap;padding:16px 24px 6px;align-items:center">
+              <div class="config-group"><span class="config-label">分隔符:</span>
+                <select class="config-input" id="genFormat" style="width:70px;text-align:left" onchange="updateGenLink()">
+                  <option value="n">\n</option><option value="rn">\r\n</option>
+                </select>
+              </div>
+              <div class="config-group"><span class="config-label">会话类型:</span>
+                <select class="config-input" id="genSession" style="width:110px;text-align:left" onchange="updateGenLink()">
+                  <option value="">轮换 IP</option>
+                  <option value="sticky">Sticky IP</option>
+                </select>
+              </div>
+              <div class="config-group" id="genTimeGroup" style="display:none"><span class="config-label">时长:</span>
+                <select class="config-input" id="genTime" style="width:80px;text-align:left" onchange="updateGenLink()">
+                  <option>5</option><option selected>10</option><option>30</option><option>60</option><option>120</option>
+                </select>
+                <span class="config-label">分钟</span>
+              </div>
+              <div class="config-group"><span class="config-label">数据格式:</span>
+                <select class="config-input" id="genType" style="width:80px;text-align:left" onchange="updateGenLink()">
+                  <option value="txt">txt</option><option value="json">json</option>
+                </select>
+              </div>
+              <div class="config-group"><span class="config-label">数量:</span>
+                <input type="number" class="config-input" id="genNum" value="1" min="1" max="20" style="width:60px" oninput="updateGenLink()">
+              </div>
+            </div>
+
+            <div style="display:flex;gap:8px;align-items:center;padding:10px 24px 4px">
+              <input readonly id="genApiLink" class="form-input" style="flex:1;font-family:Consolas,monospace;font-size:12.5px;color:var(--info)" value="">
+              <button class="icon-btn" title="复制链接" onclick="copyTextSilent(document.getElementById('genApiLink').value);showToast('链接已复制','success')">📋</button>
+              <button class="bbtn-primary" style="padding:8px 18px" onclick="window.open(document.getElementById('genApiLink').value,'_blank')">打开链接</button>
+            </div>
+
+            <div style="padding:14px 24px 8px">
+              <h4 style="font-size:14px;margin-bottom:10px">接口参数注释</h4>
+              <div style="border:1px solid var(--border);border-radius:8px;overflow:auto">
+                <table class="light-table">
+                  <thead><tr><th>参数名</th><th>说明</th><th>类型</th><th>必选</th></tr></thead>
+                  <tbody>
+                    <tr><td class="mono">num</td><td>提取ip数量</td><td class="mono">int</td><td>是</td></tr>
+                    <tr><td class="mono">format</td><td>返回数据格式分割符，n = \n rn = \r\n</td><td class="mono">int</td><td>是</td></tr>
+                    <tr><td class="mono">time</td><td>轮转时长（分钟，粘性会话）</td><td class="mono">string</td><td>否</td></tr>
+                    <tr><td class="mono">type</td><td>数据格式: txt json</td><td class="mono">string</td><td>否</td></tr>
+                    <tr><td class="mono">sid</td><td>粘性会话ID（相同sid提取到同一出口IP）</td><td class="mono">string</td><td>否</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div style="padding:6px 24px 20px">
+              <h4 style="font-size:14px;margin-bottom:10px">返回示例</h4>
+              <div class="code-dark">192.6.121.16:11010
+192.6.121.16:11011
+192.6.121.16:11012</div>
+              <div class="info-box" style="margin-top:8px">
+                txt 每行一条 <code>IP:端口</code>（白名单端口，免密直连）；json 返回结构化数据（含账密与出口IP）。白名单内IP免Key调用本接口。
+              </div>
+            </div>
+          </div>
+
+          <!-- Tab2: 白名单列表 -->
+          <div id="trafficWlWrap" style="display:none">
+            <div class="batch-bar" style="border-bottom:none">
+              <button class="bbtn-primary" onclick="showAddWlModal()">+ 添加白名单</button>
+              <button class="bbtn" id="tBtnBatchDel" disabled onclick="trafficWlBatchDelete()">批量删除</button>
+              <span class="batch-flex"></span>
+              <input id="tWlSearch" class="form-input" style="width:220px;padding:7px 12px" placeholder="请输入IP搜索" oninput="renderTrafficWl()">
+            </div>
+            <div style="padding:0 24px;font-size:12px;color:var(--text-dim)">注意：白名单内IP免密直连代理白名单端口（实例端口+1000）并免Key调用全部API；服务器本机始终放行。</div>
+            <div style="padding:10px 24px 20px">
+              <table class="light-table">
+                <thead><tr>
+                  <th style="width:36px"><input type="checkbox" id="tWlSelectAll" onchange="trafficWlToggleAll(this.checked)" style="accent-color:var(--primary)"></th>
+                  <th style="width:44px">#</th><th>IP</th><th>备注</th><th style="width:80px">操作</th>
+                </tr></thead>
+                <tbody id="tWlBody"></tbody>
+              </table>
+              <div class="empty-box" id="tWlEmpty" style="display:none"><div class="icon">🗂️</div><div class="txt">Empty Data</div></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== 流量代理 · 账密模式（使用设置 / 使用教程 + 左右双栏） ===== -->
+      <section class="view" id="view-traffic-creds">
+        <div class="page-card">
+          <div class="tab-row">
+            <div class="stab active" id="ctabUse" onclick="switchCredsTab('use')">使用设置</div>
+            <div class="stab" id="ctabDoc" onclick="switchCredsTab('doc')">使用教程</div>
+          </div>
+
+          <div id="credsUseWrap" style="display:flex;gap:0;flex-wrap:wrap">
+            <!-- 左：配置区 -->
+            <div style="flex:1;min-width:320px;padding:20px 24px;border-right:1px solid var(--border)">
+              <h4 style="font-size:14px;margin-bottom:14px">基础设置</h4>
+              <div class="form-group">
+                <label class="form-label">会话类型 (?) <span title="轮换IP=每次请求换出口；Sticky IP=同会话固定出口">❓</span></label>
+                <select class="form-input" id="cSession" onchange="updateCredsPreview()">
+                  <option value="">轮换 IP</option><option value="sticky" selected>Sticky IP</option>
+                </select>
+              </div>
+              <div class="form-group" id="cTimeGroup">
+                <label class="form-label">时长 (1-120min)</label>
+                <div style="display:flex;gap:6px;align-items:center">
+                  <button class="icon-btn" onclick="stepInput('cTime',-1,1,120)">−</button>
+                  <input type="number" class="form-input" id="cTime" value="5" min="1" max="120" style="width:80px;text-align:center" onchange="updateCredsPreview()">
+                  <button class="icon-btn" onclick="stepInput('cTime',1,1,120)">＋</button>
+                </div>
+              </div>
+              <div class="form-group">
+                <label class="form-label">用户名</label>
+                <div style="display:flex;gap:6px;align-items:center">
+                  <input readonly class="form-input" id="cUsername" style="font-family:Consolas,monospace" value="--">
+                  <button class="icon-btn" title="复制用户名" onclick="copyTextSilent(document.getElementById('cUsername').value);showToast('已复制','success')">📋</button>
+                </div>
+              </div>
+              <div class="form-group">
+                <label class="form-label">密码</label>
+                <div style="display:flex;gap:6px;align-items:center">
+                  <input readonly class="form-input" id="cPassword" style="font-family:Consolas,monospace" value="--">
+                  <button class="icon-btn" title="复制密码" onclick="copyTextSilent(document.getElementById('cPassword').value);showToast('已复制','success')">📋</button>
+                  <button class="icon-btn" title="修改密码" onclick="editCredsPassword()">✏️</button>
+                </div>
+              </div>
+              <div class="info-box">一套账密适用于全部实例端口（每个端口对应一个独立出口IP）；修改密码立即热更新生效（IP不变）。</div>
+              <h4 style="font-size:14px;margin:18px 0 8px;display:flex;align-items:center;gap:8px">
+                高级设置
+                <label class="toggle-switch"><input type="checkbox" id="cWlToggle" onchange="toggleTrafficWl()"><span class="toggle-slider"></span></label>
+              </h4>
+              <div style="font-size:12px;color:var(--text-dim);line-height:1.8;margin-bottom:10px">
+                未开启状态下所有IP均可连通，开启后，只有添加到白名单的IP才能免密连通成功（白名单端口）。
+              </div>
+              <button class="bbtn" onclick="switchView('traffic-api');switchTrafficTab('wl')">添加 IP +</button>
+            </div>
+
+            <!-- 右：预览生成区 -->
+            <div style="flex:1.2;min-width:360px;padding:20px 24px">
+              <h4 style="font-size:14px;margin-bottom:14px">测试示例</h4>
+              <div class="cred-row"><span class="cred-label">主机端口:</span><input readonly class="form-input" id="pvHost" style="font-family:Consolas,monospace"><button class="icon-btn" onclick="copyTextSilent(document.getElementById('pvHost').value);showToast('已复制','success')">📋</button></div>
+              <div class="cred-row"><span class="cred-label">用户名:</span><input readonly class="form-input" id="pvUser" style="font-family:Consolas,monospace"><button class="icon-btn" onclick="copyTextSilent(document.getElementById('pvUser').value);showToast('已复制','success')">📋</button></div>
+              <div class="cred-row"><span class="cred-label">密码:</span><input readonly class="form-input" id="pvPass" style="font-family:Consolas,monospace"><button class="icon-btn" onclick="copyTextSilent(document.getElementById('pvPass').value);showToast('已复制','success')">📋</button></div>
+
+              <div style="display:flex;gap:16px;margin:14px 0 8px;border-bottom:1px solid var(--border)">
+                <div class="stab active" id="ptabHttp" style="margin-right:0" onclick="switchProto('http')">HTTP(S)</div>
+                <div class="stab" id="ptabSocks" style="margin-right:0" onclick="switchProto('socks')">SOCKS5</div>
+              </div>
+              <div class="code-dark" id="pvCurl"></div>
+
+              <h4 style="font-size:14px;margin:18px 0 10px">特定格式的代理列表</h4>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+                <select class="form-input" id="listFormat" style="width:240px">
+                  <option value="host">hostname:port</option>
+                  <option value="hostauth" selected>hostname:port:username:password</option>
+                  <option value="socks">socks5://username:password@hostname:port</option>
+                </select>
+                <div style="display:flex;gap:4px;align-items:center">
+                  <button class="icon-btn" onclick="stepInput('listNum',-1,1,200)">−</button>
+                  <input type="number" class="form-input" id="listNum" value="1" min="1" max="200" style="width:64px;text-align:center">
+                  <button class="icon-btn" onclick="stepInput('listNum',1,1,200)">＋</button>
+                </div>
+                <button style="padding:7px 18px;background:#ea580c;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600" onclick="genProxyList()">生成</button>
+                <button class="bbtn" onclick="copyTextSilent(document.getElementById('proxyListBox').textContent);showToast('已复制全部','success')">复制全部</button>
+              </div>
+              <div class="code-dark" id="proxyListBox" style="min-height:48px">生成后此处展示代理列表</div>
+            </div>
+          </div>
+
+          <div id="credsDocWrap" style="display:none;padding:24px">
+            <div class="info-box" style="line-height:2">
+              · 白名单外：账密直连 <code>socks5://用户名:密码@服务器IP:端口</code>（本页上方「测试示例」）<br>
+              · 白名单内：免密直连白名单端口（实例端口+1000），且调用全部API免Key<br>
+              · 完整接口说明见 <a href="/docs" style="color:var(--primary)">API 文档</a>；粘性会话通过 <code>sid</code> 参数实现<br>
+              · 修改密码后立即生效（实例热重启，出口IP不变）
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== 长效静态IP（CliProxy 复刻） ==================== -->
+      <section class="view" id="view-static">
+        <div class="page-card">
+          <div class="static-head">
+            <div>
+              <h2>长效静态IP <span class="fresh-badge">固定绑定</span></h2>
+              <div class="static-tip">提示：固定IP绑定后长期有效（IPv6出口固定），解绑后实例归还代理池；IPv4出口仍为共享NAT轮换</div>
+            </div>
+            <div class="static-count">当前绑定<b id="staticCount">0</b>个</div>
+          </div>
+
+          <div class="tab-row">
+            <div class="stab active" id="stabUsage" onclick="switchStaticTab('usage')">使用记录</div>
+            <div class="stab" id="stabHistory" onclick="switchStaticTab('history')">历史记录</div>
+            <div class="tab-search">
+              <input id="staticSearch" placeholder="支持搜索实例名/出口IP/备注" onkeydown="if(event.key==='Enter')renderStatic()">
+              <button class="icon-btn" onclick="renderStatic()" title="搜索">🔍</button>
+              <button class="icon-btn" onclick="loadStaticAll()" title="刷新列表">⟳</button>
+            </div>
+          </div>
+
+          <div class="batch-bar" id="staticBatchBar">
+            <span>已选 <b id="staticSelCount">0</b> 条数据</span>
+            <button class="bbtn" id="btnBatchCopy" disabled onclick="staticBatchCopy()">批量复制</button>
+            <button class="bbtn" id="btnBatchRemark" disabled onclick="staticBatchRemark()">批量编辑</button>
+            <button class="bbtn" id="btnBatchExport" disabled onclick="staticBatchExport()">批量导出</button>
+            <button class="bbtn" id="btnBatchUnbind" disabled onclick="staticBatchUnbind()">批量解绑</button>
+            <span class="batch-flex"></span>
+            <button class="bbtn" onclick="resetAllCreds(this)">重置全部账密</button>
+            <button class="bbtn-primary" onclick="staticExportAll()">全部导出</button>
+          </div>
+
+          <!-- 使用记录 -->
+          <div id="staticUsageWrap">
+            <table class="light-table">
+              <thead><tr>
+                <th style="width:36px"><input type="checkbox" id="staticSelectAll" onchange="staticToggleAll(this.checked)" style="accent-color:var(--primary)"></th>
+                <th style="width:44px">#</th>
+                <th>实例</th>
+                <th>IP地址（出口）</th>
+                <th>端口</th>
+                <th>用户名</th>
+                <th>密码</th>
+                <th>提取时间</th>
+                <th>过期时间</th>
+                <th>备注</th>
+                <th style="width:150px">操作</th>
+              </tr></thead>
+              <tbody id="staticUsageBody"></tbody>
+            </table>
+            <div class="empty-box" id="staticEmpty">
+              <div class="icon">🗂️</div>
+              <div class="txt">暂无使用记录</div>
+              <button class="btn-purple-big" onclick="showBindModal()">提取并使用 IP</button>
+            </div>
+          </div>
+
+          <!-- 历史记录 -->
+          <div id="staticHistoryWrap" style="display:none">
+            <table class="light-table">
+              <thead><tr>
+                <th style="width:44px">#</th>
+                <th>实例</th>
+                <th>IP地址</th>
+                <th>端口</th>
+                <th>提取时间</th>
+                <th>解绑时间</th>
+                <th>备注</th>
+              </tr></thead>
+              <tbody id="staticHistoryBody"></tbody>
+            </table>
+            <div class="empty-box" id="staticHistoryEmpty" style="display:none">
+              <div class="icon">🗂️</div>
+              <div class="txt">暂无历史记录</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== 白名单管理（长效静态ISP 子页） ==================== -->
+      <section class="view" id="view-whitelist">
+        <div class="page-card">
+          <div class="toolbar" style="padding:16px 20px">
+            <button class="btn-purple" onclick="showAddWlModal()">＋ 添加白名单</button>
+            <button class="bbtn" id="wlPageBatchBtn" disabled onclick="wlPageBatchDelete()">批量删除</button>
+            <div class="search-wrap" style="margin-left:auto;position:relative">
+              <input id="wlPageSearch" style="width:240px;padding:8px 36px 8px 14px;border:1px solid var(--border);border-radius:8px;background:var(--card);color:var(--text);font-size:13px;outline:none" placeholder="请输入IP地址" onkeydown="if(event.key==='Enter')renderWlPage()">
+              <span style="position:absolute;right:10px;top:50%;transform:translateY(-50%);cursor:pointer" onclick="renderWlPage()">🔍</span>
+            </div>
+          </div>
+          <div style="padding:0 20px 14px;font-size:12px;color:var(--text-dim)">
+            白名单内的IP：① 免密直连代理白名单端口（实例端口+1000）② 调用全部API免Key。服务器本机始终放行；变更后自动热更新实例配置（出口IP不变）。
+          </div>
+          <table class="light-table">
+            <thead><tr>
+              <th style="width:40px"><input type="checkbox" id="wlPageSelectAll" onchange="wlPageToggleAll(this.checked)" style="accent-color:var(--primary)"></th>
+              <th style="width:50px">#</th>
+              <th>IP</th>
+              <th style="width:190px">地区</th>
+              <th>描述</th>
+              <th style="width:140px">操作</th>
+            </tr></thead>
+            <tbody id="wlPageBody"></tbody>
+          </table>
+          <div class="empty-box" id="wlPageEmpty" style="display:none"><div class="icon">🗂️</div><div class="txt">Empty Data</div></div>
+        </div>
+        <div class="page-card" style="padding:20px 24px">
+          <div style="font-size:12.5px;color:var(--text-dim);line-height:2">
+            · 支持 IP 与 CIDR（IPv4/IPv6），添加时自动查询归属地。你的IP: <b id="wlPageMyIP" style="color:var(--primary);font-family:Consolas">…</b>
+            <button class="op-btn" style="margin-left:6px" onclick="wlPageAddMyIP()">一键添加我的IP</button><br>
+            · 远程无法访问时，在服务器上执行: <code style="font-family:Consolas;background:var(--card-hover);padding:1px 6px;border-radius:4px">curl -X POST http://127.0.0.1:4433/api/whitelist -H "Content-Type: application/json" -d '{"add":"你的IP"}'</code><br>
+            · 完整接口说明见 <a href="/docs" style="color:var(--primary)">API 文档</a>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== 实例管理 ==================== -->
+      <section class="view" id="view-instances">
+        <div class="view-title">实例管理</div>
+        <div class="view-desc">WARP 实例的创建、重建、换IP、启停与删除</div>
+
+        <div class="config-bar" style="padding-top:12px">
+          <div class="config-group">
+            <span class="config-label">实例数:</span>
+            <input type="number" class="config-input" id="instanceCount" value="20" min="1" max="200">
+            <button class="btn btn-sm btn-primary" onclick="applyInstanceCount()">应用</button>
+          </div>
+          <div class="config-group">
+            <span class="config-label">粘性会话(分钟):</span>
+            <input type="number" class="config-input" id="stickyMinutes" value="10" min="1" max="1440">
+            <button class="btn btn-sm btn-primary" onclick="applyStickyMinutes()">应用</button>
+          </div>
+          <div class="config-group">
+            <span class="config-label">403自动换IP:</span>
+            <label class="toggle-switch">
+              <input type="checkbox" id="autoRotateToggle" checked onchange="toggleAutoRotate()">
+              <span class="toggle-slider"></span>
+            </label>
+            <span class="config-label">阈值:</span>
+            <input type="number" class="config-input" id="cf403Threshold" value="50" min="10" max="100" style="width:50px">%
+            <button class="btn btn-sm btn-primary" onclick="applyCfThreshold()">应用</button>
+          </div>
+          <div class="config-group">
+            <span class="config-label">账密模式:</span>
+            <label class="toggle-switch">
+              <input type="checkbox" id="proxyAuthToggle" checked onchange="toggleProxyAuth()">
+              <span class="toggle-slider"></span>
+            </label>
+            <span style="font-size:11px;color:var(--text-dim)">SOCKS5需用户名密码</span>
+          </div>
+        </div>
+
+        <div class="toolbar">
+          <button class="btn btn-primary" onclick="showCreateModal()">+ 创建/重建实例</button>
+          <button class="btn btn-danger" onclick="deleteSelected()">删除选中</button>
+          <button class="btn btn-ghost" onclick="deleteAll()">删除全部</button>
+          <button class="btn btn-info" onclick="rebuildSelected()">重建选中</button>
+          <button class="btn btn-purple" onclick="rotateAll()">强制换IP(全部)</button>
+          <button class="btn btn-ghost" onclick="togglePoolPanel()">代理池状态</button>
+          <input type="text" class="search-box" placeholder="搜索容器/IP/端口..." id="searchInput" oninput="renderTable()">
+        </div>
+
+        <div class="pool-panel" id="poolPanel">
+          <div class="pool-panel-header">
+            <span>代理池会话</span>
+            <button class="btn-sm btn-ghost" onclick="togglePoolPanel()">关闭</button>
+          </div>
+          <div class="pool-sessions" id="poolSessions">
+            <div style="text-align:center;color:var(--text-dim);padding:20px;">加载中...</div>
+          </div>
+        </div>
+
+        <div class="table-container" style="margin-bottom:20px">
+          <div class="table-header">
+            <div><input type="checkbox" class="checkbox" id="selectAllCheckbox" onchange="selectAll(this.checked)"></div>
+            <div>容器 / 实例</div>
+            <div>端口</div>
+            <div>池状态</div>
+            <div>出口IP</div>
+            <div>CF 403率</div>
+            <div>健康</div>
+            <div>会话</div>
+            <div>账密 (user:pass)</div>
+            <div>操作</div>
+          </div>
+          <div id="tableBody"></div>
+        </div>
+      </section>
+    </main>
   </div>
 
   <div class="footer">
@@ -671,6 +1277,106 @@
     </div>
   </div>
 
+  <!-- 编辑白名单描述 Modal -->
+  <div class="modal-overlay" id="editWlModal">
+    <div class="modal">
+      <h2>编辑白名单</h2>
+      <div class="modal-body">
+        <div class="form-group">
+          <label class="form-label">IP（不可修改）</label>
+          <input type="text" class="form-input" id="editWlIp" readonly style="color:var(--text-dim)">
+        </div>
+        <div class="form-group">
+          <label class="form-label">描述</label>
+          <input type="text" class="form-input" id="editWlRemark" placeholder="备注说明">
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" onclick="closeModal('editWlModal')">取消</button>
+        <button class="btn btn-primary" onclick="doWlEdit()">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 添加白名单 Modal -->
+  <div class="modal-overlay" id="addWlModal">
+    <div class="modal">
+      <h2>添加白名单</h2>
+      <div class="modal-body">
+        <div class="form-group">
+          <label class="form-label">IP 地址 / CIDR</label>
+          <input type="text" class="form-input" id="addWlIp" placeholder="如 1.2.3.4 或 10.0.0.0/24" onkeydown="if(event.key==='Enter')doAddWl()">
+        </div>
+        <div class="form-group">
+          <label class="form-label">描述（可选）</label>
+          <input type="text" class="form-input" id="addWlRemark" placeholder="如：公司出口/家里宽带">
+        </div>
+        <div class="info-box">白名单内IP将免Key调用全部API，并免密直连代理白名单端口（实例端口+1000）。提交后自动查询归属地。</div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" onclick="closeModal('addWlModal')">取消</button>
+        <button class="btn btn-primary" onclick="doAddWl()">提交</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 提取并使用IP Modal（长效静态IP） -->
+  <div class="modal-overlay" id="bindModal">
+    <div class="modal">
+      <h2>提取并使用 IP</h2>
+      <div class="modal-body">
+        <div class="form-group">
+          <label class="form-label">提取数量（1-20，每个IP独占一个实例）</label>
+          <input type="number" class="form-input" id="bindCount" value="1" min="1" max="20">
+        </div>
+        <div class="form-group">
+          <label class="form-label">备注（可选，用于标记用途）</label>
+          <input type="text" class="form-input" id="bindRemark" placeholder="如：店铺A登录专线">
+        </div>
+        <div class="info-box">
+          绑定后锁定实例当前 IPv6 出口：不参与轮换、豁免所有自动换IP，直到解绑。<br>
+          白名单外请用账密连接（提取后可在列表中复制）；白名单内可用免密端口（端口+1000）。
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" onclick="closeModal('bindModal')">取消</button>
+        <button class="btn btn-primary" id="bindConfirmBtn" onclick="doBind()">提取并使用 IP</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 批量编辑备注 Modal -->
+  <div class="modal-overlay" id="remarkModal">
+    <div class="modal">
+      <h2>批量编辑备注</h2>
+      <div class="modal-body">
+        <div class="form-group">
+          <label class="form-label">为选中的 <span id="remarkTargetCount">0</span> 条记录设置备注</label>
+          <input type="text" class="form-input" id="batchRemarkInput" placeholder="输入备注内容">
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" onclick="closeModal('remarkModal')">取消</button>
+        <button class="btn btn-primary" onclick="doBatchRemark()">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 访问受限 Modal（来源IP不在白名单） -->
+  <div class="modal-overlay" id="accessModal">
+    <div class="modal">
+      <h2>访问受限</h2>
+      <div class="modal-body">
+        你的IP <b id="accessMyIP" style="color:var(--warning);font-family:Consolas"></b> 不在白名单，无法调用API。<br><br>
+        在<b>服务器上</b>执行以下命令添加白名单（服务器本机始终放行）：
+        <div class="info-box" id="accessHint" style="margin-top:10px;font-family:Consolas;white-space:pre-wrap;word-break:break-all"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-primary" onclick="closeModal('accessModal');refreshAll()">已添加，重试</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Progress Overlay -->
   <div class="progress-overlay" id="progressOverlay">
     <div class="progress-box">
@@ -694,6 +1400,23 @@
     let appConfig = null;
 
     // ==================== 复制功能 ====================
+    function copyTextSilent(text) {
+      if (!text) return;
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).catch(() => fallbackCopyText(text));
+      } else {
+        fallbackCopyText(text);
+      }
+    }
+    function fallbackCopyText(text) {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    }
+
     function copyText(text, btn) {
       if (!text || text === '--' || text === '未设置') return;
       navigator.clipboard.writeText(text).then(() => {
@@ -717,22 +1440,57 @@
     }
 
     function copyAcquireUrl(btn) {
-      const host = window.location.origin;
-      const cmd = `curl -s "${host}/api/pool/acquire"`;
+      const cmd = `curl -s "${window.location.origin}/api/pool/acquire"`;
       copyText(cmd, btn);
     }
 
     function copyStickyAcquireUrl(btn) {
-      const host = window.location.origin;
-      const cmd = `curl -s "${host}/api/pool/acquire?session_id=自定义会话ID"`;
+      const cmd = `curl -s "${window.location.origin}/api/pool/acquire?session_id=自定义会话ID&minutes=10"`;
       copyText(cmd, btn);
     }
 
-    // ==================== API 请求 ====================
+    function copyDedicatedBindUrl(btn) {
+      const cmd = `curl -s -X POST -H "Content-Type: application/json" -d '{}' "${window.location.origin}/api/pool/dedicated/bind"`;
+      copyText(cmd, btn);
+    }
+
+    function copyDirectProxy(btn) {
+      const c = instances.find(i => i.proxy_auth && i.username);
+      if (!c) return showToast('暂无可用实例', 'error');
+      const cmd = `curl -s --proxy "${c.proxy_auth}" https://api64.ipify.org`;
+      copyText(cmd, btn);
+    }
+
+    // ==================== API 请求（白名单鉴权 + 商用响应格式兼容层） ====================
+    // 服务端统一返回 {code, msg, data}（code==='00000' 为成功）；白名单内IP免Key调用
+    // 这里转换为 {success, data, error:{message}} 兼容旧调用方
     async function api(url, options = {}) {
       const headers = { 'Content-Type': 'application/json', ...options.headers };
       const res = await fetch(url, { ...options, headers });
-      return res.json();
+
+      let body = null;
+      try { body = await res.json(); } catch (e) { body = null; }
+
+      if (res.status === 401) {
+        showAccessDenied(body);
+        return { success: false, code: 'A0001', error: { code: 'A0001', message: '来源IP不在白名单' } };
+      }
+
+      const ok = !!(body && body.code === '00000');
+      return {
+        success: ok,
+        code: body ? body.code : null,
+        msg: body ? body.msg : '响应解析失败',
+        data: ok ? body.data : null,
+        error: ok ? null : { code: body ? body.code : '99999', message: (body && body.msg) || '请求失败' },
+      };
+    }
+
+    function showAccessDenied(body) {
+      const d = (body && body.data) || {};
+      document.getElementById('accessMyIP').textContent = d.client_ip || '未知';
+      document.getElementById('accessHint').textContent = d.hint || '';
+      document.getElementById('accessModal').classList.add('show');
     }
 
     // ==================== Docker 检查 ====================
@@ -740,17 +1498,17 @@
       try {
         const data = await api('/api/check');
         const el = document.getElementById('dockerStatus');
-        if (data.success) {
+        if (data.code === 'A0001') {
+          el.innerHTML = `<span class="status-dot offline"></span><span>API 未授权</span>`;
+        } else if (data.success) {
           const d = data.data;
-          if (!d.daemonRunning) {
-            el.innerHTML = `<span class="status-dot offline"></span><span>Docker 未运行</span>`;
-          } else if (!d.imageExists) {
-            el.innerHTML = `<span class="status-dot checking"></span><span>Docker 正常 | 镜像未拉取</span>`;
+          if (d.singboxExists) {
+            el.innerHTML = `<span class="status-dot"></span><span>运行中 | ${d.poolSize} 实例</span>`;
           } else {
-            el.innerHTML = `<span class="status-dot"></span><span>Docker 正常</span>`;
+            el.innerHTML = `<span class="status-dot offline"></span><span>sing-box 未安装</span>`;
           }
         } else {
-          el.innerHTML = `<span class="status-dot offline"></span><span>Docker 异常</span>`;
+          el.innerHTML = `<span class="status-dot offline"></span><span>服务异常</span>`;
         }
       } catch (e) {
         document.getElementById('dockerStatus').innerHTML =
@@ -777,6 +1535,10 @@
           if (document.getElementById('cf403Threshold') && !document.activeElement.matches('#cf403Threshold')) {
             document.getElementById('cf403Threshold').value = appConfig.cf_403_threshold || 50;
           }
+          // 账密模式开关
+          if (document.getElementById('proxyAuthToggle')) {
+            document.getElementById('proxyAuthToggle').checked = appConfig.proxy_auth_enabled !== false;
+          }
           // 更新端口范围显示
           const portStart = document.getElementById('portRangeStart');
           const portEnd = document.getElementById('portRangeEnd');
@@ -800,6 +1562,7 @@
           document.getElementById('statInUse').textContent = d.in_use;
           document.getElementById('statUnhealthy').textContent = d.unhealthy;
           document.getElementById('statUniqueIP').textContent = d.unique_ips;
+          document.getElementById('statDedicated').textContent = d.dedicated || 0;
           document.getElementById('statSessions').textContent = d.active_sessions;
         }
       } catch (e) {}
@@ -813,6 +1576,7 @@
           instances = data.data;
           renderTable();
           loadStats();
+          fillCredsPanel();
         }
       } catch (e) {}
     }
@@ -866,6 +1630,9 @@
         } else {
           poolBadge = `<span class="badge badge-unknown">${c.pool_status || '-'}</span>`;
         }
+        if (c.dedicated) {
+          poolBadge += ` <span class="badge badge-dedicated">固定</span>`;
+        }
 
         const ipCell = c.ip
           ? `<span class="ip-cell">${c.ip}</span>`
@@ -885,10 +1652,19 @@
 
         const sessionInfo = c.pool_status === 'in_use' ? '是' : '-';
 
+        const credsCell = c.username
+          ? `<span style="font-family:Consolas;font-size:11px;cursor:pointer" title="点击复制" onclick="copyText('${c.username}:${c.password}', this)">${c.username}:${c.password}</span>`
+          : `<span style="color:var(--text-dim);font-size:12px">免密</span>`;
+
         let actions = '';
         if (c.pool_status === 'stopped') {
           actions += `<button class="btn-sm btn-sm-start" onclick="startContainer('${c.container}')">启动</button>`;
         } else if (c.pool_status !== 'stopped' && c.instance_index >= 0) {
+          if (c.dedicated) {
+            actions += `<button class="btn-sm btn-sm-dedicated" onclick="unbindDedicated('${c.container}')">解绑</button>`;
+          } else {
+            actions += `<button class="btn-sm btn-sm-dedicated" onclick="bindDedicated('${c.container}')">固定</button>`;
+          }
           actions += `<button class="btn-sm btn-sm-rotate" onclick="rotateOne('${c.container}', ${c.instance_index}, '${c.pool_key || ''}')">换IP</button>`;
           actions += `<button class="btn-sm btn-sm-stop" onclick="stopContainer('${c.container}')">停止</button>`;
         }
@@ -908,6 +1684,7 @@
             <div>${cfCell}</div>
             <div>${healthBadge}</div>
             <div style="font-size:12px;color:var(--text-dim)">${sessionInfo}</div>
+            <div>${credsCell}</div>
             <div class="row-actions">${actions}</div>
           </div>
         `;
@@ -953,6 +1730,744 @@
       });
       else selectedNames.clear();
       renderTable();
+    }
+
+    // ==================== 白名单管理 ====================
+    let wlData = { items: [], ips: [] };
+    async function loadWhitelist() {
+      try {
+        const resp = await api('/api/whitelist');
+        if (resp.success) {
+          wlData = resp.data;
+          if (!wlData.items) wlData.items = (wlData.ips || []).map(ip => ({ ip, remark: '' }));
+          renderWhitelist(wlData);
+          renderTrafficWl();
+        }
+      } catch (e) {}
+    }
+
+    function renderWhitelist(d) {
+      const myIP = document.getElementById('wlMyIP');
+      if (myIP) myIP.textContent = d.client_ip || '未知';
+      const qw = document.getElementById('quickWhitelist');
+      if (qw) qw.textContent = (d.ips || []).length;
+      const box = document.getElementById('whitelistChips');
+      if (!box) return;
+      if (!d.ips || !d.ips.length) {
+        box.innerHTML = '<span style="color:var(--text-dim);font-size:13px">白名单为空（仅服务器本机 127.0.0.1 可调API）</span>';
+        return;
+      }
+      box.innerHTML = d.ips.map(ip =>
+        `<span class="wl-chip">${ip}<span class="wl-chip-x" onclick="removeWhitelist('${ip}')" title="移除">×</span></span>`
+      ).join('');
+    }
+
+    async function addWhitelist() {
+      const v = document.getElementById('wlInput').value.trim();
+      if (!v) return showToast('请输入 IP 或 CIDR', 'error');
+      await postWhitelist({ add: v });
+      document.getElementById('wlInput').value = '';
+    }
+
+    function showAddWlModal() {
+      document.getElementById('addWlIp').value = '';
+      document.getElementById('addWlRemark').value = '';
+      document.getElementById('addWlModal').classList.add('show');
+    }
+
+    async function doAddWl() {
+      const ip = document.getElementById('addWlIp').value.trim();
+      const remark = document.getElementById('addWlRemark').value.trim();
+      if (!ip) return showToast('请输入 IP 地址', 'error');
+      closeModal('addWlModal');
+      await postWhitelist({ add: { ip, remark } });
+      renderTrafficWl();
+    }
+
+    async function addMyIP() {
+      const ip = document.getElementById('wlMyIP').textContent;
+      if (!ip || ip === '未知') return showToast('无法识别当前IP', 'error');
+      await postWhitelist({ add: ip });
+    }
+
+    async function removeWhitelist(ip) {
+      await postWhitelist({ remove: ip });
+    }
+
+    async function postWhitelist(payload) {
+      try {
+        const resp = await api('/api/whitelist', {
+          method: 'POST',
+          body: JSON.stringify(payload),
+        });
+        if (resp.success) {
+          showToast('白名单已更新，正在热更新实例配置（IP不变）', 'success');
+          loadWhitelist();
+          if (resp.data && resp.data.reapply_job_id) {
+            pollJob(resp.data.reapply_job_id, '热更新接入配置').then(() => {
+              hideProgress();
+              refreshAll();
+            });
+          }
+        } else {
+          showToast(resp.error?.message || '更新失败', 'error');
+        }
+      } catch (e) { showToast(e.message, 'error'); }
+    }
+
+    async function toggleProxyAuth() {
+      const enabled = document.getElementById('proxyAuthToggle').checked;
+      try {
+        const resp = await api('/api/config', {
+          method: 'POST',
+          body: JSON.stringify({ proxy_auth_enabled: enabled }),
+        });
+        if (resp.success) {
+          showToast(`账密模式已${enabled ? '开启' : '关闭'}，正在热更新实例（IP不变）`, 'success');
+          if (resp.data && resp.data.reapply_job_id) {
+            pollJob(resp.data.reapply_job_id, '热更新接入配置').then(() => {
+              hideProgress();
+              refreshAll();
+            });
+          }
+        } else {
+          showToast(resp.error?.message || '设置失败', 'error');
+          document.getElementById('proxyAuthToggle').checked = !enabled;
+        }
+      } catch (e) {
+        showToast(e.message, 'error');
+        document.getElementById('proxyAuthToggle').checked = !enabled;
+      }
+    }
+
+    // ==================== 视图切换（侧边栏控制台） ====================
+    function switchView(name) {
+      document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+      const target = document.getElementById('view-' + name);
+      if (target) target.classList.add('active');
+      document.querySelectorAll('.side-link[data-view]').forEach(a => {
+        a.classList.toggle('active', a.dataset.view === name);
+      });
+      history.replaceState(null, '', '#' + name);
+      if (name === 'overview') { loadUsage(); }
+      if (name === 'static') { loadStaticAll(); }
+      if (name === 'whitelist') { loadWhitelist().then(() => renderWlPage()); }
+      if (name === 'traffic-api') { updateGenLink(); renderTrafficWl(); }
+      if (name === 'traffic-creds') { fillCredsPanel(); }
+    }
+
+    // ==================== 用量统计（数据概览） ====================
+    let usageData = [];
+    async function loadUsage() {
+      try {
+        const resp = await api('/api/usage?days=30');
+        if (resp.success) {
+          usageData = resp.data.days || [];
+          renderUsage();
+        }
+      } catch (e) {}
+    }
+
+    function renderUsage() {
+      // 快捷入口卡片
+      const today = usageData[usageData.length - 1] || { acquires: 0, sticky: 0 };
+      const qt = document.getElementById('quickTraffic');
+      if (qt) qt.textContent = (today.acquires || 0) + (today.sticky || 0);
+
+      // 柱状图（近30天，隔天显示标签）
+      const chart = document.getElementById('usageChart');
+      if (!chart) return;
+      const max = Math.max(1, ...usageData.map(d => d.total || 0));
+      chart.innerHTML = usageData.map((d, i) => {
+        const h = Math.round((d.total || 0) / max * 100);
+        const label = (i % 3 === 0 || i === usageData.length - 1) ? d.date.slice(5) : '';
+        return `<div class="usage-bar-wrap" title="${d.date}: ${d.total}次">
+          <div class="usage-bar" style="height:${Math.max(h, 1)}%"></div>
+          <div class="usage-bar-label">${label}</div>
+        </div>`;
+      }).join('');
+
+      // 明细表（倒序，仅显示有数据的日期 + 今天）
+      const tbody = document.getElementById('usageTableBody');
+      const rows = usageData.filter(d => d.total > 0 || d.date === new Date().toISOString().slice(0, 10)).reverse();
+      tbody.innerHTML = rows.length === 0
+        ? '<tr><td colspan="9" style="color:var(--text-dim);text-align:center;padding:20px">暂无用量数据</td></tr>'
+        : rows.map(d => `<tr>
+            <td>${d.date}</td><td>${d.acquires||0}</td><td>${d.sticky||0}</td><td>${d.releases||0}</td>
+            <td>${d.reports||0}</td><td>${d.rotates||0}</td><td>${d.binds||0}</td><td>${d.unbinds||0}</td>
+            <td style="color:var(--primary);font-weight:700">${d.total||0}</td>
+          </tr>`).join('');
+    }
+
+    // ==================== 长效静态IP（CliProxy 复刻） ====================
+    let dedicatedList = [];
+    let dedicatedHistory = [];
+    let staticSelected = new Set();
+    let staticTab = 'usage';
+
+    async function loadStaticAll() {
+      await Promise.all([loadDedicated(), loadDedicatedHistory()]);
+    }
+
+    async function loadDedicated() {
+      try {
+        const resp = await api('/api/pool/dedicated');
+        if (resp.success) {
+          dedicatedList = resp.data.items || [];
+          renderStatic();
+        }
+      } catch (e) {}
+    }
+
+    async function loadDedicatedHistory() {
+      try {
+        const resp = await api('/api/pool/dedicated/history');
+        if (resp.success) {
+          dedicatedHistory = resp.data.items || [];
+          renderStatic();
+        }
+      } catch (e) {}
+    }
+
+    function switchStaticTab(tab) {
+      staticTab = tab;
+      document.getElementById('stabUsage').classList.toggle('active', tab === 'usage');
+      document.getElementById('stabHistory').classList.toggle('active', tab === 'history');
+      document.getElementById('staticUsageWrap').style.display = tab === 'usage' ? '' : 'none';
+      document.getElementById('staticHistoryWrap').style.display = tab === 'history' ? '' : 'none';
+      document.getElementById('staticBatchBar').style.display = tab === 'usage' ? '' : 'none';
+      renderStatic();
+    }
+
+    function staticMatches(d) {
+      const q = (document.getElementById('staticSearch').value || '').trim().toLowerCase();
+      if (!q) return true;
+      return (d.name || '').toLowerCase().includes(q)
+        || (d.ip || '').includes(q)
+        || (d.remark || '').toLowerCase().includes(q);
+    }
+
+    function renderStatic() {
+      // 概览快捷卡 & 头部计数
+      const qs = document.getElementById('quickStatic');
+      if (qs) qs.textContent = dedicatedList.length;
+      const sc = document.getElementById('staticCount');
+      if (sc) sc.textContent = dedicatedList.length;
+
+      const filtered = dedicatedList.filter(staticMatches);
+      const tbody = document.getElementById('staticUsageBody');
+      const empty = document.getElementById('staticEmpty');
+      if (!tbody) return;
+
+      if (!filtered.length) {
+        tbody.innerHTML = '';
+        empty.style.display = '';
+        staticSelected.clear();
+        updateStaticSelCount();
+        renderStaticHistory();
+        return;
+      }
+      empty.style.display = 'none';
+      tbody.innerHTML = filtered.map((d, i) => `        <tr>
+          <td><input type="checkbox" data-name="${d.name}" ${staticSelected.has(d.name) ? 'checked' : ''} onchange="staticToggleOne('${d.name}', this.checked)" style="accent-color:var(--primary)"></td>
+          <td>${i + 1}</td>
+          <td class="mono">${d.name}</td>
+          <td class="mono" style="cursor:pointer" title="点击复制" onclick="copyText('${d.ip || ''}', this)">${d.ip || '--'}</td>
+          <td class="mono">${d.host_port}${d.proxy_whitelist ? ` <span style="color:var(--text-dim);font-size:11px">(免密${d.host_port + 1000})</span>` : ''}</td>
+          <td class="mono">${d.username || '免密'}</td>
+          <td class="mono" style="cursor:pointer" title="点击复制" onclick="copyText('${d.password || ''}', this)">${d.password || '--'}</td>
+          <td style="font-size:12px;color:var(--text-dim)">${d.bound_at ? new Date(d.bound_at).toLocaleString() : '--'}</td>
+          <td><span style="color:var(--success);font-size:12px">长期有效</span></td>
+          <td><span class="remark-cell" onclick="editRemark('${d.name}')" title="点击编辑备注">${d.remark || '点击添加备注'}</span></td>
+          <td>
+            <button class="op-btn" onclick="copyStaticRow('${d.name}')">复制</button>
+            <button class="op-btn" onclick="rotateDedicated('${d.name}')">换IP</button>
+            <button class="op-btn danger" onclick="unbindDedicated('${d.name}')">解绑</button>
+          </td>
+        </tr>`).join('');
+      updateStaticSelCount();
+      renderStaticHistory();
+    }
+
+    function renderStaticHistory() {
+      const tbody = document.getElementById('staticHistoryBody');
+      const empty = document.getElementById('staticHistoryEmpty');
+      if (!tbody) return;
+      const q = (document.getElementById('staticSearch').value || '').trim().toLowerCase();
+      const filtered = dedicatedHistory.filter(r => !q
+        || (r.name || '').toLowerCase().includes(q)
+        || (r.ip || '').includes(q)
+        || (r.remark || '').toLowerCase().includes(q));
+      if (!filtered.length) {
+        tbody.innerHTML = '';
+        empty.style.display = '';
+        return;
+      }
+      empty.style.display = 'none';
+      tbody.innerHTML = filtered.map((r, i) => `
+        <tr>
+          <td>${i + 1}</td>
+          <td class="mono">${r.name}</td>
+          <td class="mono">${r.ip || '--'}</td>
+          <td class="mono">${r.port || '--'}</td>
+          <td style="font-size:12px;color:var(--text-dim)">${r.bound_at ? new Date(r.bound_at).toLocaleString() : '--'}</td>
+          <td style="font-size:12px;color:var(--text-dim)">${r.unbound_at ? new Date(r.unbound_at).toLocaleString() : '<span style="color:var(--success)">使用中</span>'}</td>
+          <td style="font-size:12px">${r.remark || '--'}</td>
+        </tr>`).join('');
+    }
+
+    // 渲染入口：按当前 Tab 分发（历史表在使用记录渲染时一并刷新）
+
+    function staticToggleAll(checked) {
+      const filtered = dedicatedList.filter(staticMatches);
+      if (checked) filtered.forEach(d => staticSelected.add(d.name));
+      else staticSelected.clear();
+      renderStatic();
+    }
+    function staticToggleOne(name, checked) {
+      if (checked) staticSelected.add(name); else staticSelected.delete(name);
+      updateStaticSelCount();
+    }
+    function updateStaticSelCount() {
+      const n = staticSelected.size;
+      document.getElementById('staticSelCount').textContent = n;
+      ['btnBatchCopy', 'btnBatchRemark', 'btnBatchExport', 'btnBatchUnbind'].forEach(id => {
+        const b = document.getElementById(id);
+        if (b) b.disabled = n === 0;
+      });
+      const all = document.getElementById('staticSelectAll');
+      if (all) all.checked = n > 0 && n === dedicatedList.filter(staticMatches).length;
+    }
+
+    function staticRowText(d) {
+      return `${location.hostname}:${d.host_port}:${d.username || ''}:${d.password || ''}`;
+    }
+
+    function copyStaticRow(name) {
+      const d = dedicatedList.find(x => x.name === name);
+      if (d) { copyTextSilent(staticRowText(d)); showToast('已复制该条代理', 'success'); }
+    }
+
+    function staticBatchCopy() {
+      const rows = dedicatedList.filter(d => staticSelected.has(d.name));
+      if (!rows.length) return;
+      copyTextSilent(rows.map(staticRowText).join('\n'));
+      showToast(`已复制 ${rows.length} 条`, 'success');
+    }
+
+    function staticBatchRemark() {
+      if (!staticSelected.size) return;
+      document.getElementById('remarkTargetCount').textContent = staticSelected.size;
+      document.getElementById('batchRemarkInput').value = '';
+      document.getElementById('remarkModal').classList.add('show');
+    }
+
+    async function doBatchRemark() {
+      const remark = document.getElementById('batchRemarkInput').value.trim();
+      const names = Array.from(staticSelected);
+      let ok = 0;
+      for (const name of names) {
+        const resp = await api('/api/pool/dedicated/remark', {
+          method: 'POST', body: JSON.stringify({ name, remark }),
+        }).catch(() => null);
+        if (resp && resp.success) ok++;
+      }
+      closeModal('remarkModal');
+      showToast(`已更新 ${ok}/${names.length} 条备注`, 'success');
+      loadDedicated();
+    }
+
+    async function editRemark(name) {
+      const d = dedicatedList.find(x => x.name === name);
+      const val = prompt('修改备注（留空清除）:', d ? (d.remark || '') : '');
+      if (val === null) return;
+      const resp = await api('/api/pool/dedicated/remark', {
+        method: 'POST', body: JSON.stringify({ name, remark: val.trim() }),
+      });
+      if (resp.success) { showToast('备注已更新', 'success'); loadDedicated(); }
+      else showToast(resp.error?.message || '更新失败', 'error');
+    }
+
+    function downloadText(filename, text) {
+      const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    }
+
+    function staticBatchExport() {
+      const rows = dedicatedList.filter(d => staticSelected.has(d.name));
+      if (!rows.length) return;
+      downloadText(`static-ips-${rows.length}.txt`, rows.map(staticRowText).join('\n'));
+    }
+
+    function staticExportAll() {
+      if (!dedicatedList.length) return showToast('暂无绑定数据', 'error');
+      downloadText(`static-ips-all-${dedicatedList.length}.txt`, dedicatedList.map(staticRowText).join('\n'));
+    }
+
+    async function staticBatchUnbind() {
+      if (!staticSelected.size) return;
+      if (!confirm(`确认解绑选中的 ${staticSelected.size} 个固定IP? 解绑后实例归还代理池`)) return;
+      let ok = 0;
+      for (const name of Array.from(staticSelected)) {
+        const resp = await api('/api/pool/dedicated/unbind', {
+          method: 'POST', body: JSON.stringify({ name }),
+        }).catch(() => null);
+        if (resp && resp.success) ok++;
+      }
+      showToast(`已解绑 ${ok} 个`, 'info');
+      staticSelected.clear();
+      loadStaticAll();
+      loadStats();
+    }
+
+    async function unbindDedicated(name) {
+      if (!confirm(`确认解除 ${name} 的固定IP绑定?`)) return;
+      const resp = await api('/api/pool/dedicated/unbind', {
+        method: 'POST', body: JSON.stringify({ name }),
+      });
+      if (resp.success) {
+        showToast(`${name} 已解除绑定`, 'info');
+        loadStaticAll(); loadStats();
+      } else showToast(resp.error?.message || '解绑失败', 'error');
+    }
+
+    async function rotateDedicated(name) {
+      if (!confirm(`确认为 ${name} 强制换IP? 换后保持绑定状态（IPv6出口变更）`)) return;
+      const resp = await api('/api/pool/rotate', {
+        method: 'POST', body: JSON.stringify({ pool_key: name.replace('warp-', ''), force: true }),
+      });
+      if (resp.success) {
+        const job = await pollJob(resp.data.jobId, `换IP ${name}`);
+        showToast(job && job.results[0] && job.results[0].success ? `换IP成功: ${job.results[0].new_ip}` : '换IP失败', job && job.results[0] && job.results[0].success ? 'success' : 'error');
+        loadStaticAll();
+      } else showToast(resp.error?.message || '操作失败', 'error');
+    }
+
+    function showBindModal() {
+      document.getElementById('bindCount').value = 1;
+      document.getElementById('bindRemark').value = '';
+      document.getElementById('bindModal').classList.add('show');
+    }
+
+    async function doBind() {
+      const count = Math.min(Math.max(parseInt(document.getElementById('bindCount').value) || 1, 1), 20);
+      const remark = document.getElementById('bindRemark').value.trim();
+      const btn = document.getElementById('bindConfirmBtn');
+      btn.disabled = true; btn.textContent = '提取中...';
+      try {
+        const resp = await api('/api/pool/dedicated/bind', {
+          method: 'POST', body: JSON.stringify({ count, remark }),
+        });
+        if (resp.success) {
+          const n = resp.data.count;
+          showToast(`已提取 ${n} 个固定IP`, 'success');
+          closeModal('bindModal');
+          loadStaticAll(); loadStats();
+        } else {
+          showToast(resp.error?.message || '提取失败', 'error');
+        }
+      } catch (e) {
+        showToast(e.message, 'error');
+      } finally {
+        btn.disabled = false; btn.textContent = '提取并使用 IP';
+      }
+    }
+
+    async function resetAllCreds(btn) {
+      if (!confirm('确认重置全部实例的代理密码?\n旧密码立即失效（用户名不变，出口IP不变），使用账密的脚本需更新密码。')) return;
+      const orig = btn.textContent;
+      btn.disabled = true; btn.textContent = '重置中...';
+      try {
+        const resp = await api('/api/creds/reset', { method: 'POST', body: JSON.stringify({}) });
+        if (resp.success && resp.data.job_id) {
+          const job = await pollJob(resp.data.job_id, '重置全部账密');
+          showToast('账密已重置并热更新完成', 'success');
+        } else {
+          showToast(resp.error?.message || '重置失败', 'error');
+        }
+      } catch (e) {
+        showToast(e.message, 'error');
+      } finally {
+        btn.disabled = false; btn.textContent = orig;
+        hideProgress();
+        loadStaticAll();
+      }
+    }
+
+    // ==================== 流量代理：API提取 / 白名单列表（radio 子Tab） ====================
+    function switchTrafficTab(tab) {
+      document.getElementById('rtabApi').classList.toggle('active', tab === 'api');
+      document.getElementById('rtabWl').classList.toggle('active', tab === 'wl');
+      document.getElementById('trafficApiWrap').style.display = tab === 'api' ? '' : 'none';
+      document.getElementById('trafficWlWrap').style.display = tab === 'wl' ? '' : 'none';
+      if (tab === 'api') updateGenLink();
+      if (tab === 'wl') renderTrafficWl();
+    }
+
+    function updateGenLink() {
+      const num = Math.min(Math.max(parseInt(document.getElementById('genNum').value) || 1, 1), 20);
+      const sticky = document.getElementById('genSession').value === 'sticky';
+      document.getElementById('genTimeGroup').style.display = sticky ? '' : 'none';
+      const time = parseInt(document.getElementById('genTime').value) || 10;
+      const type = document.getElementById('genType').value;
+      const format = document.getElementById('genFormat').value;
+      let q = `num=${num}&type=${type}&format=${format}`;
+      if (sticky) q += `&sid=mysession&time=${time}`;
+      document.getElementById('genApiLink').value = `${window.location.origin}/api/proxies?${q}`;
+    }
+
+    // ==================== 流量代理：白名单列表 Tab ====================
+    let tWlSelected = new Set();
+    function renderTrafficWl() {
+      const q = (document.getElementById('tWlSearch').value || '').trim().toLowerCase();
+      const items = (wlData.items || wlData.ips || []).filter(e => {
+        const ip = typeof e === 'string' ? e : e.ip;
+        return !q || ip.toLowerCase().includes(q);
+      });
+      const toggle = document.getElementById('cWlToggle');
+      if (toggle) toggle.checked = items.length > 0;
+      const tbody = document.getElementById('tWlBody');
+      const empty = document.getElementById('tWlEmpty');
+      if (!items.length) {
+        tbody.innerHTML = '';
+        empty.style.display = '';
+        tWlSelected.clear();
+        document.getElementById('tBtnBatchDel').disabled = true;
+        return;
+      }
+      empty.style.display = 'none';
+      tbody.innerHTML = items.map((e, i) => {
+        const ip = typeof e === 'string' ? e : e.ip;
+        const remark = typeof e === 'object' ? (e.remark || '') : '';
+        return `<tr>
+          <td><input type="checkbox" data-ip="${ip}" ${tWlSelected.has(ip) ? 'checked' : ''} onchange="trafficWlToggleOne('${ip}', this.checked)" style="accent-color:var(--primary)"></td>
+          <td>${i + 1}</td>
+          <td class="mono">${ip}</td>
+          <td style="font-size:12.5px">${remark || '--'}</td>
+          <td><button class="op-btn danger" onclick="trafficWlRemove('${ip}')">删除</button></td>
+        </tr>`;
+      }).join('');
+      updateTWlBtns(items.length);
+    }
+    function trafficWlToggleAll(checked) {
+      const q = (document.getElementById('tWlSearch').value || '').trim().toLowerCase();
+      (wlData.items || []).forEach(e => {
+        const ip = typeof e === 'string' ? e : e.ip;
+        if (!q || ip.toLowerCase().includes(q)) { if (checked) tWlSelected.add(ip); else tWlSelected.delete(ip); }
+      });
+      renderTrafficWl();
+    }
+    function trafficWlToggleOne(ip, checked) {
+      if (checked) tWlSelected.add(ip); else tWlSelected.delete(ip);
+      updateTWlBtns();
+    }
+    function updateTWlBtns(total) {
+      const n = tWlSelected.size;
+      document.getElementById('tBtnBatchDel').disabled = n === 0;
+      const all = document.getElementById('tWlSelectAll');
+      if (all) all.checked = total ? n === total : false;
+    }
+    async function trafficWlRemove(ip) {
+      if (!confirm(`确认删除白名单 ${ip}?`)) return;
+      await postWhitelist({ remove: ip });
+      renderTrafficWl();
+    }
+    async function trafficWlBatchDelete() {
+      if (!tWlSelected.size) return;
+      if (!confirm(`确认批量删除选中的 ${tWlSelected.size} 条白名单?`)) return;
+      const remain = (wlData.items || []).map(e => typeof e === 'string' ? e : e.ip).filter(ip => !tWlSelected.has(ip));
+      await postWhitelist({ ips: remain.map(ip => ({ ip })) });
+      tWlSelected.clear();
+      renderTrafficWl();
+    }
+    async function toggleTrafficWl() {
+      // 高级设置开关 = 是否启用白名单（清空/恢复由白名单管理决定，这里只提示）
+      const on = document.getElementById('cWlToggle').checked;
+      if (on && !(wlData.items || []).length) {
+        showToast('白名单为空，请先添加IP（点击下方「添加 IP +」）', 'info');
+        document.getElementById('cWlToggle').checked = false;
+        return;
+      }
+      if (!on && (wlData.items || []).length) {
+        if (confirm('关闭高级设置将清空白名单（全部实例恢复仅账密访问），确认?')) {
+          await postWhitelist({ ips: [] });
+        } else {
+          document.getElementById('cWlToggle').checked = true;
+        }
+      }
+    }
+
+    // ==================== 白名单管理页（view-whitelist） ====================
+    let wlPageSelected = new Set();
+    function renderWlPage() {
+      const my = document.getElementById('wlPageMyIP');
+      if (my) my.textContent = wlData.client_ip || '未知';
+      const q = (document.getElementById('wlPageSearch').value || '').trim().toLowerCase();
+      const items = (wlData.items || []).filter(e => !q || e.ip.toLowerCase().includes(q));
+      const tbody = document.getElementById('wlPageBody');
+      const empty = document.getElementById('wlPageEmpty');
+      if (!tbody) return;
+      if (!items.length) {
+        tbody.innerHTML = '';
+        empty.style.display = '';
+        wlPageSelected.clear();
+        document.getElementById('wlPageBatchBtn').disabled = true;
+        return;
+      }
+      empty.style.display = 'none';
+      tbody.innerHTML = items.map((e, i) => `
+        <tr>
+          <td><input type="checkbox" ${wlPageSelected.has(e.ip) ? 'checked' : ''} onchange="wlPageToggleOne('${e.ip}', this.checked)" style="accent-color:var(--primary)"></td>
+          <td>${i + 1}</td>
+          <td class="mono">${e.ip}</td>
+          <td style="font-size:12.5px;color:var(--text-dim)">${e.region || '--'}</td>
+          <td style="font-size:12.5px">${e.remark || '--'}</td>
+          <td>
+            <button class="op-btn" onclick="showWlEdit('${e.ip}')">编辑</button>
+            <button class="op-btn danger" onclick="wlPageRemove('${e.ip}')">删除</button>
+          </td>
+        </tr>`).join('');
+      const btn = document.getElementById('wlPageBatchBtn');
+      btn.disabled = wlPageSelected.size === 0;
+      document.getElementById('wlPageSelectAll').checked = wlPageSelected.size === items.length;
+    }
+    function wlPageToggleAll(checked) {
+      const q = (document.getElementById('wlPageSearch').value || '').trim().toLowerCase();
+      (wlData.items || []).forEach(e => {
+        if (!q || e.ip.toLowerCase().includes(q)) { if (checked) wlPageSelected.add(e.ip); else wlPageSelected.delete(e.ip); }
+      });
+      renderWlPage();
+    }
+    function wlPageToggleOne(ip, checked) {
+      if (checked) wlPageSelected.add(ip); else wlPageSelected.delete(ip);
+      document.getElementById('wlPageBatchBtn').disabled = wlPageSelected.size === 0;
+    }
+    async function wlPageRemove(ip) {
+      if (!confirm(`确认删除白名单 ${ip}?`)) return;
+      await postWhitelist({ remove: ip });
+      renderWlPage();
+    }
+    async function wlPageBatchDelete() {
+      if (!wlPageSelected.size) return;
+      if (!confirm(`确认批量删除选中的 ${wlPageSelected.size} 条白名单?`)) return;
+      const remain = (wlData.items || []).map(e => e.ip).filter(ip => !wlPageSelected.has(ip));
+      await postWhitelist({ ips: remain.map(ip => ({ ip })) });
+      wlPageSelected.clear();
+      renderWlPage();
+    }
+    async function wlPageAddMyIP() {
+      const ip = wlData.client_ip;
+      if (!ip) return showToast('无法识别当前IP', 'error');
+      await postWhitelist({ add: { ip, remark: '一键添加' } });
+      renderWlPage();
+    }
+    function showWlEdit(ip) {
+      const e = (wlData.items || []).find(x => x.ip === ip);
+      if (!e) return;
+      document.getElementById('editWlIp').value = e.ip;
+      document.getElementById('editWlRemark').value = e.remark || '';
+      document.getElementById('editWlModal').classList.add('show');
+    }
+    async function doWlEdit() {
+      const ip = document.getElementById('editWlIp').value;
+      const remark = document.getElementById('editWlRemark').value.trim();
+      closeModal('editWlModal');
+      await postWhitelist({ update: { ip, remark } });
+      renderWlPage();
+    }
+
+    // ==================== 账密模式（左右双栏） ====================
+    function switchCredsTab(tab) {
+      document.getElementById('ctabUse').classList.toggle('active', tab === 'use');
+      document.getElementById('ctabDoc').classList.toggle('active', tab === 'doc');
+      document.getElementById('credsUseWrap').style.display = tab === 'use' ? 'flex' : 'none';
+      document.getElementById('credsDocWrap').style.display = tab === 'doc' ? '' : 'none';
+    }
+
+    function stepInput(id, delta, min, max) {
+      const el = document.getElementById(id);
+      let v = (parseInt(el.value) || min) + delta;
+      v = Math.min(Math.max(v, min), max);
+      el.value = v;
+      el.dispatchEvent(new Event('change'));
+    }
+
+    function fillCredsPanel() {
+      const u = document.getElementById('cUsername');
+      const p = document.getElementById('cPassword');
+      if (u) u.value = (appConfig && appConfig.proxy_username) || 'warpuser';
+      if (p) p.value = (appConfig && appConfig.proxy_password) || '--';
+      updateCredsPreview();
+    }
+
+    function currentCredsPort() {
+      const base = (appConfig && appConfig.base_port) || 10010;
+      const n = (appConfig && appConfig.resident_count) || 1;
+      return { base, end: base + n - 1, first: base };
+    }
+
+    function updateCredsPreview() {
+      const { base, end } = currentCredsPort();
+      document.getElementById('pvHost').value = `${location.hostname}:${base}${end > base ? `~${end}` : ''}`;
+      document.getElementById('pvUser').value = (appConfig && appConfig.proxy_username) || 'warpuser';
+      document.getElementById('pvPass').value = (appConfig && appConfig.proxy_password) || '--';
+      switchProto(currentProto);
+    }
+
+    let currentProto = 'http';
+    function switchProto(proto) {
+      currentProto = proto;
+      document.getElementById('ptabHttp').classList.toggle('active', proto === 'http');
+      document.getElementById('ptabSocks').classList.toggle('active', proto === 'socks');
+      const { first } = currentCredsPort();
+      const user = (appConfig && appConfig.proxy_username) || 'warpuser';
+      const pass = (appConfig && appConfig.proxy_password) || '';
+      const sticky = document.getElementById('cSession').value === 'sticky';
+      const time = parseInt(document.getElementById('cTime').value) || 5;
+      const sid = sticky ? `?num=1&type=json&sid=myconn&time=${time}` : '?num=1&type=json';
+      const curl = proto === 'http'
+        ? `curl -x http://${user}:${pass}@${location.hostname}:${first} https://api64.ipify.org`
+        : `curl --proxy socks5h://${user}:${pass}@${location.hostname}:${first} https://api64.ipify.org`;
+      document.getElementById('pvCurl').textContent =
+        `# ${sticky ? `粘性会话（同sid固定出口 ${time} 分钟）先提取:` : '轮换提取:'}\ncurl -s "${window.location.origin}/api/proxies${sid}"\n\n# ${proto === 'http' ? 'HTTP' : 'SOCKS5'} 账密直连（端口任选，每个端口一个独立出口IP）:\n${curl}`;
+    }
+
+    async function editCredsPassword() {
+      const val = prompt('修改代理密码（留空随机生成；一套账密适用于全部端口）:\n当前: ' + ((appConfig && appConfig.proxy_password) || ''), '');
+      if (val === null) return;
+      const resp = await api('/api/creds/set', {
+        method: 'POST', body: JSON.stringify({ password: val.trim() || undefined }),
+      });
+      if (resp.success) {
+        showToast(`密码已更新: ${resp.data.password}（热更新生效中）`, 'success');
+        if (resp.data.reapply_job_id) {
+          pollJob(resp.data.reapply_job_id, '热更新接入配置').then(() => { hideProgress(); });
+        }
+        await loadConfig();
+        fillCredsPanel();
+      } else {
+        showToast(resp.error?.message || '更新失败', 'error');
+      }
+    }
+
+    function genProxyList() {
+      const fmt = document.getElementById('listFormat').value;
+      const num = Math.min(Math.max(parseInt(document.getElementById('listNum').value) || 1, 1), 200);
+      const pool = instances.filter(c => c.username && c.host_port);
+      if (!pool.length) { showToast('暂无可用实例', 'error'); return; }
+      const lines = [];
+      for (let i = 0; i < num; i++) {
+        const c = pool[i % pool.length];
+        if (fmt === 'host') lines.push(`${location.hostname}:${c.host_port}`);
+        else if (fmt === 'hostauth') lines.push(`${location.hostname}:${c.host_port}:${c.username}:${c.password}`);
+        else lines.push(`socks5://${c.username}:${c.password}@${location.hostname}:${c.host_port}`);
+      }
+      document.getElementById('proxyListBox').textContent = lines.join('\n');
+      showToast(`已生成 ${num} 条`, 'success');
     }
 
     // ==================== Modal ====================
@@ -1120,6 +2635,23 @@
       setTimeout(() => { hideProgress(); refreshAll(); }, 2000);
     }
 
+    // ==================== 固定IP绑定（实例表格行内按钮） ====================
+    async function bindDedicated(name) {
+      try {
+        const resp = await api('/api/pool/dedicated/bind', {
+          method: 'POST',
+          body: JSON.stringify({ name }),
+        });
+        if (resp.success) {
+          const it = resp.data.items && resp.data.items[0];
+          showToast(`${name} 已绑定固定IP: ${it ? it.ip : ''}`, 'success');
+          setTimeout(refreshAll, 800);
+        } else {
+          showToast(resp.error?.message || '绑定失败', 'error');
+        }
+      } catch (e) { showToast(e.message, 'error'); }
+    }
+
     // ==================== 单个操作 ====================
     async function rotateOne(container, instanceIndex, poolKey) {
       // 通过 pool_key 换单个实例的IP（pool key 即实例索引，如 "0"）
@@ -1194,6 +2726,8 @@
             showToast(`删除完成: 成功${job.results.filter(r=>r.success).length}个`, 'success');
             selectedNames.clear();
           }
+        } else {
+          showToast(resp.error?.message || '删除失败', 'error');
         }
       } catch (e) { showToast(e.message, 'error'); }
       setTimeout(() => { hideProgress(); refreshAll(); }, 1500);
@@ -1234,6 +2768,8 @@
             const successCount = job.results.filter(r=>r.success).length;
             showToast(`重建完成: 成功${successCount}个`, 'success');
           }
+        } else {
+          showToast(resp.error?.message || '重建失败', 'error');
         }
       } catch (e) { showToast(e.message, 'error'); }
       setTimeout(() => { hideProgress(); refreshAll(); }, 2000);
@@ -1288,6 +2824,7 @@
       await loadConfig();
       await checkDocker();
       await loadContainers();
+      loadWhitelist();
       if (document.getElementById('poolPanel').classList.contains('show')) {
         loadPoolStatus();
       }
@@ -1295,7 +2832,11 @@
 
     // ==================== 初始化 ====================
     (async function init() {
+      // hash 路由（#overview/#traffic-api/#traffic-creds/#static/#instances）
+      const hash = (location.hash || '#overview').slice(1);
+      switchView(['overview', 'traffic-api', 'traffic-creds', 'static', 'whitelist', 'instances'].includes(hash) ? hash : 'overview');
       await refreshAll();
+      loadUsage();
       setInterval(() => { if (!isProcessing) loadContainers(); }, 30000);
       setInterval(() => { if (!isProcessing) loadStats(); }, 10000);
     })();

@@ -1,0 +1,25 @@
+{
+  "log": { "level": "debug" },
+  "inbounds": [
+    { "type": "socks", "tag": "test-in", "listen": "127.0.0.1", "listen_port": 19999 }
+  ],
+  "endpoints": [
+    {
+      "type": "wireguard",
+      "tag": "WARP",
+      "address": ["172.16.0.2/32", "2606:4700:110:8ca1:e794:2996:f1c:9fff/128"],
+      "private_key": "4H7a1C5+E3tyEX8C8TwmnvXzcMHdzUFqIPu577m800s=",
+      "peers": [
+        {
+          "address": "162.159.193.10",
+          "port": 2408,
+          "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+          "allowed_ips": ["0.0.0.0/0", "::/0"],
+          "persistent_keepalive_interval": 30
+        }
+      ],
+      "mtu": 1280
+    }
+  ],
+  "route": { "final": "WARP" }
+}
