@@ -457,11 +457,11 @@
       background: var(--card);
       border: 1px solid var(--border);
       border-radius: 12px;
-      overflow: hidden;
+      overflow-x: auto;
     }
     .table-header {
       display: grid;
-      grid-template-columns: 40px 175px 55px 85px 125px 80px 70px 45px 145px 160px;
+      grid-template-columns: 40px 175px 55px 85px 300px 150px 90px 130px 70px 45px 145px 160px;
       padding: 12px 16px;
       background: var(--card-hover);
       border-bottom: 1px solid var(--border);
@@ -471,7 +471,7 @@
     }
     .table-row {
       display: grid;
-      grid-template-columns: 40px 175px 55px 85px 125px 80px 70px 45px 145px 160px;
+      grid-template-columns: 40px 175px 55px 85px 300px 150px 90px 130px 70px 45px 145px 160px;
       padding: 10px 16px;
       border-bottom: 1px solid var(--border);
       font-size: 13px;
@@ -761,6 +761,8 @@
         <span class="status-dot checking"></span>
         <span>检测中...</span>
       </div>
+      <button class="btn btn-ghost" id="loginBtnHeader" onclick="showLoginModal()" style="display:none">登录</button>
+      <button class="btn btn-ghost" id="logoutBtnHeader" onclick="doLogout()" style="display:none">退出</button>
       <button class="btn btn-ghost" onclick="refreshAll()">刷新</button>
     </div>
   </div>
@@ -903,6 +905,12 @@
                   <option value="txt">txt</option><option value="json">json</option>
                 </select>
               </div>
+              <div class="config-group"><span class="config-label">出口协议:</span>
+                <select class="config-input" id="genIpMode" style="width:100px;text-align:left" onchange="updateGenLink()">
+                  <option value="ip6">IPv6（独立）</option>
+                  <option value="ip4">IPv4（共享）</option>
+                </select>
+              </div>
               <div class="config-group"><span class="config-label">数量:</span>
                 <input type="number" class="config-input" id="genNum" value="1" min="1" max="20" style="width:60px" oninput="updateGenLink()">
               </div>
@@ -925,6 +933,8 @@
                     <tr><td class="mono">time</td><td>轮转时长（分钟，粘性会话）</td><td class="mono">string</td><td>否</td></tr>
                     <tr><td class="mono">type</td><td>数据格式: txt json</td><td class="mono">string</td><td>否</td></tr>
                     <tr><td class="mono">sid</td><td>粘性会话ID（相同sid提取到同一出口IP）</td><td class="mono">string</td><td>否</td></tr>
+                    <tr><td class="mono">ip_mode</td><td><code>ip6</code>（默认，独立 IPv6）或 <code>ip4</code>（共享 IPv4 NAT，默认自动去重）</td><td class="mono">string</td><td>否</td></tr>
+                    <tr><td class="mono">unique_ip</td><td>仅 ip4 生效：默认去重，传 <code>0</code> 可关闭；去重后数量可能少于请求值</td><td class="mono">int</td><td>否</td></tr>
                   </tbody>
                 </table>
               </div>
@@ -935,8 +945,9 @@
               <div class="code-dark">192.6.121.16:11010
 192.6.121.16:11011
 192.6.121.16:11012</div>
-              <div class="info-box" style="margin-top:8px">
-                txt 每行一条 <code>IP:端口</code>（白名单端口，免密直连）；json 返回结构化数据（含账密与出口IP）。白名单内IP免Key调用本接口。
+              <div class="info-box" style="margin-top:8px;line-height:1.8">
+                txt 每行一条 <code>IP:端口</code>（白名单端口，免密直连）；json 返回结构化数据（含账密与出口IP）。<br>
+                <b>提取说明：</b>IPv6（ip6）每个实例通常拥有独立出口；IPv4（ip4）来自共享 NAT 池，默认自动按 IPv4 去重，实际返回数量可能少于请求数量。需要按实例提取时可在链接后加 <code>&unique_ip=0</code>。
               </div>
             </div>
           </div>
@@ -1237,7 +1248,9 @@
             <div>容器 / 实例</div>
             <div>端口</div>
             <div>池状态</div>
-            <div>出口IP</div>
+            <div>IPv6 出口</div>
+            <div>IPv4 出口</div>
+            <div>当前模式</div>
             <div>CF 403率</div>
             <div>健康</div>
             <div>会话</div>
@@ -1362,17 +1375,37 @@
     </div>
   </div>
 
-  <!-- 访问受限 Modal（来源IP不在白名单） -->
+  <!-- 登录 Modal（输入 API Key 获取管理台会话） -->
+  <div class="modal-overlay" id="loginModal">
+    <div class="modal" style="max-width:420px">
+      <h2>管理台登录</h2>
+      <div class="modal-body">
+        请输入管理台 <b>API Key</b> 登录（初始 <code>zs1236547</code>，可在服务器 config.json 中修改）：
+        <input type="password" class="form-input" id="loginKey" placeholder="API Key" style="margin-top:12px"
+          onkeydown="if(event.key==='Enter')doLogin()" autocomplete="off">
+        <div style="margin-top:10px;font-size:12px;color:var(--text-dim)">
+          登录后即可管理白名单、容器等；会话有效期 30 天。
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" onclick="closeModal('loginModal')">取消</button>
+        <button class="btn btn-primary" id="loginSubmitBtn" onclick="doLogin()">登 录</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 访问受限 Modal（白名单类接口：IP 不在白名单） -->
   <div class="modal-overlay" id="accessModal">
     <div class="modal">
       <h2>访问受限</h2>
       <div class="modal-body">
-        你的IP <b id="accessMyIP" style="color:var(--warning);font-family:Consolas"></b> 不在白名单，无法调用API。<br><br>
-        在<b>服务器上</b>执行以下命令添加白名单（服务器本机始终放行）：
+        你的IP <b id="accessMyIP" style="color:var(--warning);font-family:Consolas"></b> 不在白名单，无法调用该接口。<br><br>
+        请<b>先登录管理台</b>，再到「🛡️ 白名单管理」页添加你的 IP 即可免Key调用：
         <div class="info-box" id="accessHint" style="margin-top:10px;font-family:Consolas;white-space:pre-wrap;word-break:break-all"></div>
       </div>
       <div class="modal-footer">
-        <button class="btn btn-primary" onclick="closeModal('accessModal');refreshAll()">已添加，重试</button>
+        <button class="btn btn-ghost" onclick="closeModal('accessModal')">关闭</button>
+        <button class="btn btn-primary" onclick="closeModal('accessModal');showLoginModal()">去登录</button>
       </div>
     </div>
   </div>
@@ -1466,13 +1499,15 @@
     // 这里转换为 {success, data, error:{message}} 兼容旧调用方
     async function api(url, options = {}) {
       const headers = { 'Content-Type': 'application/json', ...options.headers };
+      const token = localStorage.getItem('warpAdminToken');
+      if (token) headers['Authorization'] = 'Bearer ' + token;
       const res = await fetch(url, { ...options, headers });
 
       let body = null;
       try { body = await res.json(); } catch (e) { body = null; }
 
       if (res.status === 401) {
-        showAccessDenied(body);
+        showAuthGate(body);
         return { success: false, code: 'A0001', error: { code: 'A0001', message: '来源IP不在白名单' } };
       }
 
@@ -1486,11 +1521,71 @@
       };
     }
 
-    function showAccessDenied(body) {
+    // 401 分流：管理类接口未登录 → 弹登录层；代理提取类接口 → 弹访问受限提示（引导登录后加白名单）
+    function showAuthGate(body) {
       const d = (body && body.data) || {};
-      document.getElementById('accessMyIP').textContent = d.client_ip || '未知';
-      document.getElementById('accessHint').textContent = d.hint || '';
-      document.getElementById('accessModal').classList.add('show');
+      if (d.need_login) {
+        showLoginModal();
+      } else {
+        document.getElementById('accessMyIP').textContent = d.client_ip || '未知';
+        document.getElementById('accessHint').textContent = d.hint || '';
+        document.getElementById('accessModal').classList.add('show');
+      }
+    }
+
+    // ==================== 管理台登录（API Key → 30 天会话，localStorage 持久化） ====================
+    function showLoginModal() {
+      document.getElementById('loginModal').classList.add('show');
+      setTimeout(() => { const inp = document.getElementById('loginKey'); if (inp) inp.focus(); }, 60);
+    }
+    function updateLoginUI() {
+      const loggedIn = !!localStorage.getItem('warpAdminToken');
+      const lb = document.getElementById('loginBtnHeader');
+      const lo = document.getElementById('logoutBtnHeader');
+      if (lb) lb.style.display = loggedIn ? 'none' : '';
+      if (lo) lo.style.display = loggedIn ? '' : 'none';
+    }
+    function hasAccess() {
+      return !!localStorage.getItem('warpAdminToken') || !!appConfig;
+    }
+    async function doLogin() {
+      const inp = document.getElementById('loginKey');
+      const key = (inp.value || '').trim();
+      if (!key) return showToast('请输入 API Key', 'error');
+      const btn = document.getElementById('loginSubmitBtn');
+      btn.disabled = true;
+      btn.textContent = '登录中...';
+      try {
+        const res = await fetch('/api/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ key }),
+        });
+        let body = null;
+        try { body = await res.json(); } catch (e) {}
+        if (res.ok && body && body.code === '00000' && body.data && body.data.token) {
+          localStorage.setItem('warpAdminToken', body.data.token);
+          closeModal('loginModal');
+          showToast('登录成功', 'success');
+          updateLoginUI();
+          await refreshAll();
+          loadUsage();
+        } else {
+          showToast((body && body.msg) || '登录失败，请检查 API Key', 'error');
+        }
+      } catch (e) {
+        showToast('网络错误，无法连接服务', 'error');
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '登 录';
+      }
+    }
+    function doLogout() {
+      localStorage.removeItem('warpAdminToken');
+      appConfig = null;
+      updateLoginUI();
+      showToast('已退出登录', 'info');
+      showLoginModal();
     }
 
     // ==================== Docker 检查 ====================
@@ -1601,7 +1696,10 @@
         filtered = instances.filter(c =>
           c.container.toLowerCase().includes(search) ||
           (c.host_port && c.host_port.toString().includes(search)) ||
-          (c.ip && c.ip.includes(search))
+          (c.ip && c.ip.includes(search)) ||
+          (c.ipv6 && c.ipv6.includes(search)) ||
+          (c.ipv4 && c.ipv4.includes(search)) ||
+          (c.ip_mode && c.ip_mode.includes(search))
         );
       }
 
@@ -1634,9 +1732,15 @@
           poolBadge += ` <span class="badge badge-dedicated">固定</span>`;
         }
 
-        const ipCell = c.ip
-          ? `<span class="ip-cell">${c.ip}</span>`
-          : `<span style="color:var(--text-dim)">--</span>`;
+        const ipv6Cell = c.ipv6
+          ? `<span class="ip-cell">${c.ipv6}</span>`
+          : `<span style="color:var(--text-dim)">未检测到</span>`;
+        const ipv4Cell = c.ipv4
+          ? `<span class="ip-cell">${c.ipv4}</span>`
+          : `<span style="color:var(--text-dim)">未检测到</span>`;
+        const modeCell = c.ip_mode === 'ip4'
+          ? '<span class="badge badge-in-use">IPv4</span>'
+          : '<span class="badge badge-available">IPv6</span>';
 
         // CF 403率显示
         let cfCell;
@@ -1646,8 +1750,8 @@
           const rate = c.cf_403_rate;
           const color = rate === 0 ? 'var(--success)' : rate < 30 ? 'var(--warning)' : 'var(--danger)';
           const lastCode = c.cf_last_code ? ` (last: ${c.cf_last_code})` : '';
-          cfCell = `<span style="color:${color};font-weight:600;font-size:13px">${rate}%</span>` +
-                   `<span style="font-size:11px;color:var(--text-dim)">${c.cf_403_count}/${c.cf_check_count}${lastCode}</span>`;
+          cfCell = `<span style="white-space:nowrap"><span style="color:${color};font-weight:600;font-size:13px">${rate}%</span>` +
+                   `<span style="font-size:11px;color:var(--text-dim)">${c.cf_403_count}/${c.cf_check_count}${lastCode}</span></span>`;
         }
 
         const sessionInfo = c.pool_status === 'in_use' ? '是' : '-';
@@ -1680,7 +1784,9 @@
             <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${containerDisplay}</div>
             <div style="font-family:Consolas">${c.host_port || '--'}</div>
             <div>${poolBadge}</div>
-            <div>${ipCell}</div>
+            <div>${ipv6Cell}</div>
+            <div>${ipv4Cell}</div>
+            <div>${modeCell}</div>
             <div>${cfCell}</div>
             <div>${healthBadge}</div>
             <div style="font-size:12px;color:var(--text-dim)">${sessionInfo}</div>
@@ -2215,7 +2321,8 @@
       const time = parseInt(document.getElementById('genTime').value) || 10;
       const type = document.getElementById('genType').value;
       const format = document.getElementById('genFormat').value;
-      let q = `num=${num}&type=${type}&format=${format}`;
+      const ipMode = document.getElementById('genIpMode').value;
+      let q = `num=${num}&type=${type}&format=${format}&ip_mode=${ipMode}`;
       if (sticky) q += `&sid=mysession&time=${time}`;
       document.getElementById('genApiLink').value = `${window.location.origin}/api/proxies?${q}`;
     }
@@ -2835,10 +2942,12 @@
       // hash 路由（#overview/#traffic-api/#traffic-creds/#static/#instances）
       const hash = (location.hash || '#overview').slice(1);
       switchView(['overview', 'traffic-api', 'traffic-creds', 'static', 'whitelist', 'instances'].includes(hash) ? hash : 'overview');
+      updateLoginUI();
+      // 初始就有登录：未登录时接口 401 会自动弹出登录层（白名单IP免登录直接加载数据）
       await refreshAll();
       loadUsage();
-      setInterval(() => { if (!isProcessing) loadContainers(); }, 30000);
-      setInterval(() => { if (!isProcessing) loadStats(); }, 10000);
+      setInterval(() => { if (!isProcessing && hasAccess()) loadContainers(); }, 30000);
+      setInterval(() => { if (!isProcessing && hasAccess()) loadStats(); }, 10000);
     })();
   </script>
 </body>

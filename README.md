@@ -15,10 +15,10 @@
 
 ## 快速部署（Docker）
 
-只用两条命令就能把整套代理池拉起来。镜像由 GitHub Actions 在每次 push 到 `main`/`master` 时自动构建并推送 `2.0` / `latest` 两个标签，**本地无需构建、无需任何推送**：
+只用两条命令就能把整套代理池拉起来。镜像由 GitHub Actions 在每次 push 到 `main`/`master` 时自动构建并推送 `4.0` / `latest` 两个标签，**本地无需构建、无需任何推送**：
 
 ```bash
-# ① 拉取镜像（2.0 与 latest 为同一镜像，随代码更新自动同步）
+# ① 拉取镜像（4.0 与 latest 为同一镜像，随代码更新自动同步）
 docker pull zhoushu1/warp-pool:latest
 
 # ② 启动容器（host 网络 + 实例目录持久化 + 崩溃自启）
@@ -93,16 +93,21 @@ POST /api/pool/release  → 归还实例（可用 /api/pool/report 上报真实 
 ### 商用提取 API
 
 ```bash
-# 批量提取（CliProxy 风格参数）: num 数量 / type=txt|json / format=n|rn / sid 粘性会话 / time 分钟
-curl -s "http://<ip>:4433/api/proxies?num=5&type=txt&format=n"
+# 批量提取（CliProxy 风格参数）: num 数量 / type=txt|json / format=n|rn / sid 粘性会话 / time 分钟 / ip_mode=ip6|ip4
+# ip4 默认按出口 IPv4 去重；unique_ip=0 可关闭去重（实际数量可能少于 num）
+curl -s "http://<ip>:4433/api/proxies?num=5&type=txt&format=n&ip_mode=ip6"
 # txt 返回（白名单端口，免密直连）:
 # 192.6.121.16:11010
 # 192.6.121.16:11011
 
-# 粘性提取（同 sid 固定出口，1~1440 分钟）
-curl -s "http://<ip>:4433/api/proxies?num=1&type=json&sid=account-001&time=30"
+# 提取 IPv4 出口（默认去重）
+curl -s "http://<ip>:4433/api/proxies?num=5&type=json&ip_mode=ip4"
 
-# 白名单管理
+# IPv4 不去重，按实例提取
+curl -s "http://<ip>:4433/api/proxies?num=5&type=json&ip_mode=ip4&unique_ip=0"
+
+# 粘性提取（同 sid 固定出口，1~1440 分钟；ip4 粘性仍可能与其他实例共享 IPv4）
+curl -s "http://<ip>:4433/api/proxies?num=1&type=json&sid=account-001&time=30&ip_mode=ip6"
 curl -X POST http://127.0.0.1:4433/api/whitelist -H "Content-Type: application/json" -d '{"add":"1.2.3.4"}'
 
 # 用量统计（数据概览图表数据源）
@@ -166,6 +171,8 @@ curl -s "http://<ip>:4433/api/usage?days=30"
 - [403 统计与自动换 IP](#403-统计与自动换-ip)
 - [WARP Teams 无限流量](#warp-teams-无限流量账户可选)
 - [主要配置](#主要配置)
+- [服务区（出口地区）配置](#服务区出口地区配置)
+- [推荐实例数（按服务器配置）](#推荐实例数按服务器配置)
 - [当前生产环境实测数据](#当前生产环境实测数据192612116)
 - [OpenAI 403 的替代方案](#openai-403-的替代方案)
 - [多服务器扩展](#多服务器扩展增加-ipv4-出口)
@@ -209,7 +216,7 @@ server.js                  # 与服务器同步的主服务
 deploy-v3.ps1              # 部署脚本（SFTP 上传 + 重启 systemd 服务，进程化方式）
 Dockerfile                 # Docker 镜像定义（内置 sing-box / wgcf 二进制）
 docker-compose.yml         # 容器编排（host 网络 + 挂载卷 + 自启，从 Docker Hub 拉镜像）
-.github/workflows/         # GitHub Actions：push 到 main/master 自动构建并推送镜像（2.0 / latest）
+.github/workflows/         # GitHub Actions：push 到 main/master 自动构建并推送镜像（4.0 / latest）
 test-ipv6-sites.sh         # IPv6 目标网站可达性测试脚本
 test/                      # API / 代理池模拟测试
 ```
@@ -622,12 +629,12 @@ curl -s --compressed --max-time 25 -X POST "https://api.cloudflareclient.com/v0a
 
 ### 方式 A：Docker 容器（推荐，可移植）
 
-**镜像已发布到 Docker Hub**（`zhoushu1/warp-pool`），由 GitHub Actions 在每次 push 到 `main`/`master` 时自动构建并推送 `2.0` 与 `latest` 两个标签（见 [.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml)），**本地不执行任何推送**。镜像内置 sing-box 与 wgcf 二进制，宿主机无需预装 Node/sing-box/wgcf。
+**镜像已发布到 Docker Hub**（`zhoushu1/warp-pool`），由 GitHub Actions 在每次 push 到 `main`/`master` 时自动构建并推送 `4.0` 与 `latest` 两个标签（见 [.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml)），**本地不执行任何推送**。镜像内置 sing-box 与 wgcf 二进制，宿主机无需预装 Node/sing-box/wgcf。
 
 **拉取镜像：**
 
 ```bash
-docker pull zhoushu1/warp-pool:latest   # 或 docker pull zhoushu1/warp-pool:2.0（同一镜像）
+docker pull zhoushu1/warp-pool:latest   # 或 docker pull zhoushu1/warp-pool:4.0（同一镜像）
 ```
 
 #### 方案 1：Docker Compose（推荐）
@@ -670,7 +677,7 @@ docker run -d --name warp \
 
 > 必须使用 `--network host`：实例 SOCKS5 端口（10010 起）与 API 端口 4433 直接暴露，sing-box UDP 2408 出站无 NAT 干扰。
 
-**发布新版本**：改代码 → `git push` 到 `main`/`master` → GitHub Actions 自动构建推送（`2.0` / `latest` 两标签）→ 服务器 `docker compose pull && docker compose up -d`（或 `docker pull && docker rm -f warp && docker run ...`）升级，全程不碰本地构建。
+**发布新版本**：改代码 → `git push` 到 `main`/`master` → GitHub Actions 自动构建推送（`4.0` / `latest` 两标签）→ 服务器 `docker compose pull && docker compose up -d`（或 `docker pull && docker rm -f warp && docker run ...`）升级，全程不碰本地构建。
 
 容器启动后 RECOVERY 机制自动扫描 `/root/warp-instances`：
 - **复用已有配置启动**：实例目录已有 `singbox.json` 时直接复用（不重新注册账号），每个实例约 9 秒恢复（8 秒等待隧道建立 + 出口检测），秒级恢复 20/20。
@@ -1104,6 +1111,69 @@ curl -X POST http://127.0.0.1:4433/api/rebuild \
 
 ---
 
+## 服务区（出口地区）配置
+
+出口 IP 的地区由服务器**就近接入的 Cloudflare 边缘节点（colo）** 决定，与实例数、账号数、隧道协议均无关。**换服务区 = 换机房部署**，无法在服务器内切换地区。
+
+### 当前服务区（实测）
+
+| 项 | 值 |
+|---|---|
+| 边缘节点 | LAX（洛杉矶） |
+| IPv4 出口 | `104.28.195.186/187`、`104.28.227.186/187`（节点 NAT 池，4 个） |
+| IPv6 出口 | `2a09:bacx::/29`（每账号唯一） |
+| 可用 endpoint | `188.114.96.1`、`188.114.97.1`、`188.114.96.2`、`188.114.96.3`（UDP 2408） |
+
+### 工作原理
+
+1. 服务启动时对内置 endpoint 列表做 UDP 连通性探测，剔除不可用项（实测 `162.159.192.1` 等链路不通，已从列表移除）。
+2. 实例按索引轮询分配 endpoint（`idx % 列表长度`），相邻实例出口更分散；换 IP 时轮换到下一个 endpoint，避免同一 endpoint 换 IP 后出口仍相同。
+3. 出口 IP 地区 = 服务器所在机房就近的边缘节点（本项目实测 LAX），出口位置无法在本机内切换。
+
+### 如何配置 / 更换服务区
+
+| 需求 | 做法 |
+|---|---|
+| 保持当前地区 | 无需配置，默认就近接入 |
+| 更换出口地区 | 在目标地区的机房部署一台新服务器（不同机房 → 不同边缘节点 → 不同出口地区，且每台额外贡献 4 个 IPv4 出口） |
+| 自定义 endpoint 列表 | 修改 `server.js` 中 `WARP_ENDPOINTS` 常量后重启（新端点需实测确认能承载流量） |
+| 查看白名单 IP 归属地 | 管理台白名单页自动显示（`ip-api.com` 查询，存入白名单条目的 `region` 字段） |
+
+> 多服务器扩展详见 [多服务器扩展](#多服务器扩展增加-ipv4-出口)：N 台不同地区服务器 = 4N 个 IPv4 出口 + 20N 个 IPv6 出口。
+
+---
+
+## 推荐实例数（按服务器配置）
+
+每个实例是一个独立的 `sing-box run` 进程，实测内存约 15MB/实例，CPU 空闲占用很低。单机实例数上限 `max_instances=200`。
+
+### 推荐实例数参考
+
+| 服务器配置 | 推荐实例数 | 说明 |
+|---|---|---|
+| 1 核 1G | 20 | 最小可用（当前生产即此规模） |
+| 2 核 2G | 50 | 常规够用 |
+| 2 核 4G | 100 | 中大规模 |
+| 4 核 8G | 200 | 系统上限 |
+
+> 估算依据：实例内存约 15MB/个 + 系统与 sing-box 基础开销，建议为服务器预留 30%~50% 内存余量；CPU 主要消耗在批量创建/重建与高并发转发，日常巡检空闲占用低。
+
+### 配置方式
+
+```bash
+# 常驻实例数（管理台「配置」或 API 修改，保存即生效，自动补齐/缩容）
+curl -s -X POST http://127.0.0.1:4433/api/config \
+  -H "Content-Type: application/json" -d '{"resident_count":50}'
+```
+
+### 扩缩容注意
+
+- 批量创建/重建会触发 Cloudflare 注册 API **429 限流**，系统内置退避重试；建议用 `max_concurrent_create`（默认 3）控制并发。
+- 缩容从端口最大的实例开始删除，固定绑定实例自动排除。
+- 单机达到 200 上限后仍需更多出口，或想增加 IPv4 出口 → 部署多台服务器（每台独立配置实例数）。
+
+---
+
 ## 当前生产环境实测数据（192.6.121.16）
 
 ### 出口 IP 汇总
@@ -1278,19 +1348,46 @@ curl -X POST http://127.0.0.1:4433/api/rebuild \
 
 ## 测试
 
-Mock 测试（不依赖真实 WARP）：
+### 自动化测试
+
+Mock 代理池测试（不依赖 Docker、sing-box 或真实 WARP）：
 
 ```bash
 node test/test-mock-pool.js
 ```
 
-测试覆盖端口分配、IP 唯一性、Round-Robin、粘性会话、并发分配、会话过期、403 统计和自动换 IP 阈值。
+覆盖端口分配、IP 唯一性、Round-Robin、粘性会话、并发分配、会话过期、403 统计、自动换 IP 阈值和固定 IP 绑定；本次快速回归结果：**51 通过 / 0 失败**。
 
-语法检查：
+完整页面、登录、Token、白名单及管理 API 鉴权回归（需要使用测试入口开启客户端 IP 模拟）：
+
+```bash
+# 终端 1
+$env:TEST_IP_OVERRIDE="1"; node container-server.js
+
+# 终端 2
+node test-full.js
+```
+
+Linux/macOS：
+
+```bash
+TEST_IP_OVERRIDE=1 node container-server.js
+node test-full.js
+```
+
+本次快速回归结果：**49 通过 / 0 失败**。测试完成后停止测试服务即可。真实 WARP 实例注册还需要服务器具备可用的外网连接、`usque`/`wgcf` 和 sing-box 运行环境。
+
+### 语法检查
 
 ```bash
 node --check server.js
+node --check container-server.js
+node --check test-full.js
+node --check test/test-api.js
+node --check test/test-mock-pool.js
 ```
+
+以上语法检查已通过。项目当前未配置 `npm test` 脚本，请直接运行上述测试命令。
 
 ---
 

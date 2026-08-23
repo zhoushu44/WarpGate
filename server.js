@@ -69,6 +69,7 @@ const DEFAULT_CONFIG = {
   proxy_auth_enabled: true,     // 账密模式: SOCKS5 端口用户名密码认证（false=端口免密开放）
   proxy_username: 'warpuser',   // 全局代理用户名（全部实例共用一套账密）
   proxy_password: '',           // 全局代理密码（首次启动自动生成，可修改）
+  api_key: 'zs1236547',         // 管理台登录 Key（API Key，初始统一 zs1236547，可在 config.json 修改）
   ip_whitelist: [],             // 白名单: 源IP免密用代理白名单端口 + 免Key调API
   whitelist_port_offset: 1000,  // 白名单端口 = base_port + offset + 实例序号
 };
@@ -103,6 +104,11 @@ normalizeWhitelistEntries();
 // 全局代理密码：首次启动自动生成
 if (!config.proxy_password) {
   config.proxy_password = crypto.randomBytes(9).toString('base64url');
+  try { fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2)); } catch (e) { }
+}
+// 管理台登录 Key：缺失或旧占位符时统一为初始 Key（zs1236547），管理员可在 config.json 修改
+if (!config.api_key || config.api_key === 'auto-generate-on-first-run') {
+  config.api_key = 'zs1236547';
   try { fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2)); } catch (e) { }
 }
 rebuildWhitelistMatcher();
@@ -321,14 +327,54 @@ async function lookupIpRegion(ip) {
   return '';
 }
 
+// ==================== 管理台登录 Token（无状态 HMAC，浏览器 localStorage 持久化） ====================
+const ADMIN_SESSION_TTL = 30 * 24 * 3600 * 1000; // 30 天
+function sessionSecret() { return 'warp-admin:' + (config.api_key || ''); }
+function signSessionToken() {
+  const payload = Buffer.from(JSON.stringify({ u: 'admin', iat: Date.now() })).toString('base64url');
+  const sig = crypto.createHmac('sha256', sessionSecret()).update(payload).digest('base64url');
+  return payload + '.' + sig;
+}
+function verifySessionToken(token) {
+  if (!token) return false;
+  const parts = String(token).split('.');
+  if (parts.length !== 2) return false;
+  const expect = crypto.createHmac('sha256', sessionSecret()).update(parts[0]).digest('base64url');
+  if (parts[1] !== expect) return false;
+  try {
+    const p = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'));
+    return !!(p && p.u === 'admin' && p.iat && (Date.now() - p.iat) < ADMIN_SESSION_TTL);
+  } catch (e) { return false; }
+}
+function getTokenFromReq(req) {
+  const h = req.headers['authorization'] || '';
+  if (h.startsWith('Bearer ')) return h.slice(7).trim();
+  return req.headers['x-auth-token'] || '';
+}
+// 代理提取类接口：维持白名单规则（白名单内免Key），登录 token 不放行
+const PROXY_EXTRACT_PATHS = ['/api/proxies', '/api/pool/acquire', '/api/pool/release', '/api/pool/report'];
+function isProxyExtractPath(p) {
+  return PROXY_EXTRACT_PATHS.some(x => p === x || p.startsWith(x + '/'));
+}
+
 function apiKeyAuth(req, res, next) {
-  if (isClientWhitelisted(req)) return next();
+  // Express 挂载 app.use('/api', ...) 后 req.path 是相对路径（不含 /api 前缀），需用 baseUrl 还原完整路径
+  const fullPath = (req.baseUrl || '') + req.path;
+  if (fullPath === '/api/login') return next(); // 登录接口免鉴权
+  if (isClientWhitelisted(req)) return next();  // 白名单/本机：全部放行（免Key）
   const ip = getClientIP(req);
-  logger.warn('AUTH', `鉴权失败 ${req.method} ${req.path} 来源:${ip || 'unknown'}（不在白名单）`);
+  // 管理类接口：登录 token 放行；代理提取类接口维持白名单规则（token 不放行）
+  if (!isProxyExtractPath(fullPath) && verifySessionToken(getTokenFromReq(req))) {
+    return next();
+  }
+  logger.warn('AUTH', `鉴权失败 ${req.method} ${fullPath} 来源:${ip || 'unknown'}（不在白名单/未登录）`);
+  const hint = isProxyExtractPath(fullPath)
+    ? '代理提取接口仅白名单内IP免Key调用；登录后请在「白名单管理」页添加你的IP'
+    : '请先登录管理台（输入 API Key）';
   return res.status(401).json({
     code: ERROR_CODES.UNAUTHORIZED,
-    msg: '来源IP不在白名单，无法调用API',
-    data: { client_ip: ip, hint: '将该IP加入 config.json 的 ip_whitelist（服务器本机执行: curl -X POST http://127.0.0.1:' + config.port + '/api/whitelist -H "Content-Type: application/json" -d \'{"add":"' + ip + '"}\'）' },
+    msg: '来源IP不在白名单或未登录',
+    data: { client_ip: ip, need_login: !isProxyExtractPath(fullPath), hint },
   });
 }
 
@@ -365,6 +411,43 @@ app.use('/api/delete', rateLimit);
 app.use('/api/rebuild', rateLimit);
 app.use('/api/start', rateLimit);
 app.use('/api/stop', rateLimit);
+
+// ==================== 管理台登录（API Key → 会话 Token） ====================
+const loginAttempts = new Map(); // ip -> {fail, lockedUntil}
+const LOGIN_MAX_FAILS = 5;
+const LOGIN_LOCK_MS = 60 * 1000;
+
+app.post('/api/login', (req, res) => {
+  const ip = getClientIP(req) || 'unknown';
+  const now = Date.now();
+  const rec = loginAttempts.get(ip) || { fail: 0, lockedUntil: 0 };
+  if (now < rec.lockedUntil) {
+    const wait = Math.ceil((rec.lockedUntil - now) / 1000);
+    return error(res, ERROR_CODES.RATE_LIMITED, `登录失败次数过多，请 ${wait} 秒后重试`, 429);
+  }
+  const key = (req.body && req.body.key) || '';
+  if (key !== config.api_key) {
+    rec.fail++;
+    if (rec.fail >= LOGIN_MAX_FAILS) {
+      rec.lockedUntil = now + LOGIN_LOCK_MS;
+      rec.fail = 0;
+      loginAttempts.set(ip, rec);
+      logger.warn('AUTH', `登录失败过多已锁定 ${ip} 60s`);
+      return error(res, ERROR_CODES.RATE_LIMITED, '登录失败次数过多，请 60 秒后重试', 429);
+    }
+    loginAttempts.set(ip, rec);
+    logger.warn('AUTH', `管理台登录失败 来源:${ip}`);
+    return res.status(401).json({ code: ERROR_CODES.UNAUTHORIZED, msg: 'API Key 无效', data: { client_ip: ip } });
+  }
+  loginAttempts.delete(ip);
+  const token = signSessionToken();
+  logger.info('AUTH', `管理台登录成功 来源:${ip}`);
+  return success(res, {
+    token,
+    expires_in: Math.floor(ADMIN_SESSION_TTL / 1000),
+    api_key_hint: config.api_key ? config.api_key.slice(0, 2) + '****' : '',
+  });
+});
 
 // ==================== 页面路由（静态页，免鉴权） ====================
 app.get('/docs', (req, res) => res.sendFile(path.join(__dirname, 'public', 'docs.html')));
@@ -2154,9 +2237,10 @@ app.post('/api/creds/set', async (req, res) => {
 
 // ==================== API: 配置管理 ====================
 app.get('/api/config', (req, res) => {
-  // team_token 不返回完整值
+  // team_token / api_key 不返回完整值（登录 Key 不外泄）
   const safeConfig = { ...config };
   safeConfig.team_token = config.team_token ? config.team_token.substring(0, 6) + '****' : '';
+  safeConfig.api_key = config.api_key ? '****' : '';
   safeConfig.public_ip = publicIP;
   success(res, safeConfig);
 });

@@ -37,5 +37,6 @@
   "proxy_password": "test-pass-123",
   "ip_whitelist": [],
   "whitelist_port_offset": 1000,
-  "api_key": "auto-generate-on-first-run"
+  "api_key": "zs1236547",
+  "masque_http2": true
 }

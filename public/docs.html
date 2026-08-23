@@ -136,7 +136,12 @@
       <a href="#manage">⚙️ 实例管理</a>
       <a href="#whitelist-creds">🛡️ 白名单与账密</a>
       <a href="#config">📐 配置管理</a>
+      <a href="#region">🗺️ 服务区配置</a>
+      <a href="#instances">🔢 推荐实例数</a>
       <a href="#usage">📊 用量统计</a>
+      <a href="#console">🖥️ 管理台操作</a>
+      <a href="#auth">🔐 管理台登录</a>
+      <a href="#advanced">🧰 高级配置与自动维护</a>
       <a href="#errors">⚠️ 响应与错误码</a>
       <a href="#examples">💻 代码示例</a>
       <a href="#faq">❓ 常见问题</a>
@@ -185,7 +190,7 @@ curl -s --proxy "socks5://{{HOST}}:11010" https://api64.ipify.org</div>
       <div class="tip"><b>一句话记忆：</b>在白名单里 → 用 +1000 的端口免密；不在白名单 → 用账号密码连原端口。账密模式可随时关闭/开启，密码可在管理台「账密模式」页修改。</div>
 
       <h2 id="proxies">🔄 提取代理</h2>
-      <p>每次提取自动轮换一个出口 IP（Round-Robin，IPv6 出口每实例唯一）。</p>
+      <p>每次提取自动轮换一个出口 IP（Round-Robin，IPv6 出口每实例唯一）。选择 <code>ip4</code> 时，批量接口默认按公网 IPv4 去重；由于 IPv4 是共享 NAT 池，实际返回数量可能少于请求数量。</p>
 
       <div class="endpoint"><span class="method">GET</span><span class="path">/api/pool/acquire</span><span class="desc">原始提取接口，返回结构化 JSON（含出口 IP 详情）</span></div>
       <p>参数（query）：</p>
@@ -193,19 +198,13 @@ curl -s --proxy "socks5://{{HOST}}:11010" https://api64.ipify.org</div>
         <tr><th>参数</th><th>说明</th><th>必选</th></tr>
         <tr><td class="mono">session_id</td><td>粘性会话 ID：相同 ID 重复调用返回同一代理</td><td>否</td></tr>
         <tr><td class="mono">minutes</td><td>粘性时长（1~1440 分钟，默认 10），别名 sticky_minutes</td><td>否</td></tr>
+        <tr><td class="mono">ip_mode</td><td>出口协议：<code>ip6</code>（默认，独立 IPv6）或 <code>ip4</code>（共享 IPv4 NAT）</td><td>否</td></tr>
       </table>
-      <div class="code"><span class="cmt"># 普通提取（每次轮换出口）</span>
-curl -s "{{API_BASE}}/api/pool/acquire"
+      <div class="code"><span class="cmt"># 普通提取（默认 IPv6）</span>
+curl -s "{{API_BASE}}/api/pool/acquire?ip_mode=ip6"
 
-<span class="cmt"># 响应示例</span>
-{ "code": "00000", "msg": "", "data": {
-  "session_id": null, "ip": "2a09:bac1:76e0:3d0::48c:5f",
-  "sticky": false, "sticky_minutes": null, "reused": false,
-  "username": "warpuser", "password": "******",
-  "proxy": "socks5://{{HOST}}:10010",
-  "proxy_auth": "socks5://warpuser:******@{{HOST}}:10010",
-  "proxy_whitelist": "socks5://{{HOST}}:11010"
-} }</div>
+<span class="cmt"># IPv4 提取</span>
+curl -s "{{API_BASE}}/api/pool/acquire?ip_mode=ip4"</div>
 
       <div class="endpoint"><span class="method">GET</span><span class="path">/api/proxies</span><span class="desc">商用批量提取（CliProxy 风格），txt / json 两种格式</span></div>
       <table>
@@ -215,15 +214,22 @@ curl -s "{{API_BASE}}/api/pool/acquire"
         <tr><td class="mono">format</td><td>txt 行分隔符：<code>n</code>（默认 \n）/ <code>rn</code>（\r\n，方便 Windows）</td><td>否</td></tr>
         <tr><td class="mono">sid</td><td>粘性会话 ID：相同 sid 总是拿到同一个出口 IP</td><td>否</td></tr>
         <tr><td class="mono">time</td><td>粘性时长（分钟，1~1440，默认 10）</td><td>否</td></tr>
+        <tr><td class="mono">ip_mode</td><td>出口协议：<code>ip6</code>（默认，独立 IPv6）/ <code>ip4</code>（IPv4 NAT）</td><td>否</td></tr>
       </table>
       <div class="code"><span class="cmt"># 提取 5 个（txt，白名单端口）</span>
 curl -s "{{API_BASE}}/api/proxies?num=5&type=txt"
 <span class="cmt"># → {{HOST}}:11010 &#10;# → {{HOST}}:11011 &#10;# → …</span>
 
-<span class="cmt"># 提取 1 个（json，含账密与出口 IP）</span>
-curl -s "{{API_BASE}}/api/proxies?num=1&type=json"
-<span class="cmt"># → {"code":"00000","data":{"count":1,"proxies":[{ "ip":"{{HOST}}", "port":10010,
-#      "exit_ip":"2a09:bac1:...","username":"warpuser","password":"******","whitelist_mode":true }]}}</span></div>
+<span class="cmt"># 提取 5 个 IPv4 代理（JSON，默认去重）</span>
+curl -s "{{API_BASE}}/api/proxies?num=5&type=json&ip_mode=ip4"
+
+<span class="cmt"># IPv4 按实例提取，允许重复出口 IP</span>
+curl -s "{{API_BASE}}/api/proxies?num=5&type=json&ip_mode=ip4&unique_ip=0"
+
+<span class="cmt"># 提取 5 个 IPv6 代理（TXT）</span>
+curl -s "{{API_BASE}}/api/proxies?num=5&type=txt&ip_mode=ip6"
+
+<span class="cmt"># JSON 中每项包含 ip_mode 与 ipv4 字段</span></div>
 
       <h2 id="sticky">📌 粘性会话（固定出口一段时间）</h2>
       <p>带 <code>sid</code> 提取后，同一 sid 在有效期内始终拿到同一出口 IP，适合登录态、需要多次请求保持同 IP 的业务。超时未使用自动释放，也可主动释放。</p>
@@ -335,11 +341,88 @@ curl -s -X POST {{API_BASE}}/api/config -H "Content-Type: application/json" \
 #   auto_rotate_on_high_403 / cf_403_threshold / cf_min_check_count /
 #   ip_risk_check / ip_risk_threshold / rate_limit_per_minute / proxy_auth_enabled / team_token 等</span></div>
 
+      <h2 id="region">🗺️ 服务区配置（出口地区）</h2>
+      <p>出口 IP 的地区由服务器<b>就近接入的 Cloudflare 边缘节点（colo）</b>决定，与实例数、账号数、隧道协议均无关。<b>换服务区 = 换机房部署</b>，无法在服务器内切换地区。</p>
+      <table>
+        <tr><th>项</th><th>值（当前实测）</th></tr>
+        <tr><td>边缘节点</td><td>LAX（洛杉矶）</td></tr>
+        <tr><td>IPv4 出口</td><td><code>104.28.195.186/187</code>、<code>104.28.227.186/187</code>（节点 NAT 池，4 个）</td></tr>
+        <tr><td>IPv6 出口</td><td><code>2a09:bacx::/29</code>（每实例唯一）</td></tr>
+        <tr><td>可用 endpoint</td><td><code>188.114.96.1</code>、<code>188.114.97.1</code>、<code>188.114.96.2</code>、<code>188.114.96.3</code>（UDP 2408）</td></tr>
+      </table>
+      <p><b>工作原理：</b>服务启动时对内置 endpoint 列表做 UDP 连通性探测，剔除不可用项；实例按索引轮询分配 endpoint（<code>idx % 列表长度</code>），换 IP 时轮换到下一个 endpoint，避免同端点换 IP 后出口仍相同。出口位置无法在本机内切换。</p>
+      <table>
+        <tr><th>需求</th><th>做法</th></tr>
+        <tr><td>保持当前地区</td><td>无需配置，默认就近接入</td></tr>
+        <tr><td>更换出口地区</td><td>在目标地区的机房部署一台新服务器（不同机房 → 不同边缘节点 → 不同出口地区，且每台额外贡献 4 个 IPv4 出口）</td></tr>
+        <tr><td>自定义 endpoint 列表</td><td>修改 <code>server.js</code> 中 <code>WARP_ENDPOINTS</code> 常量后重启（新端点需实测确认能承载流量）</td></tr>
+      </table>
+      <div class="warn"><b>提示：</b>N 台不同地区服务器 = 4N 个 IPv4 出口 + 20N 个 IPv6 出口，是增加出口地区与 IPv4 数量的唯一途径。</div>
+
+      <h2 id="instances">🔢 推荐实例数（按服务器配置）</h2>
+      <p>每个实例是一个独立的 <code>sing-box run</code> 进程，实测内存约 <b>15MB/实例</b>，CPU 空闲占用很低。单机实例数上限 <code>max_instances=200</code>。</p>
+      <table>
+        <tr><th>服务器配置</th><th>推荐实例数</th><th>说明</th></tr>
+        <tr><td>1 核 1G</td><td>20</td><td>最小可用（当前生产即此规模）</td></tr>
+        <tr><td>2 核 2G</td><td>50</td><td>常规够用</td></tr>
+        <tr><td>2 核 4G</td><td>100</td><td>中大规模</td></tr>
+        <tr><td>4 核 8G</td><td>200</td><td>系统上限</td></tr>
+      </table>
+      <div class="tip"><b>估算依据：</b>实例内存约 15MB/个 + 系统与 sing-box 基础开销，建议为服务器预留 30%~50% 内存余量；CPU 主要消耗在批量创建/重建与高并发转发，日常巡检空闲占用低。</div>
+      <div class="code"><span class="cmt"># 常驻实例数（管理台「配置」或 API 修改，保存即生效，自动补齐/缩容）</span>
+curl -s -X POST {{API_BASE}}/api/config \
+  -H "Content-Type: application/json" -d '{"resident_count":50}'</div>
+      <p><b>扩缩容注意：</b>批量创建/重建会触发 Cloudflare 注册 API <code>429 限流</code>（内置退避重试，建议 <code>max_concurrent_create</code> 默认 3 控制并发）；缩容从端口最大的实例开始删除，固定绑定实例自动排除；单机达 200 上限后仍需更多出口，请部署多台服务器。</p>
+
       <h2 id="usage">📊 用量统计</h2>
       <div class="endpoint"><span class="method">GET</span><span class="path">/api/usage</span><span class="desc">每日提取/粘性/释放/上报/换IP/绑定次数（数据概览图表的来源）</span></div>
       <div class="code">curl -s "{{API_BASE}}/api/usage?days=30"
 <span class="cmt"># → data: { days:[{ date:"2026-08-18", acquires:0, sticky:0, releases:0,
 #            reports:0, rotates:0, binds:0, unbinds:0, total:0 }, ...] }</span></div>
+
+      <h2 id="console">🖥️ 管理台操作</h2>
+      <p>管理台入口为 <code>/</code>，文档入口为 <code>/docs</code>。管理台按功能分为数据概览、流量代理、长效静态 IP、白名单管理和实例管理。</p>
+      <table>
+        <tr><th>页面</th><th>主要用途</th><th>常用操作</th></tr>
+        <tr><td><b>数据概览</b></td><td>查看容器、实例、可用数、使用中、不健康、独立 IP、固定绑定和活跃会话</td><td>查看近 30 天用量；添加白名单或一键添加当前 IP；进入代理提取、静态 IP、白名单管理</td></tr>
+        <tr><td><b>API 白名单模式</b></td><td>生成批量提取链接</td><td>选择 txt/json、IPv4/IPv6、轮换/Sticky、数量和换行符；复制链接或直接打开；可切换白名单列表批量删除</td></tr>
+        <tr><td><b>账密模式</b></td><td>使用代理账号密码连接实例端口</td><td>查看/复制账密，修改密码，生成 HTTP(S)/SOCKS5 示例和代理列表（1~200 条）</td></tr>
+        <tr><td><b>长效静态 IP</b></td><td>管理长期固定的 IPv6 出口</td><td>绑定、搜索、复制、编辑备注、导出、批量解绑；切换使用记录/历史记录；可重置全部账密</td></tr>
+        <tr><td><b>白名单管理</b></td><td>管理 API 免 Key 和白名单端口来源</td><td>支持 IPv4、IPv6、CIDR；搜索、编辑备注、批量删除、查看归属地、一键添加当前 IP</td></tr>
+        <tr><td><b>实例管理</b></td><td>管理 WARP 实例生命周期</td><td>调整实例数、粘性时长、403 自动换 IP、账密开关；创建/重建、启停、删除、换 IP、查看任务日志</td></tr>
+      </table>
+      <div class="tip"><b>端口规则：</b>实例主端口从 <code>base_port</code>（默认 10010）开始递增；白名单端口 = 主端口 + <code>whitelist_port_offset</code>（默认 1000）。白名单端口仅允许白名单来源且免密，主端口是否需要账密由账密模式开关决定。</div>
+
+      <h2 id="auth">🔐 管理台登录与鉴权</h2>
+      <p>管理台页面公开可打开，但管理接口需要登录。点击右上角「登录」，使用配置中的 API Key 换取会话 Token；登录成功后会话默认有效 <b>30 天</b>，浏览器会保存登录状态。</p>
+      <div class="endpoint"><span class="method post">POST</span><span class="path">/api/login</span><span class="desc">API Key 换取管理台会话 Token</span></div>
+      <div class="code">curl -s -X POST {{API_BASE}}/api/login \
+  -H "Content-Type: application/json" -d '{"key":"你的API Key"}'
+<span class="cmt"># 成功返回 data.token；expires_in 为有效秒数，api_key_hint 仅显示脱敏提示</span></div>
+      <p><b>注意：</b>管理台登录 Token 只用于管理接口，不会替代代理提取接口的来源 IP 白名单。外部调用 API 仍需把调用方 IP 加入白名单；服务器本机 <code>127.0.0.1</code> / <code>::1</code> 始终放行。</p>
+      <div class="warn"><b>登录保护：</b>API Key 连续输错 5 次会锁定当前来源 60 秒。不要把 API Key 写入前端代码、公开脚本或代理列表。</div>
+
+      <h2 id="advanced">🧰 高级配置与自动维护</h2>
+      <h3>常用配置</h3>
+      <table>
+        <tr><th>配置</th><th>默认值</th><th>说明</th></tr>
+        <tr><td class="mono">resident_count</td><td>5</td><td>常驻实例数；保存后自动补齐或缩容</td></tr>
+        <tr><td class="mono">max_instances</td><td>200</td><td>单机实例上限</td></tr>
+        <tr><td class="mono">min_available</td><td>5</td><td>可用实例不足时触发补充</td></tr>
+        <tr><td class="mono">max_concurrent_create</td><td>3</td><td>创建/重建并发数，降低 Cloudflare 429 风险</td></tr>
+        <tr><td class="mono">health_check_interval</td><td>600 秒</td><td>健康巡检间隔；配合自动重建使用</td></tr>
+        <tr><td class="mono">auto_rebuild_on_unhealthy</td><td>true</td><td>实例异常时自动重建；最多由 max_rebuild_attempts 控制</td></tr>
+        <tr><td class="mono">auto_rotate_on_high_403</td><td>true</td><td>403 统计达到阈值后自动换 IP</td></tr>
+        <tr><td class="mono">cf_403_threshold / cf_min_check_count</td><td>50 / 3</td><td>403 比例阈值与最少统计次数</td></tr>
+        <tr><td class="mono">ip_risk_check / ip_risk_threshold</td><td>true / 70</td><td>使用 Scamalytics 风控检测，达到阈值自动换 IP</td></tr>
+        <tr><td class="mono">rate_limit_per_minute</td><td>60</td><td>代理池及管理操作的接口限流</td></tr>
+        <tr><td class="mono">proxy_auth_enabled</td><td>true</td><td>主端口是否启用用户名密码；切换会热更新实例且不改变出口 IP</td></tr>
+      </table>
+      <h3>WireGuard 与 MASQUE</h3>
+      <p><code>warp_transport</code> 默认为 <code>wireguard</code>；设置为 <code>masque</code> 时使用 <code>usque</code> 引擎，通过本机独立 SOCKS 端口承载 WARP 流量，适合服务器 UDP/WireGuard 受限的网络。<code>masque_http2</code> 可启用 HTTP/2 传输；修改后需重建或重启相关实例。</p>
+      <h3>Teams Token</h3>
+      <p>在 <code>team_token</code> 中填写 WARP Teams Token 后，新注册账号会按 Teams 方式创建（用于团队/无限流量场景）。GET 配置接口只返回 Token 前 6 位；不要在文档、日志或截图中暴露完整 Token。</p>
+      <div class="tip"><b>固定绑定影响：</b>长效静态 IP 实例会从普通代理池中排除，并豁免自动换 IP和自动重建；如需更换其出口，必须显式传 <code>force=true</code>，换 IP 后仍保留绑定关系。</div>
 
       <h2 id="errors">⚠️ 统一响应格式与错误码</h2>
       <p>所有 JSON 接口统一返回 <code>{ "code": "00000", "msg": "", "data": {} }</code>，<code>code</code> 为 5 位错误码，<code>00000</code> 代表成功。</p>
