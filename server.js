@@ -243,7 +243,7 @@ app.use((req, res, next) => {
   const start = Date.now();
   res.on('finish', () => {
     const ms = Date.now() - start;
-    logger.info('REQUEST', `${req.method} ${req.path} ${res.statusCode} ${ms}ms`);
+    logger.debug('REQUEST', `${req.method} ${req.path} ${res.statusCode} ${ms}ms`);
   });
   next();
 });
@@ -1140,6 +1140,12 @@ function engineLogPath(instanceIndex) {
   return path.join(getInstanceDir(instanceIndex), 'engine.log');
 }
 
+// 引擎日志 fd 被子进程长期持有，超限只能原地截断（rename 后子进程仍写旧 inode，等于没删）
+function openEngineLog(p) {
+  try { if (fs.statSync(p).size > 10 * 1024 * 1024) fs.truncateSync(p, 0); } catch (e) { }
+  return fs.openSync(p, 'a');
+}
+
 // 注册（如无账号）+ 启动本实例的 usque 引擎，返回 PID。
 // 注意: 账号=出口IP（每账号独立 IPv6），引擎配置持久化在实例目录，删除文件即触发下次换新账号。
 function startMasqueEngine(instanceIndex) {
@@ -1153,10 +1159,10 @@ function startMasqueEngine(instanceIndex) {
     }
     logger.info('ENGINE', `warp-${instanceIndex} 已注册全新 MASQUE 账号 (${cfgPath})`);
   }
-  const logFd = fs.openSync(engineLogPath(instanceIndex), 'a');
+  const logFd = openEngineLog(engineLogPath(instanceIndex));
   const args = ['socks', '-c', cfgPath, '-b', '127.0.0.1', '-p', String(enginePort(instanceIndex)), '--always-reconnect'];
   if (config.masque_http2) args.push('--http2'); // TCP 443 兜底（QUIC/UDP 也被风控时）
-  const child = spawn(USQUE_BIN, args, { detached: true, stdio: ['ignore', logFd, logFd] });
+  const child = spawn(USQUE_BIN, args, { detached: true, stdio: ['ignore', logFd, logFd], env: { ...process.env, RUST_LOG: 'warn' } });
   fs.closeSync(logFd);
   child.unref();
   logger.info('ENGINE', `warp-${instanceIndex} usque已启动 (端口:${enginePort(instanceIndex)} PID:${child.pid}${config.masque_http2 ? ' http2' : ''})`);
@@ -1269,6 +1275,7 @@ function buildSingboxConfig({ privateKey, ipv6Addr, port, wlPort, wlCidrs = [], 
   rules.push({ ip_is_private: true, outbound: 'direct-out' });
 
   const cfg = {
+    log: { level: 'warn', timestamp: true },
     dns: {
       servers: [
         { tag: 'remote', type: 'tls', server: 'dns.quad9.net', domain_resolver: 'local', detour: 'direct-out' },
@@ -1581,7 +1588,7 @@ function registerViaWgcf(dir) {
 function startSingbox(instanceIndex, configPath) {
   const name = getInstanceName(instanceIndex);
   const logPath = path.join(getInstanceDir(instanceIndex), 'singbox.log');
-  const logFd = fs.openSync(logPath, 'a');
+  const logFd = openEngineLog(logPath);
   const child = spawn(SINGBOX_BIN, ['run', '-c', configPath], {
     detached: true,
     stdio: ['ignore', logFd, logFd]

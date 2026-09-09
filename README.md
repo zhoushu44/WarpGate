@@ -13,18 +13,28 @@
 
 ---
 
+## 更新日志
+
+### v5.0（2026-09-10）
+
+- **日志治理（磁盘占用优化）**：引擎日志（sing-box / usque）降为 `warn` 级别，不再逐连接记录（此前为日志膨胀主因，长期运行可达数 GB）；实例引擎日志超 10MB 在引擎重启时自动原地截断；API 访问日志降为 `debug` 级，默认 `log_level=info` 下不落盘；`docker run` 示例补齐容器日志上限 `--log-opt max-size=20m --log-opt max-file=3`（与 compose 一致）。
+- **镜像标签**：CI 构建标签 `4.0` → `5.0`，仍与 `latest` 同镜像由 GitHub Actions 自动推送，本地无需任何推送操作。
+
+---
+
 ## 快速部署（Docker）
 
-只用两条命令就能把整套代理池拉起来。镜像由 GitHub Actions 在每次 push 到 `main`/`master` 时自动构建并推送 `4.0` / `latest` 两个标签，**本地无需构建、无需任何推送**：
+只用两条命令就能把整套代理池拉起来。镜像由 GitHub Actions 在每次 push 到 `main`/`master` 时自动构建并推送 `5.0` / `latest` 两个标签，**本地无需构建、无需任何推送**：
 
 ```bash
-# ① 拉取镜像（4.0 与 latest 为同一镜像，随代码更新自动同步）
+# ① 拉取镜像（5.0 与 latest 为同一镜像，随代码更新自动同步）
 docker pull zhoushu1/warp-pool:latest
 
 # ② 启动容器（host 网络 + 实例目录持久化 + 崩溃自启）
 docker run -d --name warp \
   --network host \
   --restart unless-stopped \
+  --log-opt max-size=20m --log-opt max-file=3 \
   -v /root/warp-instances:/root/warp-instances \
   -v /root/warp/config.json:/app/config.json \
   -v /root/warp/logs:/app/logs \
@@ -197,7 +207,7 @@ curl -s "http://<ip>:4433/api/usage?days=30"
 /root/warp/
 ├── server.js                 # 主服务（Node.js，端口 4433）
 ├── config.json               # 运行配置
-├── logs/server.log           # 运行日志
+├── logs/app-YYYY-MM-DD.log   # 运行日志（按天滚动，保留 7 份）
 └── package.json
 
 /root/warp-instances/
@@ -206,6 +216,8 @@ curl -s "http://<ip>:4433/api/usage?days=30"
     ├── wgcf-account.toml     # WARP 账号凭据（API 注册成功也会生成等效文件）
     ├── wgcf-profile.conf     # WireGuard 配置文件
     ├── meta.json             # 元数据（pid / ipv6 / endpoint）
+    ├── singbox.log           # sing-box 进程日志（warn 级，超 10MB 自动截断）
+    ├── engine.log            # usque 引擎日志（MASQUE 模式，超 10MB 自动截断）
     └── pid                   # 进程号文件
 ```
 
@@ -216,7 +228,7 @@ server.js                  # 与服务器同步的主服务
 deploy-v3.ps1              # 部署脚本（SFTP 上传 + 重启 systemd 服务，进程化方式）
 Dockerfile                 # Docker 镜像定义（内置 sing-box / wgcf 二进制）
 docker-compose.yml         # 容器编排（host 网络 + 挂载卷 + 自启，从 Docker Hub 拉镜像）
-.github/workflows/         # GitHub Actions：push 到 main/master 自动构建并推送镜像（4.0 / latest）
+.github/workflows/         # GitHub Actions：push 到 main/master 自动构建并推送镜像（5.0 / latest）
 test-ipv6-sites.sh         # IPv6 目标网站可达性测试脚本
 test/                      # API / 代理池模拟测试
 ```
@@ -247,7 +259,7 @@ server.js（Node.js，端口 4433）
 
 - **两种部署方式**：进程化（每个实例是独立的 `sing-box run` 进程，用户态 WireGuard，内核无需 `wireguard` 模块，内存约 15MB/实例）或 **Docker 容器**（`node:20-slim` + host 网络，镜像内置 sing-box/wgcf 二进制，挂载实例目录，`restart: unless-stopped` 自启）。两者底层完全一致，Docker 化的价值在于：环境可移植（依赖打进镜像，新机器免装 Node/sing-box/wgcf）、服务自启免 systemd 配置、日志轮转统一管理。
 - **进程隔离**：每个实例独立目录（`/root/warp-instances/warp-{idx}/`）、独立 SOCKS5 端口（`base_port + idx`）、独立 WARP 账号与密钥，互不影响。
-- **可观测**：`meta.json` 记录 pid / ipv6 / endpoint；`registration.json` 记录注册响应原文；`singbox.log` 记录进程日志。
+- **可观测**：`meta.json` 记录 pid / ipv6 / endpoint；`registration.json` 记录注册响应原文；`singbox.log` / `engine.log` 记录引擎日志（warn 级，超 10MB 在引擎重启时自动截断，不会无限增长）。
 - **崩溃恢复**：服务启动时扫描实例目录自动重启所有进程；`auto_rebuild_on_unhealthy` 在健康巡检发现异常时自动重建。
 
 ---
@@ -629,12 +641,12 @@ curl -s --compressed --max-time 25 -X POST "https://api.cloudflareclient.com/v0a
 
 ### 方式 A：Docker 容器（推荐，可移植）
 
-**镜像已发布到 Docker Hub**（`zhoushu1/warp-pool`），由 GitHub Actions 在每次 push 到 `main`/`master` 时自动构建并推送 `4.0` 与 `latest` 两个标签（见 [.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml)），**本地不执行任何推送**。镜像内置 sing-box 与 wgcf 二进制，宿主机无需预装 Node/sing-box/wgcf。
+**镜像已发布到 Docker Hub**（`zhoushu1/warp-pool`），由 GitHub Actions 在每次 push 到 `main`/`master` 时自动构建并推送 `5.0` 与 `latest` 两个标签（见 [.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml)），**本地不执行任何推送**。镜像内置 sing-box 与 wgcf 二进制，宿主机无需预装 Node/sing-box/wgcf。
 
 **拉取镜像：**
 
 ```bash
-docker pull zhoushu1/warp-pool:latest   # 或 docker pull zhoushu1/warp-pool:4.0（同一镜像）
+docker pull zhoushu1/warp-pool:latest   # 或 docker pull zhoushu1/warp-pool:5.0（同一镜像）
 ```
 
 #### 方案 1：Docker Compose（推荐）
@@ -669,6 +681,7 @@ docker logs -f warp          # 查看日志
 docker run -d --name warp \
   --network host \
   --restart unless-stopped \
+  --log-opt max-size=20m --log-opt max-file=3 \
   -v /root/warp-instances:/root/warp-instances \
   -v /root/warp/config.json:/app/config.json \
   -v /root/warp/logs:/app/logs \
@@ -677,7 +690,7 @@ docker run -d --name warp \
 
 > 必须使用 `--network host`：实例 SOCKS5 端口（10010 起）与 API 端口 4433 直接暴露，sing-box UDP 2408 出站无 NAT 干扰。
 
-**发布新版本**：改代码 → `git push` 到 `main`/`master` → GitHub Actions 自动构建推送（`4.0` / `latest` 两标签）→ 服务器 `docker compose pull && docker compose up -d`（或 `docker pull && docker rm -f warp && docker run ...`）升级，全程不碰本地构建。
+**发布新版本**：改代码 → `git push` 到 `main`/`master` → GitHub Actions 自动构建推送（`5.0` / `latest` 两标签）→ 服务器 `docker compose pull && docker compose up -d`（或 `docker pull && docker rm -f warp && docker run ...`）升级，全程不碰本地构建。
 
 容器启动后 RECOVERY 机制自动扫描 `/root/warp-instances`：
 - **复用已有配置启动**：实例目录已有 `singbox.json` 时直接复用（不重新注册账号），每个实例约 9 秒恢复（8 秒等待隧道建立 + 出口检测），秒级恢复 20/20。
@@ -1104,7 +1117,7 @@ curl -X POST http://127.0.0.1:4433/api/rebuild \
 | `cleanup_on_exit` | false | 退出时是否清理实例 |
 | `rate_limit_enabled` | true | 提取 API 限流开关 |
 | `rate_limit_per_minute` | 60 | 提取 API 每分钟限流次数 |
-| `log_level` | info | 日志级别 |
+| `log_level` | info | 日志级别（REQUEST 访问日志为 debug 级，info 下不落盘） |
 | `public_ip` | auto-detect | 公网 IP（自动检测） |
 | `api_key` | 随机生成 | API 密钥（存储于 config.json） |
 | `team_token` | 空 | WARP Teams (Zero Trust) 团队 Token（见上文） |
