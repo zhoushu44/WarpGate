@@ -1,0 +1,4 @@
+warpgate
+warpgate.exe
+*.test
+coverage.out
