@@ -78,6 +78,9 @@ type Manager struct {
 
 	// rotateFn 可注入换 IP 动作（默认 (*Manager).Rotate；测试用）
 	rotateFn func(ctx context.Context, m *Manager, idx int) error
+
+	// registerFn 可注入注册动作（默认 wgtunnel.RegisterAccount；测试用）
+	registerFn func(name, jwt string) (*wgtunnel.UsqueConfig, error)
 }
 
 func (m *Manager) rotate(ctx context.Context, idx int) error {
@@ -85,6 +88,13 @@ func (m *Manager) rotate(ctx context.Context, idx int) error {
 		return m.rotateFn(ctx, m, idx)
 	}
 	return m.Rotate(ctx, idx)
+}
+
+func (m *Manager) register(name, jwt string) (*wgtunnel.UsqueConfig, error) {
+	if m.registerFn != nil {
+		return m.registerFn(name, jwt)
+	}
+	return wgtunnel.RegisterAccount(name, jwt)
 }
 
 func New(cfg *appconfig.Config) *Manager {
@@ -189,7 +199,7 @@ func (m *Manager) Create(ctx context.Context, idx int) error {
 		// 冷创建：注册新账号
 		name := fmt.Sprintf("warpgate-%d", idx)
 		var err error
-		ucfg, err = wgtunnel.RegisterAccount(name, m.cfg.TeamToken)
+		ucfg, err = m.register(name, m.cfg.TeamToken)
 		if err != nil {
 			return err
 		}

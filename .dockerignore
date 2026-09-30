@@ -11,3 +11,4 @@ REQUIREMENTS.md
 Dockerfile
 docker-compose.yml
 .dockerignore
+.env

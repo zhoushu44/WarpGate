@@ -2,6 +2,9 @@ package pool
 
 import (
 	"context"
+	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -163,6 +166,45 @@ func TestApplyProbe403TriggersRotate(t *testing.T) {
 	inst.mu.Unlock()
 	if checkCnt != 0 {
 		t.Fatalf("触发 rotate 后统计应清零, got %d", checkCnt)
+	}
+}
+
+// TestConcurrentCreateRespectsMaxConcurrent 验证并发调用 Create 时，
+// 同时进行中的注册数不超过 max_concurrent_create（信号量上限）。
+func TestConcurrentCreateRespectsMaxConcurrent(t *testing.T) {
+	m := newTestManager(t)
+	m.cfg.MaxConcurrent = 3
+	m.sem = make(chan struct{}, 3) // 与 New 一致：容量 = max_concurrent_create
+
+	var inflight, peak int32
+	m.registerFn = func(name, jwt string) (*wgtunnel.UsqueConfig, error) {
+		cur := atomic.AddInt32(&inflight, 1)
+		for {
+			old := atomic.LoadInt32(&peak)
+			if cur <= old || atomic.CompareAndSwapInt32(&peak, old, cur) {
+				break
+			}
+		}
+		time.Sleep(150 * time.Millisecond) // 拉长注册窗口，制造重叠
+		atomic.AddInt32(&inflight, -1)
+		return nil, fmt.Errorf("test: 注册后中断（不进入启动流程）")
+	}
+
+	const n = 8
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			_ = m.Create(context.Background(), idx)
+		}(i)
+	}
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&peak); got > 3 {
+		t.Fatalf("同时注册数超过 max_concurrent_create=3, got %d", got)
+	} else if got != 3 {
+		t.Fatalf("并发未真正生效（峰值为 %d，期望 3）", got)
 	}
 }
 

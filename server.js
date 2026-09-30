@@ -608,6 +608,7 @@ function socksProxyFlag(port) {
 }
 
 // L1: 连通性检测 - 强制IPv6出口（每个WARP账号有独立IPv6地址，返回不同IP），回退IPv4
+// 返回: { ip: 主出口IP(string|null), v6: IPv6出口(string|null), v4: IPv4出口(string|null) }
 async function checkExitIP(port) {
   const tag = `L1[端口${port}]`;
   logger.debug('IP_CHECK', `${tag} 开始IP检测 (最多${config.ip_check_retries}次)`);
@@ -632,7 +633,9 @@ async function checkExitIP(port) {
       // 优先使用IPv6结果（每个WARP账号唯一IPv6地址）
       if (primaryTrim && (primaryTrim.includes(':') || /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(primaryTrim))) {
         logger.info('IP_CHECK', `${tag} 第${attempt}次成功 → 出口IP:${primaryTrim} (api4:${fallbackTrim}) (${elapsed}ms)`);
-        return primaryTrim;
+        const v4 = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(primaryTrim) ? primaryTrim
+          : (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(fallbackTrim) ? fallbackTrim : null);
+        return { ip: primaryTrim, v6: primaryTrim.includes(':') ? primaryTrim : null, v4 };
       }
       
       // 回退到IPv4（仅当v6始终不可用时才兜底）
@@ -646,7 +649,7 @@ async function checkExitIP(port) {
           }
         }
         logger.info('IP_CHECK', `${tag} 第${attempt}次成功(回退IPv4) → IP:${fallbackTrim} (v6:${primaryTrim || '无'}) (${elapsed}ms)`);
-        return fallbackTrim;
+        return { ip: fallbackTrim, v6: null, v4: fallbackTrim };
       }
       
       logger.warn('IP_CHECK', `${tag} 第${attempt}次返回非IP: v6="${primaryTrim.substring(0, 40)}" v4="${fallbackTrim.substring(0, 40)}" (${elapsed}ms)`);
@@ -662,7 +665,7 @@ async function checkExitIP(port) {
   }
   
   logger.error('IP_CHECK', `${tag} 全部${config.ip_check_retries}次重试均失败，IP检测失败`);
-  return null;
+  return { ip: null, v6: null, v4: null };
 }
 
 // L2: CF可访问性检测（返回HTTP状态码，0=连接失败）
@@ -843,7 +846,10 @@ async function checkInstanceHealth(poolKey) {
 
   // ---- L1: IP连通性检测 ----
   logger.debug('HEALTH_CHECK', `${tag} L1阶段: 检测IP连通性...`);
-  const ip = await checkExitIP(entry.host_port);
+  const exit = await checkExitIP(entry.host_port);
+  const ip = exit.ip;
+  entry.ipv6 = exit.v6;
+  entry.ipv4 = exit.v4;
   
   if (!ip) {
     const elapsed = Date.now() - t0;
@@ -1033,7 +1039,8 @@ async function rotateInstanceIP(poolKey, options = {}) {
       fs.writeFileSync(metaPath, JSON.stringify(oldMeta, null, 2));
 
       logger.debug('ROTATE', `${tag} 检测新IP...`);
-      const newIP = await checkExitIP(entry.host_port);
+      const newExit = await checkExitIP(entry.host_port);
+      const newIP = newExit.ip;
       const attemptElapsed = Date.now() - attemptT0;
 
       if (!newIP) {
@@ -1082,6 +1089,8 @@ async function rotateInstanceIP(poolKey, options = {}) {
 
       // 成功
       entry.ip = newIP;
+      entry.ipv6 = newExit.v6;
+      entry.ipv4 = newExit.v4;
       entry.ip_risk = newRisk ? newRisk.score : (config.ip_risk_check && !isDuplicate ? null : entry.ip_risk);
       entry.ip_risk_label = newRisk ? getRiskLabel(newRisk.risk) : (entry.ip_risk_label || null);
       entry.health = 'healthy';
@@ -1732,7 +1741,8 @@ async function createWarpInstance(instanceIndex) {
 
   // 检测出口IP
   const poolKey = `${instanceIndex}`;
-  const ip = await checkExitIP(port);
+  const exit = await checkExitIP(port);
+  const ip = exit.ip;
 
   // L2检测
   const httpCode = await checkOpenAIAccess(port);
@@ -1748,6 +1758,8 @@ async function createWarpInstance(instanceIndex) {
     instance_index: instanceIndex,
     host_port: port,
     ip,
+    ipv6: exit.v6,
+    ipv4: exit.v4,
     health: ip ? (isHealthy ? 'healthy' : 'unhealthy') : 'unknown',
     status: 'available',
     dedicated: wasDedicated || undefined,
@@ -1842,6 +1854,9 @@ app.get('/api/containers', async (req, res) => {
           pool_key: poolKey,
           host_port: poolEntry.host_port,
           ip: poolEntry.ip,
+          ipv6: poolEntry.ipv6 || null,
+          ipv4: poolEntry.ipv4 || null,
+          ip_mode: (poolEntry.ipv4 && !poolEntry.ipv6) ? 'ip4' : 'ip6',
           endpoint: inst.endpoint,
           health: poolEntry.health,
           pool_status: poolEntry.status,
@@ -1864,6 +1879,9 @@ app.get('/api/containers', async (req, res) => {
           instance_index: inst.index,
           host_port: inst.port,
           ip: inst.ip,
+          ipv6: null,
+          ipv4: null,
+          ip_mode: 'ip6',
           endpoint: inst.endpoint,
           health: inst.running ? 'unknown' : 'stopped',
           pool_status: inst.running ? 'not-in-pool' : 'stopped',
@@ -2098,6 +2116,12 @@ app.post('/api/start', async (req, res) => {
     const pid = startSingbox(idx, configPath);
     meta.pid = pid;
     fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+    // 重新入池为可用，交给健康巡检重新检测出口IP
+    const startEntry = pool.get(`${idx}`);
+    if (startEntry) {
+      startEntry.status = 'available';
+      startEntry.health = 'unknown';
+    }
     logger.info('INSTANCE', `[${name}] sing-box已启动 (PID:${pid})`);
     success(res, { name, pid });
   } catch (err) {
@@ -2122,11 +2146,11 @@ app.post('/api/stop', async (req, res) => {
       meta.pid = null;
       fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
     }
-    // 将该实例从池中标记为unavailable
+    // 标记为已停止：不参与健康巡检与自动重建（此前误标为 available，会导致停止后被自动拉起）
     const poolKey = `${idx}`;
     const entry = pool.get(poolKey);
     if (entry) {
-      entry.status = 'available';
+      entry.status = 'stopped';
       entry.health = 'unknown';
     }
     logger.info('INSTANCE', `[${name}] 已停止`);
@@ -2970,7 +2994,8 @@ function startTimers() {
     const keys = Array.from(pool.keys());
     for (const key of keys) {
       const entry = pool.get(key);
-      if (entry.status === 'available' && entry.health !== 'unknown') {
+      // 含 health=unknown 的实例（初次出口检测失败）也参与巡检，否则会永久卡死不再重试
+      if (entry.status === 'available') {
         await checkInstanceHealth(key);
       }
     }
@@ -3017,12 +3042,15 @@ async function recoverFromExistingContainers() {
       const poolKey = `${inst.index}`;
       if (pool.has(poolKey)) continue;
 
-      const ip = await checkExitIP(inst.port);
+      const exit = await checkExitIP(inst.port);
+      const ip = exit.ip;
       pool.set(poolKey, {
         container: inst.name,
         instance_index: inst.index,
         host_port: inst.port,
         ip,
+        ipv6: exit.v6,
+        ipv4: exit.v4,
         health: ip ? 'healthy' : 'unhealthy',
         status: 'available',
         dedicated: inst.dedicated || undefined,
@@ -3167,7 +3195,8 @@ async function reuseExistingInstance(instanceIndex) {
 
   // 检测出口 IP（v6 优先重试）
   const poolKey = `${instanceIndex}`;
-  const ip = await checkExitIP(port);
+  const exit = await checkExitIP(port);
+  const ip = exit.ip;
 
   // L2 检测
   const httpCode = await checkOpenAIAccess(port);
@@ -3182,6 +3211,8 @@ async function reuseExistingInstance(instanceIndex) {
     instance_index: instanceIndex,
     host_port: port,
     ip,
+    ipv6: exit.v6,
+    ipv4: exit.v4,
     health: ip ? (isHealthy ? 'healthy' : 'unhealthy') : 'unknown',
     status: 'available',
     dedicated: oldMeta.dedicated || undefined,

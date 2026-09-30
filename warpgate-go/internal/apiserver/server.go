@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"warpgate/internal/appconfig"
@@ -351,22 +352,29 @@ func (s *apiServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 	j := s.newJob("create")
 	writeOK(w, map[string]any{"jobId": j.ID})
 	go func() {
-		healthy := 0
+		// 并发创建：实际并发度由 pool.Manager 的信号量（max_concurrent_create）约束
+		var wg sync.WaitGroup
+		var healthy int32
 		for i := 0; i < target; i++ {
-			j.addLog(fmt.Sprintf("创建实例 warp-%d...", i))
-			if _, ok := s.mgr.Get(i); ok {
-				j.addLog(fmt.Sprintf("warp-%d 已存在，跳过", i))
-				continue
-			}
-			if err := s.mgr.Create(r.Context(), i); err != nil {
-				j.addLog(fmt.Sprintf("warp-%d 创建失败: %v", i, err))
-				j.addResult(jobResult{Success: false, Name: store.Name(i), Error: err.Error()})
-				continue
-			}
-			j.addResult(jobResult{Success: true, Name: store.Name(i)})
-			healthy++
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				j.addLog(fmt.Sprintf("创建实例 warp-%d...", idx))
+				if _, ok := s.mgr.Get(idx); ok {
+					j.addLog(fmt.Sprintf("warp-%d 已存在，跳过", idx))
+					return
+				}
+				if err := s.mgr.Create(r.Context(), idx); err != nil {
+					j.addLog(fmt.Sprintf("warp-%d 创建失败: %v", idx, err))
+					j.addResult(jobResult{Success: false, Name: store.Name(idx), Error: err.Error()})
+					return
+				}
+				j.addResult(jobResult{Success: true, Name: store.Name(idx)})
+				atomic.AddInt32(&healthy, 1)
+			}(i)
 		}
-		j.finish(fmt.Sprintf("创建完成，健康实例 %d/%d", healthy, target))
+		wg.Wait()
+		j.finish(fmt.Sprintf("创建完成，健康实例 %d/%d", atomic.LoadInt32(&healthy), target))
 	}()
 }
 
