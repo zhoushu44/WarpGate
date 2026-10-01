@@ -2,8 +2,8 @@
 
 基于 **sing-box + Cloudflare WARP** 的多出口 IP SOCKS5 代理池。系统在单台 Linux 服务器上直接运行多个相互隔离的 WARP 实例（进程化架构，不依赖 Docker），每个实例独立注册 Cloudflare WARP 账号，拥有**独立的 IPv6 出口 IP**，并共享边缘节点的 **IPv4 NAT 池**。
 
-- 单机支持 1～200 个 WARP 实例（当前生产环境 20 个）
-- **20 个唯一 IPv6 出口**（每个账号独立分配，`2a09:bacx::/29` 段）
+- 单机支持 1～200 个 WARP 实例（当前生产环境 100 个）
+- **100 个唯一 IPv6 出口**（每个账号独立分配，`2a09:bacx::/29` 段）
 - **4 个 IPv4 出口**（由 Cloudflare 边缘节点 NAT 池决定，动态轮换）
 - **多对端（Endpoint）优选**：5 个边缘接入点轮询分配，进一步扩展出口 IP 组合（账号数 × 端点数的组合）
 - API 按 Round-Robin 顺序提取代理，连续调用返回不同出口 IP
@@ -14,6 +14,20 @@
 ---
 
 ## 更新日志
+
+### v8.0（2026-10-01）
+
+- **MASQUE 端点自愈（核心改动）**：此前所有实例都使用 CF 注册下发的默认端点 `162.159.198.2`，该 IP 被服务器网络封锁后导致大批实例 `unhealthy`、IPv6 出口全废。现在支持**自动探测**：启动时按 `masque_endpoint_candidates` 候选列表逐个用 usque 试连，能真正取回出口 IP 的才采用，选中结果进程内缓存；换 IP 失败时清缓存重探。同时保留 `masque_endpoint_v4` / `masque_endpoint_h2_v4` 手动指定端点的兜底路径。
+- 新增配置项：`masque_endpoint_candidates`（候选端点列表）、`masque_endpoint_v4`、`masque_endpoint_h2_v4`。
+- **修复防火墙放行范围遗漏（部署注意）**：实例端口段规划为 `base_port ~ base_port+resident_count-1`（100 实例即 `10010~10109`），白名单段 `+1000`（`11010~11109`）。此前放行规则只到 `10100`/`11100`，**恰好缺最后 9 个端口**，表现为「服务器内 `ss -ltn` 正常监听、API 报 healthy，但外部连接超时的**假健康**」。开放端口章节已同步说明。
+
+### v7.0（2026-10-01）
+
+- **出口 IP 区分 IPv4 / IPv6**：`checkExitIP` 返回值由单个 IP 改为 `{ ip, v6, v4 }`，实例记录新增 `ipv6` / `ipv4` 字段；`/api/containers` 新增 `ipv6` / `ipv4` / `ip_mode`，管理台可区分每实例走的是 IPv6 独立出口还是 IPv4 NAT 池出口。
+
+### v6.0（2026-09-10）
+
+- **新增 Go 版本实现（`warpgate-go/`）**：并行提供一套 Go 重写（`internal/pool`、`internal/socks`、`internal/wgtunnel`、`internal/apiserver` 等），含单元测试与 e2e / 集成测试，作为逐步替换 Node 版的技术储备。
 
 ### v5.0（2026-09-10）
 
@@ -41,20 +55,32 @@ docker run -d --name warp \
   zhoushu1/warp-pool:latest
 ```
 
-启动后打开管理台 `http://<服务器IP>:4433`，容器会自动恢复/创建 20 个 WARP 实例（SOCKS5 端口 10010～10029）。升级版本：重新 `docker pull` 后 `docker rm -f warp && docker run ...`（或使用 [Docker Compose](#方式-a-docker-容器推荐可移植) 更方便，自带日志轮转与容器管理）。
+启动后打开管理台 `http://<服务器IP>:4433`，容器会自动恢复/创建 `resident_count` 个 WARP 实例（当前生产环境为 100 个，SOCKS5 端口 `10010～10109`）。升级版本：重新 `docker pull` 后 `docker rm -f warp && docker run ...`（或使用 [Docker Compose](#方式-a-docker-容器推荐可移植) 更方便，自带日志轮转与容器管理）。
 
 ### 开放端口（安全组/防火墙）
 
-以下为需要在外网访问的功能对应的 **宿主机 TCP 入站端口**（host 网络直监听，Docker 与 systemd 部署要求一致）：
+以下为需要在外网访问的功能对应的 **宿主机 TCP 入站端口**（host 网络直监听，Docker 与 systemd 部署要求一致）。
+
+**端口段随实例数伸缩**：实例数 N 对应账密端口 `base_port ~ base_port+N-1`、白名单端口 `base_port+1000 ~ base_port+N-1+1000`（`base_port` 默认 10010，最大 200 实例）。下表以当前生产环境 **100 实例**为例：
 
 | 端口 | 用途 | 是否需要外网开放 |
 |---|---|---|
 | `4433` | 管理台 / API / 文档 | 必须开放 |
-| `10010 ~ 10029` | 账密模式 SOCKS5（每实例一个端口，`base_port + 索引`） | 账密直连则开放 |
-| `11010 ~ 11029` | 白名单免密 SOCKS5（实例端口 + 1000） | 白名单直连则开放 |
+| `10010 ~ 10109` | 账密模式 SOCKS5（每实例一个端口，`base_port + 索引`） | 账密直连则开放 |
+| `11010 ~ 11109` | 白名单免密 SOCKS5（实例端口 + 1000） | 白名单直连则开放 |
 
-- 端口段随实例数伸缩：实例数 N 对应账密端口 `base_port ~ base_port+N-1`、白名单端口 `+1000`（最大 200 实例）。
-- 只对外开放「管理台 + 白名单提取」时，最小放行 `4433` + `11010~11029`；要走账密直连再放行 `10010~10029`。
+- **必须放行「实例数对应」的完整端口段，不能少放**。若放行范围短于实际实例端口（例如只放 `10010~10100` 而实例占用到 `10109`），末尾若干实例会出现「服务器内 `ss -ltn` 正常监听、API 也报 `healthy`，但外部连接一直超时」的**假健康**——服务器自测走本机回环不受防火墙影响，只有外部入站才会被 DROP。**调整实例数后要同步检查防火墙放行范围。**
+- 以 firewalld 为例（`100` 实例，账密 + 白名单段）：
+
+  ```bash
+  firewall-cmd --permanent --add-port=10010-10109/tcp
+  firewall-cmd --permanent --add-port=11010-11109/tcp
+  firewall-cmd --reload
+  firewall-cmd --list-ports     # 核对结果
+  ```
+
+  使用 nftables/iptables 或云厂商安全组时，请放行等价的完整端口区间。
+- 只对外开放「管理台 + 白名单提取」时，最小放行 `4433` + 白名单段（`11010 ~ 11010+N-1`）；要走账密直连再放行账密段（`10010 ~ 10010+N-1`）。
 - 入站**无需**开放 UDP 2408（WARP 隧道是出站方向）；若云厂商安全组限制出站，需放行 UDP `2408`（WireGuard 端点）与 UDP/TCP `443`（MASQUE/QUIC 端点）到 Cloudflare。
 
 ---
@@ -183,7 +209,7 @@ curl -s "http://<ip>:4433/api/usage?days=30"
 - [主要配置](#主要配置)
 - [服务区（出口地区）配置](#服务区出口地区配置)
 - [推荐实例数（按服务器配置）](#推荐实例数按服务器配置)
-- [当前生产环境实测数据](#当前生产环境实测数据192612116)
+- [实测数据](#实测数据)
 - [OpenAI 403 的替代方案](#openai-403-的替代方案)
 - [多服务器扩展](#多服务器扩展增加-ipv4-出口)
 - [故障排查（FAQ）](#故障排查faq)
@@ -447,6 +473,22 @@ WARP 对端（endpoint）就是 sing-box WireGuard 配置中 `peers[].address` �
 
 > 注意：部分 endpoint（如 `162.159.192.1`、`162.159.193.1`）虽能完成 UDP 握手，但实际无法承载流量（出口 IP 检测全部超时），已从候选列表剔除。若某个实例频繁出现"隧道已建立但无出口 IP"，大概率是该 endpoint 或该账号的瞬时故障——实例会走 RECOVERY 复用失败自动清理进程并重新注册（见下方部署章节），无需人工干预。
 
+#### MASQUE 传输的端点自愈（v8.0）
+
+`warp_transport: masque` 时实例走 usque 引擎，端点不再由 sing-box 的 `endpoints` 数组决定，而是取 CF 注册下发的默认端点——**该默认端点一旦被服务器网络封锁，全部实例会同时失联**（v8.0 修复的实际故障：默认端点 `162.159.198.2` 被封锁，导致大批实例 unhealthy、IPv6 出口全废）。
+
+v8.0 引入端点自愈，优先级为 **手动覆盖 > 进程内缓存 > 候选列表自动探测**：
+
+1. **手动覆盖**：`masque_endpoint_v4` / `masque_endpoint_h2_v4` 非空时直接采用，不做探测（应急排障用）。
+2. **进程内缓存**：一旦某端点探测成功，缓存在进程内，后续实例直接复用，避免重复试连。
+3. **自动探测**：按 `masque_endpoint_candidates`（默认 8 个 CF 端点）逐个用 usque 本体做「金丝雀」试连，**真实 curl 取回出口 IP 才算可用**，取第一个通过的端点。换 IP 失败时清缓存重新探测。
+
+日志中可见探测结果：
+
+```text
+[ENGINE] MASQUE 端点自动探测选中: 162.159.198.3（候选 8 个）
+```
+
 ### 账号注册机制与注册 API 解析
 
 系统按 **registerViaAPI → registerViaWgcf** 顺序注册账号，API 失败自动回退 wgcf：
@@ -658,7 +700,7 @@ services:
   warp:
     image: zhoushu1/warp-pool:latest   # 每次部署前 docker compose pull 拉取最新
     container_name: warp
-    network_mode: host        # 需要 host 网络：实例端口 10010-10029 + 服务端口 4433 直接暴露
+    network_mode: host        # 需要 host 网络：实例端口 10010 起（当前 100 实例即 10010-10109）+ 服务端口 4433 直接暴露
     restart: unless-stopped   # 开机自启 / 崩溃自动拉起
     volumes:
       - /root/warp-instances:/root/warp-instances   # 实例持久化（重启不丢账号）
@@ -740,7 +782,7 @@ WantedBy=multi-user.target
 http://<服务器IP>:4433
 ```
 
-默认创建 20 个实例，端口 `10010～10029`。每个实例创建流程：
+默认按 `config.json` 的 `resident_count` 创建实例（当前生产环境 100 个，端口 `10010～10109`）。每个实例创建流程：
 
 1. 探测可用 endpoint（仅启动时）
 2. `registerViaAPI` 注册新账号（失败回退 wgcf），按实例索引分配 endpoint
@@ -1033,6 +1075,11 @@ socks5://127.0.0.1:10010
 | `ip_risk_threshold` | 70 | 风控值 ≥ 该值判定高风险并触发换 IP（0~100） |
 | `ip_risk_ttl` | 21600 | 风控值缓存有效期（秒），6 小时 |
 | `ip_risk_check_url` | https://scamalytics.com/ip/ | 风控检测数据源前缀 |
+| `warp_transport` | masque | 传输协议（`masque` / `wireguard`） |
+| `masque_http2` | true | MASQUE 是否走 HTTP/2 over TCP 443（关闭则走 QUIC over UDP 443） |
+| `masque_endpoint_v4` | 空 | 手动指定 MASQUE 端点（IPv4）；留空则自动探测，见 `masque_endpoint_candidates` |
+| `masque_endpoint_h2_v4` | 空 | 手动指定 MASQUE HTTP/2 端点（IPv4）；留空则自动探测 |
+| `masque_endpoint_candidates` | 8 个 CF 端点 | MASQUE 自动探测候选列表：启动时逐个试连，能真正取回出口 IP 的才采用 |
 
 ### API 新增字段
 
@@ -1149,10 +1196,10 @@ curl -X POST http://127.0.0.1:4433/api/rebuild \
 |---|---|
 | 保持当前地区 | 无需配置，默认就近接入 |
 | 更换出口地区 | 在目标地区的机房部署一台新服务器（不同机房 → 不同边缘节点 → 不同出口地区，且每台额外贡献 4 个 IPv4 出口） |
-| 自定义 endpoint 列表 | 修改 `server.js` 中 `WARP_ENDPOINTS` 常量后重启（新端点需实测确认能承载流量） |
+| 自定义 endpoint 列表 | 修改 `config.json` 中的 `masque_endpoint_candidates`（MASQUE 传输，v8.0 起为自动探测候选列表）或 `server.js` 中 `WARP_ENDPOINTS` 常量（WireGuard 传输）后重启；新端点需实测确认能承载流量 |
 | 查看白名单 IP 归属地 | 管理台白名单页自动显示（`ip-api.com` 查询，存入白名单条目的 `region` 字段） |
 
-> 多服务器扩展详见 [多服务器扩展](#多服务器扩展增加-ipv4-出口)：N 台不同地区服务器 = 4N 个 IPv4 出口 + 20N 个 IPv6 出口。
+> 多服务器扩展详见 [多服务器扩展](#多服务器扩展增加-ipv4-出口)：N 台不同地区服务器 = 4N 个 IPv4 出口 +（每台实例数）个 IPv6 出口（每实例独立）。
 
 ---
 
@@ -1187,7 +1234,9 @@ curl -s -X POST http://127.0.0.1:4433/api/config \
 
 ---
 
-## 当前生产环境实测数据（192.6.121.16）
+## 实测数据
+
+> 以下为早期 20 实例环境（服务器 `192.6.121.16`，LAX 机房）的实测记录，用于说明出口 IP 构成与可达性结论；当前生产环境已扩至 100 实例（服务器 `195.72.185.32`），端口段见 [开放端口](#开放端口安全组防火墙)。
 
 ### 出口 IP 汇总
 
@@ -1282,7 +1331,7 @@ curl -s -X POST http://127.0.0.1:4433/api/config \
 
 **国内主流（绝大多数 IPv6 直达）**：baidu、taobao、tmall、jd、douyin、weibo、zhihu、bilibili、qq、sina、xiaohongshu、meituan、pinduoduo、aliyun、tencent、iqiyi、youku 等全部可达；163.com / sohu.com 返回 403（链路通，防护拦截）；`www.douban.com` 完全不可达；`www.ele.me` 仅 IPv4 可达。
 
-复用测试脚本：`bash test-ipv6-sites.sh [端口]`（默认自动探测 10010～10029）
+复用测试脚本：`bash test-ipv6-sites.sh [端口]`（默认自动探测 10010 起始的已监听实例端口）
 
 ---
 

@@ -46,5 +46,6 @@ COPY public ./public
 # 实例数据目录（运行期挂载宿主机 /root/warp-instances）
 VOLUME ["/root/warp-instances"]
 
-EXPOSE 4433 10010-10029
+# 声明性 EXPOSE（host 网络下不生效，仅作说明）：实例端口段 = base_port ~ base_port+resident_count-1
+EXPOSE 4433 10010-10109
 CMD ["node", "server.js"]

@@ -5,7 +5,8 @@ services:
     # 如需本地源码构建，可临时改用 build: { context: ., dockerfile: Dockerfile } + image: warp-pool:latest
     image: zhoushu1/warp-pool:latest
     container_name: warp
-    # host 网络：20+ 个 SOCKS5 端口(10010-10029)+API(4433) 直接暴露，sing-box UDP 2408 出站无 NAT 干扰
+    # host 网络：实例 SOCKS5 端口(10010 起，当前 100 实例即 10010-10109)+API(4433) 直接暴露，sing-box UDP 2408 出站无 NAT 干扰
+    # 注意：防火墙/安全组需放行完整实例端口段（见 README 开放端口章节），少放会致末尾实例“假健康”
     network_mode: host
     restart: unless-stopped
     volumes:
