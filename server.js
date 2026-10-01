@@ -59,6 +59,13 @@ const DEFAULT_CONFIG = {
   ip_risk_check_url: 'https://scamalytics.com/ip/',
   // WARP 传输方式: 'wireguard'（默认, sing-box 端点）| 'masque'（usque, 绕开 WireGuard UDP 封禁）
   warp_transport: 'wireguard',
+  // MASQUE 端点策略：部分服务器网络会封锁 CF 注册下发的默认端点(162.159.198.2 TCP/UDP 全丢包)，
+  // masque_endpoint_v4/h2_v4 非空时强制使用（手动兜底）；留空则按 masque_endpoint_candidates
+  // 顺序自动探测（用 usque 本体做金丝雀，真实发一次请求能取回出口 IP 才算可用），
+  // 取第一个可用 IP 写入 usque.json
+  masque_endpoint_v4: '',
+  masque_endpoint_h2_v4: '',
+  masque_endpoint_candidates: ['162.159.198.3', '162.159.198.4', '162.159.198.2', '162.159.198.5', '162.159.198.6', '162.159.198.7', '162.159.198.8', '162.159.198.1'],
   log_level: 'info',
   public_ip: 'auto-detect',
   session_cleanup_interval: 30,
@@ -1045,6 +1052,7 @@ async function rotateInstanceIP(poolKey, options = {}) {
 
       if (!newIP) {
         logger.warn('ROTATE', `${tag} 第${attemptNum}次失败: 新IP检测失败 (${attemptElapsed}ms)`);
+        if (isMasque()) invalidateMasqueEndpointCache('换IP失败');
         continue;
       }
 
@@ -1155,6 +1163,85 @@ function openEngineLog(p) {
   return fs.openSync(p, 'a');
 }
 
+// ==================== MASQUE 端点自愈 ====================
+// 注册接口下发的默认端点可能被服务器网络封锁（实测 162.159.198.2 TCP/UDP 全丢包、同网段其它 IP 正常），
+// 隧道建不起来会导致 IP 检测失败被误判 unhealthy。策略: 手动覆盖 > 进程内缓存 > 候选列表自动探测。
+// 探测方式: 用 usque 本体做"金丝雀"——复制实例配置、替换端点后在临时端口起一个引擎并真实发一次请求，
+// 能取回出口 IP 才算可用（与生产同一条路径，含 usque 的证书固定校验，比单纯 TLS 探测可靠）
+const MASQUE_PROBE_CFG_PATH = '/tmp/masque_endpoint_probe.json';
+const MASQUE_PROBE_PORT = 20299;
+let masqueEndpointPick = null; // 进程内缓存: 探测选中的端点 { v4, h2 }
+
+// 探测单个候选端点，返回是否可用
+function probeMasqueEndpoint(ip, cfgPath) {
+  let child = null;
+  try {
+    const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+    cfg.endpoint_v4 = ip;
+    cfg.endpoint_h2_v4 = ip;
+    fs.writeFileSync(MASQUE_PROBE_CFG_PATH, JSON.stringify(cfg, null, 2));
+    const args = ['socks', '-c', MASQUE_PROBE_CFG_PATH, '-b', '127.0.0.1', '-p', String(MASQUE_PROBE_PORT), '--always-reconnect'];
+    if (config.masque_http2) args.push('--http2');
+    child = spawn(USQUE_BIN, args, { stdio: 'ignore' });
+    const r = spawnSync('curl', ['-s', '--max-time', '8', '--socks5-hostname', `127.0.0.1:${MASQUE_PROBE_PORT}`, config.ip_check_url], { timeout: 11000, encoding: 'utf8' });
+    const out = (r.stdout || '').trim();
+    const ok = /^(\d{1,3}\.){3}\d{1,3}$/.test(out) || (out.includes(':') && /^[0-9a-fA-F:]+$/.test(out));
+    if (!ok) logger.debug('ENGINE', `MASQUE 端点探测 ${ip} 不可用: ${out || `curl exit ${r.status}`}`);
+    return ok;
+  } catch (e) {
+    logger.debug('ENGINE', `MASQUE 端点探测 ${ip} 异常: ${e.message}`);
+    return false;
+  } finally {
+    if (child) { try { child.kill('SIGKILL'); } catch (e) { } }
+    try { fs.unlinkSync(MASQUE_PROBE_CFG_PATH); } catch (e) { }
+  }
+}
+
+// 换IP失败等疑似端点被封锁的场景下调用，下次引擎启动会重新探测
+function invalidateMasqueEndpointCache(reason) {
+  if (masqueEndpointPick) {
+    logger.warn('ENGINE', `MASQUE 端点缓存失效(${reason})，下次引擎启动将重新探测`);
+    masqueEndpointPick = null;
+  }
+}
+
+// 解析本实例应使用的端点: 手动覆盖 > 缓存 > 候选探测; 返回 { v4, h2 } 或 null(沿用注册默认)
+function resolveMasqueEndpoint(cfgPath) {
+  const v4 = String(config.masque_endpoint_v4 || '').trim();
+  const h2 = String(config.masque_endpoint_h2_v4 || '').trim();
+  if (v4 || h2) return { v4: v4 || null, h2: h2 || null };
+  if (masqueEndpointPick) return masqueEndpointPick;
+  const list = Array.isArray(config.masque_endpoint_candidates)
+    ? config.masque_endpoint_candidates.map(s => String(s).trim()).filter(Boolean)
+    : [];
+  for (const ip of list) {
+    if (probeMasqueEndpoint(ip, cfgPath)) {
+      masqueEndpointPick = { v4: ip, h2: ip };
+      logger.info('ENGINE', `MASQUE 端点自动探测选中: ${ip}（候选 ${list.length} 个）`);
+      return masqueEndpointPick;
+    }
+  }
+  logger.warn('ENGINE', 'MASQUE 端点自动探测全部失败，沿用注册默认端点');
+  return null;
+}
+
+// 按解析结果改写 usque.json（只写非空字段，值未变则不落盘）
+function applyMasqueEndpoint(cfgPath) {
+  const pick = resolveMasqueEndpoint(cfgPath);
+  if (!pick || (!pick.v4 && !pick.h2)) return;
+  try {
+    const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+    const changed = (pick.v4 && cfg.endpoint_v4 !== pick.v4) || (pick.h2 && cfg.endpoint_h2_v4 !== pick.h2);
+    if (!changed) return;
+    if (pick.v4) cfg.endpoint_v4 = pick.v4;
+    if (pick.h2) cfg.endpoint_h2_v4 = pick.h2;
+    fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
+    logger.info('ENGINE', `MASQUE 端点已写入: v4=${cfg.endpoint_v4} h2=${cfg.endpoint_h2_v4} (${cfgPath})`);
+  } catch (e) {
+    logger.warn('ENGINE', `MASQUE 端点写入失败 (${cfgPath}): ${e.message}`);
+  }
+}
+
 // 注册（如无账号）+ 启动本实例的 usque 引擎，返回 PID。
 // 注意: 账号=出口IP（每账号独立 IPv6），引擎配置持久化在实例目录，删除文件即触发下次换新账号。
 function startMasqueEngine(instanceIndex) {
@@ -1168,6 +1255,7 @@ function startMasqueEngine(instanceIndex) {
     }
     logger.info('ENGINE', `warp-${instanceIndex} 已注册全新 MASQUE 账号 (${cfgPath})`);
   }
+  applyMasqueEndpoint(cfgPath);
   const logFd = openEngineLog(engineLogPath(instanceIndex));
   const args = ['socks', '-c', cfgPath, '-b', '127.0.0.1', '-p', String(enginePort(instanceIndex)), '--always-reconnect'];
   if (config.masque_http2) args.push('--http2'); // TCP 443 兜底（QUIC/UDP 也被风控时）

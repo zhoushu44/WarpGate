@@ -1,6 +1,6 @@
 services:
   warp:
-    # Docker Hub 镜像：由 GitHub Actions 在 push 到 main/master 时自动构建并推送（7.0 + latest）
+    # Docker Hub 镜像：由 GitHub Actions 在 push 到 main/master 时自动构建并推送（8.0 + latest）
     # 升级方式：docker compose pull && docker compose up -d
     # 如需本地源码构建，可临时改用 build: { context: ., dockerfile: Dockerfile } + image: warp-pool:latest
     image: zhoushu1/warp-pool:latest
