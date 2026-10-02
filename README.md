@@ -15,6 +15,21 @@
 
 ## 更新日志
 
+### v10.0（2026-10-02）
+
+- **引擎僵死自愈（核心改动）**：usque MASQUE 隧道约每 5 分钟被 Cloudflare 掐断一次（`Tunnel connection lost: EOF → Reconnecting`），断线/重连窗口内引擎会进入**僵死态**——TCP 能连上但数据不通，新连接无限期挂起。原健康检查用轻量 curl 探测，**测不出该状态**（仍判 healthy），坏引擎持续接客，导致下游（注册机等）请求等满超时、重试仍可能落在坏引擎上。
+  - 新增 `restartInstanceEngine()`：对僵死实例的引擎进程 SIGTERM（1.5s 后 SIGKILL 兜底）后用**原账号配置**重启 → **出口 IP 不变、不重新注册账号**，sing-box 不动（账密/白名单接入无变化），秒级恢复。
+  - `/api/pool/release` 支持 `failure_type`：客户端故障释放（`proxy_dead` 等）时立即重启该实例引擎。
+  - `/api/pool/report` 支持 `failure_type`：连接失败（`result=0` 或 `proxy_dead`）**连续 2 次**触发引擎重启（首次仅记录，防网络抖动误杀）；`result=0` 不计入 CF 403 统计，避免把引擎问题误判成「被 CF 拦截」而触发不必要的换 IP。
+  - `probeCfOnAcquire()`：提取代理后的后台 CF 探测若发现连接失败（HTTP:0）连续 2 次，主动重启引擎并标 `health=unknown` 等下次巡检验证。
+  - 效果：池子从「客户端失败上报」+「提取后主动探测」双通道发现僵死并自愈；实测下游注册机取代理从 39s 全超时 → 5s 内成功，单账号失败成本从约 5 分钟降到约 2 分钟。
+- 镜像标签：CI 构建标签 `9.0` → `10.0`，仍与 `latest` 同镜像由 GitHub Actions 自动推送。
+
+### v9.0（2026-10-01）
+
+- **README 整理**：补 6.0 / 7.0 / 8.0 更新日志，重写开放端口章节（100 实例、防火墙放行提醒），端口表述对齐，补 MASQUE 端点自愈说明与配置项。
+- **Dockerfile**：`EXPOSE` 改为 `10010-10109`（仅声明）。
+
 ### v8.0（2026-10-01）
 
 - **MASQUE 端点自愈（核心改动）**：此前所有实例都使用 CF 注册下发的默认端点 `162.159.198.2`，该 IP 被服务器网络封锁后导致大批实例 `unhealthy`、IPv6 出口全废。现在支持**自动探测**：启动时按 `masque_endpoint_candidates` 候选列表逐个用 usque 试连，能真正取回出口 IP 的才采用，选中结果进程内缓存；换 IP 失败时清缓存重探。同时保留 `masque_endpoint_v4` / `masque_endpoint_h2_v4` 手动指定端点的兜底路径。
@@ -38,10 +53,10 @@
 
 ## 快速部署（Docker）
 
-只用两条命令就能把整套代理池拉起来。镜像由 GitHub Actions 在每次 push 到 `main`/`master` 时自动构建并推送 `8.0` / `latest` 两个标签，**本地无需构建、无需任何推送**：
+只用两条命令就能把整套代理池拉起来。镜像由 GitHub Actions 在每次 push 到 `main`/`master` 时自动构建并推送 `10.0` / `latest` 两个标签，**本地无需构建、无需任何推送**：
 
 ```bash
-# ① 拉取镜像（8.0 与 latest 为同一镜像，随代码更新自动同步）
+# ① 拉取镜像（10.0 与 latest 为同一镜像，随代码更新自动同步）
 docker pull zhoushu1/warp-pool:latest
 
 # ② 启动容器（host 网络 + 实例目录持久化 + 崩溃自启）
@@ -254,7 +269,7 @@ server.js                  # 与服务器同步的主服务
 deploy-v3.ps1              # 部署脚本（SFTP 上传 + 重启 systemd 服务，进程化方式）
 Dockerfile                 # Docker 镜像定义（内置 sing-box / wgcf 二进制）
 docker-compose.yml         # 容器编排（host 网络 + 挂载卷 + 自启，从 Docker Hub 拉镜像）
-.github/workflows/         # GitHub Actions：push 到 main/master 自动构建并推送镜像（8.0 / latest）
+.github/workflows/         # GitHub Actions：push 到 main/master 自动构建并推送镜像（10.0 / latest）
 test-ipv6-sites.sh         # IPv6 目标网站可达性测试脚本
 test/                      # API / 代理池模拟测试
 ```
@@ -683,12 +698,12 @@ curl -s --compressed --max-time 25 -X POST "https://api.cloudflareclient.com/v0a
 
 ### 方式 A：Docker 容器（推荐，可移植）
 
-**镜像已发布到 Docker Hub**（`zhoushu1/warp-pool`），由 GitHub Actions 在每次 push 到 `main`/`master` 时自动构建并推送 `8.0` 与 `latest` 两个标签（见 [.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml)），**本地不执行任何推送**。镜像内置 sing-box 与 wgcf 二进制，宿主机无需预装 Node/sing-box/wgcf。
+**镜像已发布到 Docker Hub**（`zhoushu1/warp-pool`），由 GitHub Actions 在每次 push 到 `main`/`master` 时自动构建并推送 `10.0` 与 `latest` 两个标签（见 [.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml)），**本地不执行任何推送**。镜像内置 sing-box 与 wgcf 二进制，宿主机无需预装 Node/sing-box/wgcf。
 
 **拉取镜像：**
 
 ```bash
-docker pull zhoushu1/warp-pool:latest   # 或 docker pull zhoushu1/warp-pool:8.0（同一镜像）
+docker pull zhoushu1/warp-pool:latest   # 或 docker pull zhoushu1/warp-pool:10.0（同一镜像）
 ```
 
 #### 方案 1：Docker Compose（推荐）
@@ -732,7 +747,7 @@ docker run -d --name warp \
 
 > 必须使用 `--network host`：实例 SOCKS5 端口（10010 起）与 API 端口 4433 直接暴露，sing-box UDP 2408 出站无 NAT 干扰。
 
-**发布新版本**：改代码 → `git push` 到 `main`/`master` → GitHub Actions 自动构建推送（`8.0` / `latest` 两标签）→ 服务器 `docker compose pull && docker compose up -d`（或 `docker pull && docker rm -f warp && docker run ...`）升级，全程不碰本地构建。
+**发布新版本**：改代码 → `git push` 到 `main`/`master` → GitHub Actions 自动构建推送（`10.0` / `latest` 两标签）→ 服务器 `docker compose pull && docker compose up -d`（或 `docker pull && docker rm -f warp && docker run ...`）升级，全程不碰本地构建。
 
 容器启动后 RECOVERY 机制自动扫描 `/root/warp-instances`：
 - **复用已有配置启动**：实例目录已有 `singbox.json` 时直接复用（不重新注册账号），每个实例约 9 秒恢复（8 秒等待隧道建立 + 出口检测），秒级恢复 20/20。

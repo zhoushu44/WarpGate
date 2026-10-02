@@ -806,6 +806,20 @@ async function probeCfOnAcquire(poolKey, sessionId) {
     logger.info('CF_USAGE', `${tag} 会话${sessionId.substring(0, 8)}... 提取后开始后台CF探测`);
     const httpCode = await checkOpenAIAccess(entry.host_port);
 
+    // 探测连接失败（引擎僵死/隧道挂起）：立即重启引擎，坏出口不留给客户端
+    if (httpCode === 0 && isMasque()) {
+      const connFails = (entry.conn_fail_count || 0) + 1;
+      entry.conn_fail_count = connFails;
+      logger.warn('CF_USAGE', `${tag} 探测连接失败 x${connFails} (HTTP:0)，${connFails >= 2 ? '重启引擎' : '记录在案'}`);
+      if (connFails >= 2) {
+        restartInstanceEngine(entry.instance_index, `acquire探测连续${connFails}次失败`);
+        entry.conn_fail_count = 0;
+        entry.health = 'unknown'; // 等下次巡检验证
+      }
+      return;
+    }
+    entry.conn_fail_count = 0;
+
     if (entry.cf_check_count === undefined) {
       entry.cf_check_count = 0;
       entry.cf_403_count = 0;
@@ -1281,6 +1295,36 @@ function stopInstanceProcesses(meta) {
 function engineRunning(pid) {
   if (!pid) return false;
   try { process.kill(pid, 0); return true; } catch (e) { return false; }
+}
+
+// 重启实例的 usque 引擎（不重新注册账号 → IP 不变；修复引擎僵死/隧道挂起）
+// 返回新 PID 或 null。sing-box 不动（账密/白名单接入无变化）。
+function restartInstanceEngine(instanceIndex, reason = '') {
+  const dir = getInstanceDir(instanceIndex);
+  const metaPath = path.join(dir, 'meta.json');
+  let meta = {};
+  try {
+    if (fs.existsSync(metaPath)) meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+  } catch (e) { }
+  // 停旧引擎（SIGTERM；不存在的 PID 忽略）
+  if (meta.engine_pid) {
+    try { process.kill(meta.engine_pid, 'SIGTERM'); } catch (e) { }
+  }
+  // usque 有时会卡住不退出，等 1.5s 后强杀
+  setTimeout(() => {
+    try { process.kill(meta.engine_pid, 'SIGKILL'); } catch (e) { }
+  }, 1500).unref?.();
+  // 起新引擎（配置文件还在 → 不重新注册 → IP 不变）
+  let newPid = null;
+  try {
+    newPid = startMasqueEngine(instanceIndex);
+    meta.engine_pid = newPid;
+    fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+    logger.warn('ENGINE', `warp-${instanceIndex} 引擎已重启 (新PID:${newPid}${reason ? `, 原因:${reason}` : ''})`);
+  } catch (e) {
+    logger.error('ENGINE', `warp-${instanceIndex} 引擎重启失败: ${e.message}`);
+  }
+  return newPid;
 }
 
 // ==================== 固定IP（专用实例绑定） ====================
@@ -2584,7 +2628,7 @@ app.get('/api/usage', (req, res) => {
 
 // ==================== API: 代理池 - 释放代理 ====================
 app.post('/api/pool/release', async (req, res) => {
-  const { session_id, result } = req.body;
+  const { session_id, result, failure_type } = req.body;
   if (!session_id) {
     return error(res, ERROR_CODES.INVALID_INPUT, '缺少 session_id');
   }
@@ -2599,6 +2643,13 @@ app.post('/api/pool/release', async (req, res) => {
   if (entry) {
     entry.status = 'available';
     releasedIP = entry.ip;
+
+    // ── 故障释放：客户端带 failure_type（如 proxy_dead）──
+    // 立即重启该实例的 MASQUE 引擎（IP 不变，秒级恢复），坏引擎不留给下一个客户端
+    if (failure_type && isMasque() && failure_type !== 'normal') {
+      logger.warn('POOL', `[${entry.container}:${entry.instance_index}] 故障释放 type:${failure_type}，重启引擎`);
+      restartInstanceEngine(entry.instance_index, `释放上报 failure_type=${failure_type}`);
+    }
 
     // 上报结果：累加CF统计
     if (result !== undefined && result !== null) {
@@ -2652,12 +2703,12 @@ app.post('/api/pool/release', async (req, res) => {
 
 // ==================== API: 代理池 - 上报结果（不释放） ====================
 app.post('/api/pool/report', async (req, res) => {
-  const { session_id, result } = req.body;
+  const { session_id, result, failure_type } = req.body;
   if (!session_id) {
     return error(res, ERROR_CODES.INVALID_INPUT, '缺少 session_id');
   }
-  if (result === undefined || result === null) {
-    return error(res, ERROR_CODES.INVALID_INPUT, '缺少 result (HTTP状态码)');
+  if ((result === undefined || result === null) && !failure_type) {
+    return error(res, ERROR_CODES.INVALID_INPUT, '缺少 result (HTTP状态码) 或 failure_type');
   }
 
   const session = sessions.get(session_id);
@@ -2670,25 +2721,45 @@ app.post('/api/pool/report', async (req, res) => {
     return error(res, ERROR_CODES.NOT_FOUND, '代理池条目不存在');
   }
 
-  const code = parseInt(result);
+  // ── 故障上报：客户端明确说实例挂了（代理连不上/挂死）──
+  // result=0（连接失败）或 failure_type=proxy_dead 都走这里：
+  // 立即重启该实例的 MASQUE 引擎（IP 不变，秒级恢复），坏引擎不再留给下一个客户端。
+  const code = result === undefined || result === null ? 0 : (parseInt(result) || 0);
+  let engineRestarted = false;
+  if ((failure_type === 'proxy_dead' || code === 0) && isMasque()) {
+    const connFails = (entry.conn_fail_count || 0) + 1;
+    entry.conn_fail_count = connFails;
+    // 单次失败可能是网络抖动；连续 2 次连接失败基本判定引擎僵死
+    if (connFails >= 2) {
+      engineRestarted = !!restartInstanceEngine(entry.instance_index, `连续${connFails}次连接失败`);
+      entry.conn_fail_count = 0;
+    } else {
+      logger.warn('POOL', `[${entry.container}:${entry.instance_index}] 连接失败 x${connFails}（再失败一次即重启引擎）`);
+    }
+  } else {
+    entry.conn_fail_count = 0;
+  }
+
   if (isNaN(code)) {
     return error(res, ERROR_CODES.INVALID_INPUT, 'result 必须是数字');
   }
 
-  // 初始化CF统计
+  // 初始化CF统计（result=0 连接失败不计入 403 统计——它是引擎问题不是 CF 问题）
   if (entry.cf_check_count === undefined) {
     entry.cf_check_count = 0;
     entry.cf_403_count = 0;
     entry.cf_last_code = 0;
   }
-  entry.cf_check_count++;
-  entry.cf_last_code = code;
-  if (code === 403) {
-    entry.cf_403_count++;
+  if (code !== 0) {
+    entry.cf_check_count++;
+    entry.cf_last_code = code;
+    if (code === 403) {
+      entry.cf_403_count++;
+    }
   }
 
-  const cf403Rate = Math.round(entry.cf_403_count / entry.cf_check_count * 100);
-  logger.info('POOL', `report 会话${session_id.substring(0, 8)}... IP:${entry.ip} HTTP:${code} → CF统计 ${entry.cf_403_count}/${entry.cf_check_count}=${cf403Rate}%`);
+  const cf403Rate = entry.cf_check_count > 0 ? Math.round(entry.cf_403_count / entry.cf_check_count * 100) : 0;
+  logger.info('POOL', `report 会话${session_id.substring(0, 8)}... IP:${entry.ip} HTTP:${code}${failure_type ? ` type:${failure_type}` : ''}${engineRestarted ? ' → 引擎已重启' : ''} → CF统计 ${entry.cf_403_count}/${entry.cf_check_count}=${cf403Rate}%`);
   bumpUsage('reports');
 
   let rotated = false;
@@ -2711,6 +2782,7 @@ app.post('/api/pool/report', async (req, res) => {
     cf_403_count: entry.cf_403_count,
     cf_check_count: entry.cf_check_count,
     rotated,
+    engine_restarted: engineRestarted,
   });
 });
 
