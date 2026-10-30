@@ -15,6 +15,14 @@
 
 ## 更新日志
 
+### v11.0（2026-10-30）
+
+- **修复 `health=unknown` 实例永久不可用（核心改动）**：`pickProxy()` 与 `/api/proxies` 只挑 `health === 'healthy'` 的实例，而实测 100 个实例中有 **29 个长期停留在 `health='unknown'`**（其 `cf_last_code=200`、IP 正常），等于池容量凭空缩水约 30%。现在改为**仅排除 `unhealthy`**，`unknown` 可正常参与分配，等巡检确认后再落定健康状态。
+- **`sticky_minutes` 默认 10 → 60**：粘性会话 10 分钟就换出口 IP，与「账号绑定固定出口」的目标冲突；延长到 60 分钟后同一会话 IP 更稳定。
+- **`min_available` 默认 5 → 20**：高并发场景（如批量出图压测）下 5 个保底实例会被瞬间打空，提高到 20 减少 `acquire 无可用代理`。
+- **新增 `WARPGATE_VERSION` 常量**，便于运行期核对版本。
+- 镜像标签：CI 构建标签 `10.0` → `11.0`，仍与 `latest` 同镜像由 GitHub Actions 自动推送。
+
 ### v10.0（2026-10-02）
 
 - **引擎僵死自愈（核心改动）**：usque MASQUE 隧道约每 5 分钟被 Cloudflare 掐断一次（`Tunnel connection lost: EOF → Reconnecting`），断线/重连窗口内引擎会进入**僵死态**——TCP 能连上但数据不通，新连接无限期挂起。原健康检查用轻量 curl 探测，**测不出该状态**（仍判 healthy），坏引擎持续接客，导致下游（注册机等）请求等满超时、重试仍可能落在坏引擎上。
