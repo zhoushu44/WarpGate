@@ -1,7 +1,7 @@
 {
   "name": "warp-manager",
-  "version": "1.0.0",
-  "description": "WARP容器批量管理系统 - 自动重建直到换到新IP",
+  "version": "1.1.0",
+  "description": "WARP 容器批量管理系统 - 自动重建直到换到新 IP（unknown 实例可参与分配）",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

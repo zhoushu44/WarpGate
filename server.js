@@ -1,3 +1,5 @@
+// WarpGate 版本（发布递增）
+const WARPGATE_VERSION = '1.1.0';
 const express = require('express');
 const { exec, execSync, spawn, spawnSync } = require('child_process');
 const path = require('path');
@@ -31,14 +33,14 @@ const DEFAULT_CONFIG = {
   port: 4433,
   max_containers: 1,
   resident_count: 5,
-  sticky_minutes: 10,
+  sticky_minutes: 60,
   auto_rebuild_on_unhealthy: true,
   health_check_interval: 600,
   bind_address: '0.0.0.0',
   mode: 'resident',
   base_port: 10010,
   max_instances: 200,
-  min_available: 5,
+  min_available: 20,
   max_concurrent_create: 3,
   ip_check_url: 'https://api.ipify.org',
   ip_check_url_v6: 'https://api64.ipify.org',
@@ -2499,7 +2501,10 @@ function pickProxy(sessionId, stickyMinutes) {
   // 查找可用且健康的实例（round-robin；固定IP绑定实例不参与分配）
   const availableKeys = [];
   for (const [key, entry] of pool) {
-    if (!entry.dedicated && entry.status === 'available' && entry.health === 'healthy' && entry.ip) {
+    // health='unknown' 表示尚未完成出口检测，此前被永久排除；
+    // 实测 100 个实例中有 29 个卡在 unknown，等于池容量缩水 30%。
+    // 现在只有明确 unhealthy 才排除。
+    if (!entry.dedicated && entry.status === 'available' && entry.health !== 'unhealthy' && entry.ip) {
       availableKeys.push(key);
     }
   }
@@ -2995,7 +3000,7 @@ app.post('/api/pool/dedicated/bind', async (req, res) => {
       for (let i = 0; i < count; i++) {
         let entry = null;
         for (const [, e] of pool) {
-          if (!e.dedicated && e.status === 'available' && e.health === 'healthy' && e.ip) {
+          if (!e.dedicated && e.status === 'available' && e.health !== 'unhealthy' && e.ip) {
             entry = e;
             break;
           }
