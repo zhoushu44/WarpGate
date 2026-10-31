@@ -35,7 +35,7 @@ const DEFAULT_CONFIG = {
   resident_count: 5,
   sticky_minutes: 60,
   auto_rebuild_on_unhealthy: true,
-  health_check_interval: 600,
+  health_check_interval: 900,
   bind_address: '0.0.0.0',
   mode: 'resident',
   base_port: 10010,
@@ -1198,7 +1198,7 @@ function probeMasqueEndpoint(ip, cfgPath) {
     fs.writeFileSync(MASQUE_PROBE_CFG_PATH, JSON.stringify(cfg, null, 2));
     const args = ['socks', '-c', MASQUE_PROBE_CFG_PATH, '-b', '127.0.0.1', '-p', String(MASQUE_PROBE_PORT), '--always-reconnect'];
     if (config.masque_http2) args.push('--http2');
-    child = spawn(USQUE_BIN, args, { stdio: 'ignore' });
+    child = spawn(USQUE_BIN, args, { stdio: 'ignore', env: { ...process.env, GOMAXPROCS: '1', GOMEMLIMIT: '16MiB' } });
     const r = spawnSync('curl', ['-s', '--max-time', '8', '--socks5-hostname', `127.0.0.1:${MASQUE_PROBE_PORT}`, config.ip_check_url], { timeout: 11000, encoding: 'utf8' });
     const out = (r.stdout || '').trim();
     const ok = /^(\d{1,3}\.){3}\d{1,3}$/.test(out) || (out.includes(':') && /^[0-9a-fA-F:]+$/.test(out));
@@ -1273,7 +1273,7 @@ function startMasqueEngine(instanceIndex) {
   }
   applyMasqueEndpoint(cfgPath);
   const logFd = openEngineLog(engineLogPath(instanceIndex));
-  const args = ['socks', '-c', cfgPath, '-b', '127.0.0.1', '-p', String(enginePort(instanceIndex)), '--always-reconnect'];
+  const args = ['socks', '-c', cfgPath, '-b', '127.0.0.1', '-p', String(enginePort(instanceIndex)), '--always-reconnect', '--idle-timeout', '30'];
   if (config.masque_http2) args.push('--http2'); // TCP 443 兜底（QUIC/UDP 也被风控时）
   const child = spawn(USQUE_BIN, args, { detached: true, stdio: ['ignore', logFd, logFd], env: { ...process.env, RUST_LOG: 'warn' } });
   fs.closeSync(logFd);
@@ -1733,6 +1733,7 @@ function startSingbox(instanceIndex, configPath) {
   const logPath = path.join(getInstanceDir(instanceIndex), 'singbox.log');
   const logFd = openEngineLog(logPath);
   const child = spawn(SINGBOX_BIN, ['run', '-c', configPath], {
+    env: { ...process.env, GOMAXPROCS: '1', GOMEMLIMIT: '32MiB' },
     detached: true,
     stdio: ['ignore', logFd, logFd]
   });
