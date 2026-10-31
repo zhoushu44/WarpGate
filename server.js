@@ -1198,7 +1198,7 @@ function probeMasqueEndpoint(ip, cfgPath) {
     fs.writeFileSync(MASQUE_PROBE_CFG_PATH, JSON.stringify(cfg, null, 2));
     const args = ['socks', '-c', MASQUE_PROBE_CFG_PATH, '-b', '127.0.0.1', '-p', String(MASQUE_PROBE_PORT), '--always-reconnect'];
     if (config.masque_http2) args.push('--http2');
-    child = spawn(USQUE_BIN, args, { stdio: 'ignore', env: { ...process.env, GOMAXPROCS: '1' } });
+    child = spawn(USQUE_BIN, args, { stdio: 'ignore', })
     const r = spawnSync('curl', ['-s', '--max-time', '8', '--socks5-hostname', `127.0.0.1:${MASQUE_PROBE_PORT}`, config.ip_check_url], { timeout: 11000, encoding: 'utf8' });
     const out = (r.stdout || '').trim();
     const ok = /^(\d{1,3}\.){3}\d{1,3}$/.test(out) || (out.includes(':') && /^[0-9a-fA-F:]+$/.test(out));
@@ -1733,7 +1733,7 @@ function startSingbox(instanceIndex, configPath) {
   const logPath = path.join(getInstanceDir(instanceIndex), 'singbox.log');
   const logFd = openEngineLog(logPath);
   const child = spawn(SINGBOX_BIN, ['run', '-c', configPath], {
-    env: { ...process.env, GOMAXPROCS: '1' },
+    
     detached: true,
     stdio: ['ignore', logFd, logFd]
   });
