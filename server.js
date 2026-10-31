@@ -1,5 +1,5 @@
 // WarpGate 版本（发布递增）
-const WARPGATE_VERSION = '11.0';
+const WARPGATE_VERSION = '11.1';
 const express = require('express');
 const { exec, execSync, spawn, spawnSync } = require('child_process');
 const path = require('path');

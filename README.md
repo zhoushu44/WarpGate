@@ -15,6 +15,12 @@
 
 ## 更新日志
 
+### v11.1（2026-10-31）
+
+- **扩容到 150 实例**：`resident_count` 默认 100 → 150，`max_instances` 200 → 300。
+- `sticky_minutes` 默认 3（配合 egress TTL 5 分钟，避免池容量耗尽）。
+- 配套 chat2api 27.5 egress 修复（代理认证注入 + POST body release + TTL 5 分钟）。
+
 ### v11.0（2026-10-30）
 
 - **修复 `health=unknown` 实例永久不可用（核心改动）**：`pickProxy()` 与 `/api/proxies` 只挑 `health === 'healthy'` 的实例，而实测 100 个实例中有 **29 个长期停留在 `health='unknown'`**（其 `cf_last_code=200`、IP 正常），等于池容量凭空缩水约 30%。现在改为**仅排除 `unhealthy`**，`unknown` 可正常参与分配，等巡检确认后再落定健康状态。

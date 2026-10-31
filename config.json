@@ -1,14 +1,14 @@
 {
   "port": 4433,
   "max_containers": 1,
-  "resident_count": 20,
-  "sticky_minutes": 10,
+  "resident_count": 150,
+  "sticky_minutes": 3,
   "auto_rebuild_on_unhealthy": true,
   "health_check_interval": 600,
   "bind_address": "0.0.0.0",
   "mode": "resident",
   "base_port": 10010,
-  "max_instances": 200,
+  "max_instances": 300,
   "min_available": 5,
   "max_concurrent_create": 3,
   "ip_check_url": "https://api.ipify.org",
@@ -41,5 +41,14 @@
   "masque_http2": true,
   "masque_endpoint_v4": "",
   "masque_endpoint_h2_v4": "",
-  "masque_endpoint_candidates": ["162.159.198.3", "162.159.198.4", "162.159.198.2", "162.159.198.5", "162.159.198.6", "162.159.198.7", "162.159.198.8", "162.159.198.1"]
+  "masque_endpoint_candidates": [
+    "162.159.198.3",
+    "162.159.198.4",
+    "162.159.198.2",
+    "162.159.198.5",
+    "162.159.198.6",
+    "162.159.198.7",
+    "162.159.198.8",
+    "162.159.198.1"
+  ]
 }
