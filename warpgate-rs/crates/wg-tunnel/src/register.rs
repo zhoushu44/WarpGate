@@ -84,7 +84,11 @@ pub struct Registration {
 /// The account returned by registration.
 #[derive(Debug, Deserialize)]
 pub struct AccountData {
+    /// Present on `POST /reg`, absent on `PATCH /reg/<id>` — the caller
+    /// already holds both, so `enroll_key` fills them back in.
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub token: String,
     pub config: AccountConfig,
 }
@@ -249,10 +253,18 @@ pub async fn enroll_key(
         return Err(RegisterError::Rejected(format!("{} {}", status.as_u16(), first_line(&body))));
     }
 
-    let updated: AccountData =
+    let mut updated: AccountData =
         serde_json::from_str(&body).map_err(|e| RegisterError::Http(format!("解析登记响应失败: {e}")))?;
     if updated.config.peers.is_empty() {
         return Err(RegisterError::Missing("config.peers"));
+    }
+    // The PATCH response carries only `config`; echo back the identity the
+    // caller supplied so `AccountData` is complete either way.
+    if updated.id.is_empty() {
+        updated.id = account_id.to_string();
+    }
+    if updated.token.is_empty() {
+        updated.token = account_token.to_string();
     }
     Ok(updated)
 }

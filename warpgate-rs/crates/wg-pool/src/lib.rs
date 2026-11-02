@@ -407,14 +407,32 @@ impl Manager {
 
         // A registered account, or the injected test double.
         let ucfg = if let Some(f) = self.create_fn.read().await.clone() {
-            f(idx)
-                .await
-                .map_err(|e| PoolError::InstanceError(idx, e))?;
-            wg_store::UsqueConfig::read(&wg_store::dir(&self.base, idx))
-                ?
-                .ok_or_else(|| PoolError::InstanceError(idx, "create_fn 未写 usque.json".into()))?
+            if let Err(e) = f(idx).await {
+                // A failed create must not leave a directory behind: `boot`
+                // counts directories as live instances, so leftovers would
+                // silently shrink the pool.
+                let _ = wg_store::remove(&wg_store::dir(&self.base, idx));
+                return Err(PoolError::InstanceError(idx, e));
+            }
+            match wg_store::UsqueConfig::read(&wg_store::dir(&self.base, idx)) {
+                Ok(Some(c)) => c,
+                Ok(None) => {
+                    let _ = wg_store::remove(&wg_store::dir(&self.base, idx));
+                    return Err(PoolError::InstanceError(
+                        idx,
+                        "create_fn 未写 usque.json".into(),
+                    ));
+                }
+                Err(e) => return Err(PoolError::from(e)),
+            }
         } else {
-            self.register_account(idx).await?
+            match self.register_account(idx).await {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = wg_store::remove(&wg_store::dir(&self.base, idx));
+                    return Err(e);
+                }
+            }
         };
 
         self.start_with_config(idx, ucfg, true).await.map(|_| ())
@@ -425,11 +443,125 @@ impl Manager {
     /// The real implementation calls Cloudflare's API; that is a Phase-3 item
     /// alongside the QUIC client, so for now this reports that the engine is
     /// required.
+    /// Probe the exit addresses of an instance, for the live test.
+    pub async fn probe_exit_for_test(&self, idx: i64) -> Option<(String, String)> {
+        let inst = self.get(idx).await?;
+        let dial = inst.dial_now()?;
+        let v6 = wg_tunnel::probe_exit(
+            &dial,
+            "https://api6.ipify.org",
+            std::time::Duration::from_secs(20),
+        )
+        .await;
+        Some(v6)
+    }
+
+    /// Registration entry point for the live test.
+    ///
+    /// Exposed rather than testing through `create` so the network call can be
+    /// exercised without a tunnel or listeners.
+    pub async fn register_for_test(&self, idx: i64) -> Result<wg_store::UsqueConfig> {
+        self.register_account(idx).await
+    }
+
+    /// Register a fresh, anonymous WARP account and enroll a MASQUE key.
+    ///
+    /// Two API calls, in the order usque makes them:
+    ///
+    /// 1. `POST /reg` with no JWT — Cloudflare hands out an anonymous account
+    ///    (id + token + a per-account `interface.addresses.v6`, which is the
+    ///    identity this whole system sells).
+    /// 2. `PATCH /reg/<id>` with a fresh P-256 public key — swaps the WireGuard
+    ///    key for a MASQUE one and returns the endpoint + pinned public key.
+    ///
+    /// The private key is generated here and never leaves the process; only
+    /// the public half goes to Cloudflare.
     async fn register_account(&self, idx: i64) -> Result<wg_store::UsqueConfig> {
-        Err(PoolError::InstanceError(
-            idx,
-            "需要外部引擎或已注册的 usque.json（注册 API 未实装）".into(),
-        ))
+        // 1. Anonymous account.
+        let account = wg_tunnel::register("PC", "en_US", "")
+            .await
+            .map_err(|e| PoolError::InstanceError(idx, format!("注册失败: {e}")))?;
+
+        let v4 = {
+            let s = account.config.interface.addresses.v4.clone();
+            if s.is_empty() { "172.16.0.2".to_string() } else { s }
+        };
+        let v6 = {
+            let s = account.config.interface.addresses.v6.clone();
+            if s.is_empty() {
+                return Err(PoolError::InstanceError(
+                    idx,
+                    "注册响应缺少 IPv6 地址".into(),
+                ));
+            }
+            s
+        };
+
+        // 2. A P-256 key for MASQUE. This is the credential the tunnel
+        //    authenticates with, so it is generated fresh per instance.
+        // `OsRng` must come from the same `rand_core` version p256 links against;
+// the standalone crate is a different major and will not satisfy the bound.
+        // Build the key from 32 raw bytes rather than `SigningKey::random`:
+        // that constructor needs p256's `rand_core` feature, which would pull a
+        // second RNG stack. `getrandom` is already a dependency and is the same
+        // source the rest of the crate uses.
+        let signing = {
+            let mut seed = [0u8; 32];
+            wg_core::random_bytes(&mut seed)
+                .map_err(|e| PoolError::InstanceError(idx, format!("生成密钥失败: {e}")))?;
+            p256::ecdsa::SigningKey::from_bytes(&seed.into())
+                .map_err(|e| PoolError::InstanceError(idx, format!("私钥非法: {e}")))?
+        };
+        let private_b64 = {
+            use p256::pkcs8::EncodePrivateKey;
+            let der = signing
+                .to_pkcs8_der()
+                .map_err(|e| PoolError::InstanceError(idx, format!("导出私钥失败: {e}")))?;
+            base64_encode(der.as_bytes())
+        };
+        let spki = wg_tunnel::masque::public_key_spki_der(&signing);
+        let pubkey_b64 = base64_encode(&spki);
+
+        // 3. Enroll, which returns the endpoint and its pinned key.
+        let enrolled = wg_tunnel::enroll_key(&account.id, &account.token, &pubkey_b64, "warpgate")
+            .await
+            .map_err(|e| PoolError::InstanceError(idx, format!("enroll 失败: {e}")))?;
+
+        let peer = enrolled
+            .config
+            .peers
+            .first()
+            .ok_or_else(|| PoolError::InstanceError(idx, "enroll 响应缺少 peer".into()))?;
+        // Cloudflare returns `host:port` with port 0 for the MASQUE endpoints;
+        // usque.json stores a bare host (the port is always 443).
+        let endpoint_v4 = {
+            let raw = if peer.endpoint.v4.is_empty() {
+                peer.endpoint.v6.clone()
+            } else {
+                peer.endpoint.v4.clone()
+            };
+            raw.rsplit_once(':')
+                .filter(|(_, p)| p.parse::<u16>().map(|n| n == 0).unwrap_or(false))
+                .map(|(h, _)| h.to_string())
+                .unwrap_or(raw)
+        };
+        // The response carries the key as base64 SPKI; usque.json wants PEM.
+        let endpoint_pub_key = pem_wrap_public_key(&peer.public_key);
+
+        let ucfg = wg_store::UsqueConfig {
+            private_key: private_b64,
+            endpoint_v4: endpoint_v4.clone(),
+            endpoint_v6: String::new(),
+            endpoint_h2_v4: endpoint_v4,
+            endpoint_h2_v6: String::new(),
+            endpoint_pub_key,
+            id: enrolled.id,
+            access_token: enrolled.token,
+            ipv4: v4,
+            ipv6: v6,
+        };
+        ucfg.save(&wg_store::paths::usque_conf_path(&wg_store::dir(&self.base, idx)))?;
+        Ok(ucfg)
     }
 
     /// Build the tunnel and listeners for an account.
@@ -1352,7 +1484,17 @@ mod tests {
         .save(&wg_store::paths::usque_conf_path(&dir))
         .unwrap();
 
-        let m = Manager::new(cfg(), tmp.path().to_path_buf());
+        // Only the warm-start path: no residents to create, so the test
+        // cannot depend on a registration backend.
+        let mut c = (*cfg()).clone();
+        c.resident_count = 1;
+        let m = Manager::new(Arc::new(c), tmp.path().to_path_buf());
+        // `cfg()` asks for 4 residents, so `boot` will try to create 3 more.
+        // Stub registration out — otherwise this test registers real accounts
+        // over the network and runs for minutes.
+        m.set_create_fn(Arc::new(|_idx| {
+            Box::pin(async { Err("offline test: no registration".to_string()) })
+        }));
         let cancel = tokio_util::sync::CancellationToken::new();
         m.boot(&cancel).await;
 
@@ -1477,4 +1619,29 @@ mod tests {
         let all = m.all().await;
         assert_eq!(all.iter().map(|i| i.index).collect::<Vec<_>>(), vec![0, 1, 2]);
     }
+}
+/// Wrap a base64 SPKI blob in PEM armour.
+///
+/// `PATCH /reg/<id>` returns `public_key` as bare base64, but `usque.json` (and
+/// the TLS pinning code) expects a PEM document. Already-PEM input is passed
+/// through so this is safe to call on either shape.
+fn pem_wrap_public_key(key: &str) -> String {
+    if key.contains("BEGIN PUBLIC KEY") {
+        return key.to_string();
+    }
+    let b64: String = key.chars().filter(|c| !c.is_whitespace()).collect();
+    let mut out = String::from("-----BEGIN PUBLIC KEY-----\n");
+    for chunk in b64.as_bytes().chunks(64) {
+        out.push_str(&String::from_utf8_lossy(chunk));
+        out.push('\n');
+    }
+    out.push_str("-----END PUBLIC KEY-----\n");
+    out
+}
+
+/// Standard base64 without padding, which is what the Cloudflare API expects
+/// for key material.
+fn base64_encode(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
