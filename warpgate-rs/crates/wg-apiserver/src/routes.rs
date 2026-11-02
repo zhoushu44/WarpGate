@@ -64,9 +64,19 @@ pub fn router(state: AppState) -> Router {
         // An unknown /api path must answer with the same envelope, not axum's
         // bare "404 page not found" (Go's `default:` branch).
         .fallback(|| async { not_found("接口不存在") })
-        .with_state(state);
+        .with_state(state.clone());
 
-    protected
+    // The console and its docs are public, like the Node version's
+    // `express.static(public)` — no API key needed just to load the page.
+    //
+    // These go on the SAME router as the API, not a merged one: axum's `merge`
+    // lets the API tree's catch-all fallback shadow `/` and `/docs`, which
+    // surfaces as a 404 on the console with no hint as to why.
+    Router::new()
+        .route("/", get(crate::webui::index))
+        .route("/docs", get(crate::webui::docs))
+        .merge(protected)
+        .with_state(state)
 }
 
 // ------------------------------------------------------------------- helpers
@@ -217,7 +227,11 @@ async fn handle_containers(State(st): State<AppState>) -> axum::response::Respon
             "enginePid": 0,
             "engineRunning": status == wg_core::status::RUNNING,
             "configExists": true,
-            "ip": meta.ipv6,
+            // `ip` is the *detected exit address* (Go: `inst.LastExitIP`), not
+            // the address the account was assigned. Filling it with the
+            // assigned IPv6 makes the console show a tunnel address in the
+            // "exit IP" column, which reads as broken.
+            "ip": inst.last_exit_ipv6.read().await.clone(),
             "endpoint": null,
             "ipv6": meta.ipv6,
             "dedicated": meta.dedicated,

@@ -666,7 +666,29 @@ impl Manager {
             })
         });
 
-        self.attach_dial(idx, dial).await
+        let opened = self.attach_dial(idx, dial.clone()).await?;
+
+        // Detect the real exit address. This is what the console's "exit IP"
+        // column shows, and the assigned IPv6 is *not* it — Cloudflare routes
+        // from whatever the tunnel actually negotiated. A failed probe keeps
+        // the instance running; it only leaves the column blank.
+        if opened > 0 {
+            let url = self.cfg.ip_check_url_v6.trim();
+            if !url.is_empty() {
+                // `ip_check_interval` is milliseconds; clamp to a sane probe
+                // timeout so a small value cannot fail a probe on a slow link.
+                let secs = (self.cfg.ip_check_interval.max(1) as u64 / 1000).max(5);
+                let found =
+                    wg_tunnel::probe_exit_ipv6(&dial, url, Duration::from_secs(secs)).await;
+                if !found.is_empty() {
+                    if let Some(inst) = self.instances.read().await.get(&idx) {
+                        *inst.last_exit_ipv6.write().await = found;
+                    }
+                }
+            }
+        }
+
+        Ok(opened)
     }
 
     /// Install the outbound dial for an instance and open its SOCKS5 listeners.

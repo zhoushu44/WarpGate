@@ -574,3 +574,140 @@ mod tests {
         assert_eq!(o.dns_servers.len(), 2);
     }
 }
+
+// ------------------------------------------------------- exit IP probing
+
+/// Detect the tunnel's real exit IPv6 by fetching `url` through it.
+///
+/// The whole point of this system is a unique IPv6 exit per instance, so the
+/// console has to show the *observed* address — the one Cloudflare actually
+/// routes from — not the one the account was assigned. Go does the same
+/// (`probeExitIPv6`) and even overwrites `meta.IPv6` with the result.
+///
+/// Returns an empty string when the probe fails; callers keep the assigned
+/// value rather than failing the instance over a probe.
+pub async fn probe_exit_ipv6(dial: &DialFn, url: &str, timeout: Duration) -> String {
+    let Some(target) = parse_http_target(url) else {
+        return String::new();
+    };
+
+    let mut stream = match tokio::time::timeout(timeout, dial(target)).await {
+        Ok(Ok(s)) => s,
+        _ => return String::new(),
+    };
+
+    // Plain HTTP/1.1 GET; the response body is the bare address.
+    let req = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: warpgate/1.0\r\n\r\n",
+        path_of(url),
+        host_of(url)
+    );
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    if stream.write_all(req.as_bytes()).await.is_err() {
+        return String::new();
+    }
+    let mut buf = Vec::with_capacity(512);
+    let mut chunk = [0u8; 512];
+    loop {
+        match tokio::time::timeout(timeout, stream.read(&mut chunk)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let body = String::from_utf8_lossy(&buf[pos + 4..]).trim().to_string();
+                    return normalize_address(&body);
+                }
+                if buf.len() > 16 * 1024 {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    String::new()
+}
+
+/// `https://host:port/path` -> `host:port` to dial for a probe.
+///
+/// Always port 80 unless the URL names one explicitly. The echo endpoints this
+/// is used with answer identically on 80 and 443, and the probe speaks plain
+/// HTTP/1.1 — dialing 443 would need a TLS handshake it does not perform, so
+/// the request would hang until the timeout. Keeping the probe TLS-free also
+/// keeps it off the tunnel's critical path.
+fn parse_http_target(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let authority = rest.split('/').next()?;
+    if authority.contains(':') {
+        Some(authority.to_string())
+    } else {
+        Some(format!("{}:80", authority))
+    }
+}
+
+fn host_of(url: &str) -> String {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    rest.split('/').next().unwrap_or(rest).to_string()
+}
+
+fn path_of(url: &str) -> String {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    match rest.find('/') {
+        Some(i) => rest[i..].to_string(),
+        None => "/".to_string(),
+    }
+}
+
+/// Keep only a well-formed IP literal, discarding HTML or error pages.
+fn normalize_address(s: &str) -> String {
+    let s = s.trim();
+    if s.parse::<std::net::Ipv6Addr>().is_ok() || s.parse::<std::net::Ipv4Addr>().is_ok() {
+        s.to_string()
+    } else {
+        String::new()
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    #[test]
+    fn http_target_parsing() {
+        assert_eq!(
+            parse_http_target("https://api6.ipify.org").unwrap(),
+            "api6.ipify.org:80"
+        );
+        assert_eq!(parse_http_target("https://a.b:8443/x").unwrap(), "a.b:8443");
+        assert_eq!(host_of("https://api6.ipify.org"), "api6.ipify.org");
+        assert_eq!(path_of("https://a.b/x/y"), "/x/y");
+        assert_eq!(path_of("https://a.b"), "/");
+        assert_eq!(parse_http_target("not-a-url"), None);
+    }
+
+    #[test]
+    fn only_real_addresses_survive() {
+        assert_eq!(normalize_address("2606:4700::1"), "2606:4700::1");
+        assert_eq!(normalize_address("1.2.3.4"), "1.2.3.4");
+        assert_eq!(normalize_address("<html>nope</html>"), "");
+        assert_eq!(normalize_address(""), "");
+    }
+
+    /// A dead dial must yield an empty string, not a hang or a panic.
+    #[tokio::test]
+    async fn probe_with_a_dead_dial_is_empty() {
+        let dial: DialFn = Arc::new(|_t| {
+            Box::pin(async { Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "no")) })
+        });
+        let out =
+            probe_exit_ipv6(&dial, "https://api6.ipify.org", Duration::from_millis(200)).await;
+        assert_eq!(out, "");
+    }
+}

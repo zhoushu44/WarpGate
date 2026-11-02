@@ -265,13 +265,64 @@ async fn release_an_unknown_session_is_s0001() {
     assert_eq!(body["code"], "S0001", "got: {body}");
 }
 
-#[tokio::test]
-async fn unknown_api_path_is_404() {
-    let (app, _t) = app_with("secret", vec![]).await;
-    let (status, body) = call(&app, get_with_key("/api/nope", "secret")).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(body["code"], "I0002");
-}
+    // ---------------------------------------------------------------- webui
+
+    /// The console must be routed and loadable without a key.
+    ///
+    /// `public_dir()` caches on first use and the env var is process-wide, so
+    /// these tests set it once and share one directory rather than racing.
+    fn webui_dir() -> &'static tempfile::TempDir {
+        static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        DIR.get_or_init(|| {
+            let d = tempfile::tempdir().unwrap();
+            std::fs::write(d.path().join("index.html"), "<html>console</html>").unwrap();
+            std::fs::write(d.path().join("docs.html"), "<html>docs</html>").unwrap();
+            std::env::set_var("WARP_PUBLIC_DIR", d.path());
+            d
+        })
+    }
+
+    #[tokio::test]
+    async fn console_loads_without_a_key() {
+        webui_dir();
+        let (app, _t) = app_with("secret", vec![]).await;
+        let resp = app.oneshot(get("/")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "GET / must serve the console");
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "text/html; charset=utf-8"
+        );
+    }
+
+    #[tokio::test]
+    async fn docs_route_serves_the_docs_page() {
+        webui_dir();
+        let (app, _t) = app_with("secret", vec![]).await;
+        let resp = app.oneshot(get("/docs")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "GET /docs must serve docs.html");
+        let bytes = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(&bytes[..], b"<html>docs</html>");
+    }
+
+    #[tokio::test]
+    async fn unknown_console_file_is_404() {
+        webui_dir();
+        let (app, _t) = app_with("secret", vec![]).await;
+        let resp = app.oneshot(get("/nope.html")).await.unwrap();
+        // Routed, but the file does not exist — the handler's 404.
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn unknown_api_path_is_404() {
+        let (app, _t) = app_with("secret", vec![]).await;
+        let (status, body) = call(&app, get_with_key("/api/nope", "secret")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "I0002");
+    }
 
 #[tokio::test]
 async fn proxies_with_an_empty_pool_is_a_business_error() {

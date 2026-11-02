@@ -15,9 +15,10 @@
 //! Five consecutive failed logins lock the source for 60s.
 
 pub mod auth;
-pub mod middleware;
 pub mod error;
+pub mod middleware;
 pub mod routes;
+pub mod webui;
 
 pub use auth::{AuthState, LoginLimiter};
 pub use routes::{router, AppState};
