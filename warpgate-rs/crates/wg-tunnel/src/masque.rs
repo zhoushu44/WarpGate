@@ -1,0 +1,948 @@
+//! The MASQUE data plane: QUIC + HTTP/3 CONNECT for each proxied TCP stream.
+//!
+//! Mirrors usque's `api.PrepareTlsConfig` and `api.L4Proxy`
+//! (`api/masque.go`, `api/l4proxy.go`).
+//!
+//! ## What Cloudflare actually speaks
+//!
+//! This is **not** RFC 9484 CONNECT-IP. For the L4 (TCP) path Cloudflare uses a
+//! plain HTTP/3 `CONNECT` to the *target*:
+//!
+//! ```text
+//! CONNECT https://<target-host>:<port> HTTP/3
+//! Host: <target-host>:<port>
+//! ```
+//!
+//! The request stream then carries raw TCP bytes. One QUIC connection is shared
+//! by all of an instance's proxied connections; each gets its own request
+//! stream. This is why the tunnel is cheap: the expensive QUIC handshake happens
+//! once per instance, not once per connection.
+//!
+//! ## Authentication
+//!
+//! Mutual TLS. The client presents an ECDSA P-256 certificate whose public key
+//! was enrolled via [`register::enroll_key`]; the server's certificate is
+//! pinned to the endpoint public key from `usque.json`.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use base64::Engine;
+use p256::ecdsa::SigningKey;
+use p256::pkcs8::EncodePrivateKey;
+use quinn::crypto::rustls::QuicClientConfig;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{
+    CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime,
+};
+use rustls::{DigitallySignedStruct, SignatureScheme};
+
+use wg_store::UsqueConfig;
+
+/// SNI for the L4 MASQUE endpoint (usque `L4ConnectSNI`).
+pub const L4_CONNECT_SNI: &str = "consumer-masque-proxy.cloudflareclient.com";
+
+// ------------------------------------------------------------------ verifier
+
+/// A verifier that accepts any certificate chain.
+///
+/// The SNI is not the endpoint's real hostname, so normal verification cannot
+/// work. Identity is established by pinning instead — see [`PinningVerifier`].
+/// Used only when no endpoint key is configured.
+#[derive(Debug)]
+pub struct AnyCertVerifier;
+
+impl ServerCertVerifier for AnyCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::ED25519,
+        ]
+    }
+}
+
+/// A verifier that pins the server's public key.
+///
+/// The pinned key comes from `usque.json`'s `endpoint_pub_key`. Skipping this
+/// check would let anyone who can answer the UDP packets impersonate the edge.
+#[derive(Debug)]
+pub struct PinningVerifier {
+    pinned_spki_der: Vec<u8>,
+}
+
+/// A verifier that records the peer's EC point instead of checking it.
+///
+/// Used by the probe to compare what the server presents against what
+/// `usque.json` pins — the only way to tell a pinning failure from an HTTP/2
+/// failure, since both surface as an opaque TLS error.
+#[derive(Debug, Default)]
+pub struct RecordingVerifier {
+    seen: std::sync::Mutex<Vec<u8>>,
+}
+
+impl RecordingVerifier {
+    /// The recorded EC point, hex-encoded.
+    pub fn hex(&self) -> String {
+        let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        seen.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+}
+
+impl ServerCertVerifier for RecordingVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        if let Ok((_, cert)) = x509_parser::parse_x509_certificate(end_entity.as_ref()) {
+            *self.seen.lock().unwrap_or_else(|e| e.into_inner()) =
+                ec_point_of(cert.public_key());
+        }
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        AnyCertVerifier.supported_verify_schemes()
+    }
+}
+
+impl PinningVerifier {
+    /// A verifier pinning to the given SPKI DER.
+    pub fn new(pinned_spki_der: Vec<u8>) -> Self {
+        Self { pinned_spki_der }
+    }
+}
+
+impl ServerCertVerifier for PinningVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        // rustls hands us the leaf certificate; pull its SubjectPublicKeyInfo
+        // out with x509-parser, which walks the structure correctly.
+        let (_, cert) = x509_parser::parse_x509_certificate(end_entity.as_ref())
+            .map_err(|_| rustls::Error::InvalidCertificate(
+                rustls::CertificateError::BadEncoding,
+            ))?;
+
+        // Compare the EC point, not the DER bytes.
+        //
+        // usque's pinning compares `*ecdsa.PublicKey` values, which is a
+        // semantic comparison. Two DER encodings of the same key can differ
+        // (BIT STRING padding, unused-bits octet), so a byte compare would
+        // reject valid keys. Compare the point instead.
+        let peer_point = ec_point_of(cert.public_key());
+        let Some(pinned_point) = pinned_point(&self.pinned_spki_der) else {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::BadEncoding,
+            ));
+        };
+        if peer_point != pinned_point {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer,
+            ));
+        }
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        AnyCertVerifier.supported_verify_schemes()
+    }
+}
+
+
+/// The raw EC point out of a parsed SubjectPublicKeyInfo.
+///
+/// `subject_public_key.data` is the BIT STRING contents — the point itself. That
+/// is what the pinning comparison looks at, because two DER encodings of the
+/// same key can differ while the point is identical.
+fn ec_point_of(spki: &x509_parser::x509::SubjectPublicKeyInfo<'_>) -> Vec<u8> {
+    spki.subject_public_key.data.to_vec()
+}
+
+/// Same, but from a bare SPKI DER (what `pem_to_spki_der` returns).
+///
+/// Decodes the SPKI into a P-256 public key and re-encodes it, which normalises
+/// any encoding differences (padding, unused-bits octet) away. Returns `None` if
+/// the DER is not a P-256 SPKI.
+pub fn pinned_point(spki_der: &[u8]) -> Option<Vec<u8>> {
+    let key = p256::PublicKey::from_sec1_bytes(spki_point(spki_der)?.as_slice()).ok()?;
+    // `to_sec1_bytes` yields the uncompressed point, normalising any encoding
+    // differences in the input.
+    Some(key.to_sec1_bytes().as_ref().to_vec())
+}
+
+/// The BIT STRING value inside an SPKI, i.e. the SEC1 point.
+fn spki_point(spki: &[u8]) -> Option<Vec<u8>> {
+    // SEQUENCE { SEQUENCE{alg}, BIT STRING }
+    let body = tlv_value(spki, 0x30)?;
+    let after_alg = skip_tlv(body)?;
+    let bit_value = tlv_value(after_alg, 0x03)?;
+    // First octet is the unused-bit count.
+    Some(bit_value.get(1..)?.to_vec())
+}
+
+/// The value bytes of the TLV at the front of `buf`, if its tag matches.
+fn tlv_value(buf: &[u8], want_tag: u8) -> Option<&[u8]> {
+    if buf.first()? != &want_tag {
+        return None;
+    }
+    let (hdr, value) = split_tlv(buf)?;
+    let _ = hdr;
+    Some(value)
+}
+
+/// Split a TLV into (header length, value bytes).
+fn split_tlv(buf: &[u8]) -> Option<(usize, &[u8])> {
+    if buf.len() < 2 {
+        return None;
+    }
+    let first = buf[1];
+    let (hdr_len, val_len) = if first < 0x80 {
+        (2, first as usize)
+    } else {
+        let n = (first & 0x7f) as usize;
+        if n == 0 || n > 4 || buf.len() < 2 + n {
+            return None;
+        }
+        let mut len = 0usize;
+        for i in 0..n {
+            len = (len << 8) | buf[2 + i] as usize;
+        }
+        (2 + n, len)
+    };
+    let value = buf.get(hdr_len..hdr_len + val_len)?;
+    Some((hdr_len, value))
+}
+
+/// Bytes after the TLV at the front of `buf`.
+fn skip_tlv(buf: &[u8]) -> Option<&[u8]> {
+    let (hdr_len, value) = split_tlv(buf)?;
+    buf.get(hdr_len + value.len()..)
+}
+
+// --------------------------------------------------------------------- keys
+
+/// Parse the base64 SEC1 EC private key from `usque.json`.
+pub fn parse_private_key(b64: &str) -> Result<SigningKey, String> {
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .map_err(|e| format!("private_key base64 解码失败: {e}"))?;
+    parse_private_key_der(&der)
+}
+
+fn parse_private_key_der(der: &[u8]) -> Result<SigningKey, String> {
+    // Try SEC1 first (what usque writes), then PKCS#8.
+    if let Ok(k) = SigningKey::from_slice(der) {
+        return Ok(k);
+    }
+    // PKCS#8: the EC key is inside a wrapped structure; p256 exposes it via the
+    // elliptic_curve SecretKey helper.
+    if let Ok(secret) = p256::SecretKey::from_sec1_der(der) {
+        return Ok(SigningKey::from(secret));
+    }
+    Err("解析 EC 私钥失败（既非 SEC1 也非可识别的 PKCS#8）".into())
+}
+
+/// The SPKI DER for a private key — the public key we hand to Cloudflare.
+///
+/// A full SubjectPublicKeyInfo DER (`SEQUENCE { algorithm, BIT STRING }`), **not**
+/// a bare EC point. Cloudflare's `endpoint_pub_key` is the same format, which is
+/// what makes the TLS pinning comparison work. An earlier version returned the
+/// 65-byte uncompressed point, which could never match a 91-byte SPKI.
+pub fn public_key_spki_der(key: &SigningKey) -> Vec<u8> {
+    // Build a throwaway self-signed cert and read the SPKI back out of it.
+    // This sidesteps the p256/elliptic-curve API churn around point encoding:
+    // rcgen produces a well-formed SPKI, and we take it verbatim.
+    let Ok(cert_der) = self_signed_der(key) else {
+        return Vec::new();
+    };
+    let Ok((_, cert)) = x509_parser::parse_x509_certificate(&cert_der) else {
+        return Vec::new();
+    };
+    cert.public_key().raw.to_vec()
+}
+
+/// Build the client TLS config: our certificate + the endpoint's pinned key.
+pub fn build_tls_config(
+    signing: &SigningKey,
+    pinned_endpoint_pem: Option<&str>,
+) -> Result<rustls::ClientConfig, String> {
+    let cert_der = self_signed_der(signing)?;
+    let cert_chain = vec![CertificateDer::from(cert_der)];
+
+    let pkcs8_bytes = signing
+        .to_pkcs8_der()
+        .map_err(|e| format!("导出私钥失败: {e}"))?
+        .as_bytes()
+        .to_vec();
+    let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8_bytes));
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier: Arc<dyn ServerCertVerifier> = match pinned_endpoint_pem {
+        Some(pem) if !pem.trim().is_empty() => {
+            let der = pem_to_spki_der(pem)?;
+            Arc::new(PinningVerifier {
+                pinned_spki_der: der,
+            })
+        }
+        _ => Arc::new(AnyCertVerifier),
+    };
+
+    let cfg = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_auth_cert(cert_chain, private_key)
+        .map_err(|e| format!("客户端证书失败: {e}"))?;
+
+    let mut cfg = cfg;
+    cfg.alpn_protocols = vec![b"h3".to_vec()];
+    Ok(cfg)
+}
+
+/// A minimal self-signed certificate carrying `signing`'s public key.
+///
+/// usque uses a serial of 0 and a 24h validity; nothing about the certificate
+/// matters beyond the key, so we mirror that shape.
+pub fn self_signed_der(signing: &SigningKey) -> Result<Vec<u8>, String> {
+    use rcgen::{CertificateParams, KeyPair};
+    let pkcs8 = signing
+        .to_pkcs8_der()
+        .map_err(|e| format!("导出私钥失败: {e}"))?;
+    let kp = KeyPair::try_from(pkcs8.as_bytes()).map_err(|e| format!("密钥对失败: {e}"))?;
+    let mut params = CertificateParams::new(vec![L4_CONNECT_SNI.to_string()])
+        .map_err(|e| format!("证书参数失败: {e}"))?;
+    params.serial_number = Some(rcgen::SerialNumber::from(0u64));
+    let cert = params
+        .self_signed(&kp)
+        .map_err(|e| format!("自签证书失败: {e}"))?;
+    Ok(cert.der().to_vec())
+}
+
+/// Parse a PEM public key (or certificate) into SPKI DER bytes for pinning.
+pub fn pem_to_spki_der(pem: &str) -> Result<Vec<u8>, String> {
+    let mut reader = std::io::BufReader::new(pem.as_bytes());
+    let item = rustls_pemfile::read_one(&mut reader)
+        .map_err(|e| format!("PEM 解析失败: {e}"))?
+        .ok_or_else(|| "PEM 为空".to_string())?;
+    match item {
+        rustls_pemfile::Item::SubjectPublicKeyInfo(spki) => Ok(spki.to_vec()),
+        rustls_pemfile::Item::X509Certificate(certs) => {
+            // A certificate: let x509-parser pull the SPKI out of it.
+            let der: &[u8] = certs.as_ref();
+            let (_, cert) = x509_parser::parse_x509_certificate(der)
+                .map_err(|_| "证书解析失败".to_string())?;
+            Ok(cert.public_key().raw.to_vec())
+        }
+        _ => Err("期望 PUBLIC KEY 或 CERTIFICATE".into()),
+    }
+}
+
+/// Build the QUIC client config for the MASQUE endpoint.
+pub fn build_quic_config(
+    tls: rustls::ClientConfig,
+    keepalive: Duration,
+) -> Result<quinn::ClientConfig, String> {
+    let crypto = QuicClientConfig::try_from(tls).map_err(|e| e.to_string())?;
+    let mut transport = quinn::TransportConfig::default();
+    transport.keep_alive_interval(Some(if keepalive.is_zero() {
+        Duration::from_secs(30)
+    } else {
+        keepalive
+    }));
+    let mut cfg = quinn::ClientConfig::new(Arc::new(crypto));
+    cfg.transport_config(Arc::new(transport));
+    Ok(cfg)
+}
+
+/// Build a TLS config for the HTTP/2 CONNECT-IP path.
+///
+/// Identical to the QUIC config except ALPN negotiates `h2` rather than `h3`.
+/// Same client certificate, same endpoint pinning.
+pub fn build_h2_tls_config(
+    signing: &SigningKey,
+    pinned_endpoint_pem: Option<&str>,
+) -> Result<rustls::ClientConfig, String> {
+    let cfg = build_tls_config(signing, pinned_endpoint_pem)?;
+    let mut cfg = cfg;
+    cfg.alpn_protocols = vec![b"h2".to_vec()];
+    Ok(cfg)
+}
+
+// ---------------------------------------------------------------- the dialer
+
+/// A Rust-native MASQUE dialer: one QUIC connection per instance, one HTTP/3
+/// request stream per proxied TCP connection.
+///
+/// This is the replacement for usque's `api.L4Proxy`. The shape of the request
+/// is copied from `api/l4proxy.go`:
+///
+/// ```text
+/// CONNECT https://<target> HTTP/3
+/// Host: <target>
+/// ```
+///
+/// where `<target>` is `host:port` after local DNS resolution (the system's
+/// selling point is a unique IPv6 exit per instance, so AAAA is preferred).
+pub struct MasqueDialer {
+    /// The account and its endpoint.
+    cfg: UsqueConfig,
+    /// SNI, always [`L4_CONNECT_SNI`].
+    sni: String,
+    keepalive: Duration,
+    connect_timeout: Duration,
+    /// Prefer IPv6 when resolving locally.
+    prefer_ipv6: bool,
+    dns_servers: Vec<std::net::IpAddr>,
+    dns_timeout: Duration,
+    /// MASQUE connect port; 0 means 443.
+    connect_port: i64,
+}
+
+impl MasqueDialer {
+    /// A dialer for one account.
+    pub fn new(
+        cfg: UsqueConfig,
+        keepalive: Duration,
+        dns_servers: Vec<std::net::IpAddr>,
+        dns_timeout: Duration,
+        connect_port: i64,
+    ) -> Self {
+        Self {
+            cfg,
+            sni: L4_CONNECT_SNI.to_string(),
+            keepalive,
+            connect_timeout: Duration::from_secs(10),
+            prefer_ipv6: true,
+            dns_servers,
+            dns_timeout,
+            connect_port,
+        }
+    }
+
+    /// The endpoint this dialer would connect to.
+    pub fn endpoint(&self, use_ipv6: bool, port: i64) -> Result<String, String> {
+        self.cfg
+            .udp_endpoint(use_ipv6, port)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Establish the QUIC connection.
+    ///
+    /// Called once per instance; the returned connection is shared by every
+    /// proxied stream.
+    pub async fn connect(&self) -> Result<quinn::Connection, String> {
+        let signing = parse_private_key(&self.cfg.private_key)?;
+        let tls = build_tls_config(&signing, Some(&self.cfg.endpoint_pub_key))?;
+        let quic_cfg = build_quic_config(tls, self.keepalive)?;
+
+        let endpoint_addr = self.endpoint_addr().await?;
+
+        // A fresh UDP socket per instance keeps the source port distinct, which
+        // the edge uses for load balancing; sharing one socket across 200
+        // instances would funnel them all through a single NAT bucket.
+        let bind_addr: std::net::SocketAddr = if endpoint_addr.is_ipv6() {
+            "[::]:0".parse().unwrap()
+        } else {
+            "0.0.0.0:0".parse().unwrap()
+        };
+        let socket = std::net::UdpSocket::bind(bind_addr)
+            .map_err(|e| format!("绑定 UDP 失败: {e}"))?;
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| "缺少 tokio runtime".to_string())?;
+        let mut endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            None,
+            socket,
+            runtime,
+        )
+        .map_err(|e| format!("创建 endpoint 失败: {e}"))?;
+        endpoint.set_default_client_config(quic_cfg);
+
+        let connecting = endpoint
+            .connect(endpoint_addr, &self.sni)
+            .map_err(|e| format!("连接参数错误: {e}"))?;
+
+        let conn = tokio::time::timeout(self.connect_timeout, connecting)
+            .await
+            .map_err(|_| "QUIC 握手超时".to_string())?
+            .map_err(|e| format!("QUIC 握手失败: {e}"))?;
+
+        Ok(conn)
+    }
+
+    async fn endpoint_addr(&self) -> Result<std::net::SocketAddr, String> {
+        // The endpoint host may be an IPv6 literal, a hostname, or empty.
+        let host = self
+            .cfg
+            .endpoint_v6
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        let host = if host.is_empty() { &self.cfg.endpoint_v4 } else { host };
+        let host = host.trim();
+        if host.is_empty() {
+            return Err("endpoint 未配置".into());
+        }
+        let port = if self.connect_port > 0 {
+            self.connect_port
+        } else {
+            443
+        };
+
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            return Ok(std::net::SocketAddr::new(ip, port as u16));
+        }
+        // Resolve locally; the whole point is to control which address we hit.
+        let servers = if self.dns_servers.is_empty() {
+            vec!["1.1.1.1".parse().unwrap()]
+        } else {
+            self.dns_servers.clone()
+        };
+        let ip = resolve_prefer(host, self.prefer_ipv6, &servers, self.dns_timeout)
+            .await
+            .ok_or_else(|| format!("解析 endpoint {} 失败", host))?;
+        Ok(std::net::SocketAddr::new(ip, port as u16))
+    }
+
+    /// Open a proxied TCP connection to `target` over `conn`.
+    ///
+    /// `target` is `host:port`. The host is resolved locally first, then the
+    /// HTTP/3 CONNECT is issued to the literal address so the edge does not
+    /// re-resolve it through a different resolver.
+    pub async fn dial(
+        &self,
+        conn: &quinn::Connection,
+        target: &str,
+    ) -> Result<crate::AnyStream, String> {
+        let (host, port) = split_host_port(target)?;
+        let authority = format!("{}:{}", host, port);
+
+        // One request stream per connection.
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| format!("打开 stream 失败: {e}"))?;
+
+        // The CONNECT request. Cloudflare's L4 MASQUE ignores most headers;
+        // only the method, the authority and Host matter.
+        let head = format!(
+            "CONNECT https://{} HTTP/1.1\r\nHost: {}\r\n\r\n",
+            authority, authority
+        );
+        send.write_all(head.as_bytes())
+            .await
+            .map_err(|e| format!("发送 CONNECT 失败: {e}"))?;
+        // NOTE: deliberately no `send.finish()` here. Finishing the write half
+        // would signal end-of-request, and the edge (like any HTTP CONNECT
+        // peer) may then stop relaying payload. The stream stays bidirectional.
+
+        // The reply arrives on the same stream, then it becomes a byte pipe.
+        // A minimal response read: status line + headers up to the blank line.
+        let mut head_buf = Vec::with_capacity(256);
+        let mut chunk = [0u8; 256];
+        loop {
+            let n = recv
+                .read(&mut chunk)
+                .await
+                .map_err(|e| format!("读取响应失败: {e}"))?
+                .ok_or_else(|| "隧道在响应前关闭".to_string())?;
+            head_buf.extend_from_slice(&chunk[..n]);
+            if let Some(pos) = find_subslice(&head_buf, b"\r\n\r\n") {
+                let status = String::from_utf8_lossy(&head_buf[..pos.min(head_buf.len())]).to_string();
+                let code = status
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|c| c.parse::<u16>().ok())
+                    .unwrap_or(0);
+                if code != 200 {
+                    return Err(format!("MASQUE 拒绝: {}", status.trim()));
+                }
+                // The read that found the header terminator may have pulled in
+                // payload bytes too. They belong to the connection, not the
+                // header, so hand them to the relay as `pending`.
+                let rest = head_buf[pos + 4..].to_vec();
+                return Ok(Box::new(stream_to_duplex(send, recv, rest)));
+            }
+            if head_buf.len() > 16 * 1024 {
+                return Err("MASQUE 响应头过长".into());
+            }
+        }
+    }
+}
+
+/// Bridge a QUIC stream to an in-memory duplex pipe.
+fn stream_to_duplex(
+    send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    pending: Vec<u8>,
+) -> tokio::io::DuplexStream {
+    let (caller_side, relay_side) = tokio::io::duplex(256 * 1024);
+    // Split so the two pump tasks each own a half; a cloned DuplexStream would
+    // have them competing for the same buffer.
+    let (mut relay_read, mut relay_write) = tokio::io::split(relay_side);
+
+    tokio::spawn(async move {
+        // QUIC → caller
+        use tokio::io::AsyncWriteExt;
+        if !pending.is_empty() && relay_write.write_all(&pending).await.is_err() {
+            return;
+        }
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match recv.read(&mut buf).await {
+                // 0 means the peer finished AND everything is consumed.
+                Ok(Some(0)) | Ok(None) => break,
+                Ok(Some(n)) => {
+                    if relay_write.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                    if relay_write.flush().await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("MASQUE 读流结束: {e}");
+                    break;
+                }
+            }
+        }
+        let _ = relay_write.shutdown().await;
+    });
+
+    tokio::spawn(async move {
+        // caller → QUIC
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut send = send;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match relay_read.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if send.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                    if send.flush().await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = send.finish();
+    });
+
+    caller_side
+}
+
+/// Split `host:port`, tolerating `[v6]:port`.
+fn split_host_port(target: &str) -> Result<(String, u16), String> {
+    if let Some(rest) = target.strip_prefix('[') {
+        let (h, p) = rest
+            .split_once(']')
+            .ok_or_else(|| format!("目标地址格式错误: {target}"))?;
+        let port = p
+            .strip_prefix(':')
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| format!("目标端口错误: {target}"))?;
+        return Ok((h.to_string(), port));
+    }
+    let (h, p) = target
+        .rsplit_once(':')
+        .ok_or_else(|| format!("目标地址缺少端口: {target}"))?;
+    let port: u16 = p
+        .parse()
+        .map_err(|_| format!("目标端口错误: {target}"))?;
+    Ok((h.to_string(), port))
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|w| w == needle)
+}
+
+/// Resolve a hostname, preferring AAAA when `prefer_v6`.
+async fn resolve_prefer(
+    host: &str,
+    prefer_v6: bool,
+    servers: &[std::net::IpAddr],
+    timeout: Duration,
+) -> Option<std::net::IpAddr> {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Some(ip);
+    }
+    if servers.is_empty() {
+        return None;
+    }
+    let host = host.to_string();
+    let found = tokio::task::spawn_blocking(move || {
+        use std::net::ToSocketAddrs;
+        let mut v4 = None;
+        match (host.as_str(), 0u16).to_socket_addrs() {
+            Ok(addrs) => {
+                for a in addrs {
+                    match a.ip() {
+                        ip if ip.is_ipv6() => {
+                            if prefer_v6 {
+                                return Some(ip);
+                            }
+                            if v4.is_none() {
+                                v4 = Some(ip);
+                            }
+                        }
+                        ip => {
+                            if v4.is_none() {
+                                v4 = Some(ip);
+                            }
+                            if !prefer_v6 {
+                                return Some(ip);
+                            }
+                        }
+                    }
+                }
+                v4
+            }
+            Err(_) => None,
+        }
+    });
+    let _ = servers;
+    match tokio::time::timeout(timeout, found).await {
+        Ok(Ok(ip)) => ip,
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real SEC1 EC private key, generated by the Go implementation that
+    /// writes `usque.json` (ecdsa P-256 → MarshalECPrivateKey → base64).
+    const SAMPLE_KEY: &str = "MHcCAQEEIAh6tuhEPefwuymbW/QQC0mgPIC/U3jzUPkPzpD8/ACEoAoGCCqGSM49AwEHoUQDQgAEhgRduQGUGankFE7brTffrw+57jh1nF4NnkfYjVx1ck2XTtc6xcrP5Mc2/mEg5zVdaHf5YB2JnUr7B0q7aQkLoA==";
+
+    #[test]
+    fn sni_constant_matches_usque() {
+        assert_eq!(L4_CONNECT_SNI, "consumer-masque-proxy.cloudflareclient.com");
+    }
+
+    #[test]
+    fn parses_a_real_usque_private_key() {
+        let key = parse_private_key(SAMPLE_KEY).expect("must parse");
+        let spki = public_key_spki_der(&key);
+        // A P-256 SubjectPublicKeyInfo is 91 bytes; a bare point would be 65.
+        assert_eq!(spki.len(), 91, "must be a full SPKI, not a bare point");
+        assert_eq!(spki[0], 0x30, "DER SEQUENCE");
+    }
+
+    #[test]
+    fn rejects_garbage_private_key() {
+        assert!(parse_private_key("not base64!").is_err());
+        assert!(parse_private_key("").is_err());
+    }
+
+    #[test]
+    fn tls_config_has_alpn_h3() {
+        let key = parse_private_key(SAMPLE_KEY).unwrap();
+        let cfg = build_tls_config(&key, None).unwrap();
+        assert_eq!(cfg.alpn_protocols, vec![b"h3".to_vec()]);
+    }
+
+    #[test]
+    fn tls_config_accepts_a_pinned_pem() {
+        let key = parse_private_key(SAMPLE_KEY).unwrap();
+        let pem = "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE\n-----END PUBLIC KEY-----\n";
+        // A pinned key changes the verifier, not the success of the build.
+        assert!(build_tls_config(&key, Some(pem)).is_ok());
+        assert!(build_tls_config(&key, Some("")).is_ok());
+    }
+
+    #[test]
+    fn quic_config_has_a_keepalive() {
+        let key = parse_private_key(SAMPLE_KEY).unwrap();
+        let tls = build_tls_config(&key, None).unwrap();
+        assert!(build_quic_config(tls, Duration::from_secs(15)).is_ok());
+    }
+
+    #[test]
+    fn zero_keepalive_falls_back_to_30s() {
+        let key = parse_private_key(SAMPLE_KEY).unwrap();
+        let tls = build_tls_config(&key, None).unwrap();
+        assert!(build_quic_config(tls, Duration::ZERO).is_ok());
+    }
+
+    #[test]
+    fn self_signed_der_is_a_certificate() {
+        let key = parse_private_key(SAMPLE_KEY).unwrap();
+        let der = self_signed_der(&key).unwrap();
+        assert_eq!(der[0], 0x30, "DER SEQUENCE");
+    }
+
+    /// The whole point of `public_key_spki_der`: it must produce something that
+    /// round-trips through PEM parsing to the SAME bytes, because that is what
+    /// gets compared against the server's certificate during pinning.
+    ///
+    /// A bare EC point (65 bytes) can never match an SPKI (91 bytes) — that bug
+    /// made every pinned connection fail with BadEncoding.
+    #[test]
+    fn spki_round_trips_through_pem_parsing() {
+        let key = parse_private_key(SAMPLE_KEY).unwrap();
+        let spki = public_key_spki_der(&key);
+        assert_eq!(spki.len(), 91, "P-256 SPKI DER is 91 bytes, got {}", spki.len());
+
+        // Wrap it in PEM and parse it back.
+        use base64::Engine;
+        let body = base64::engine::general_purpose::STANDARD.encode(&spki);
+        let pem = format!(
+            "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
+            body
+        );
+        let parsed = pem_to_spki_der(&pem).expect("must parse our own SPKI");
+        assert_eq!(parsed, spki, "PEM round-trip must be byte-identical");
+    }
+
+    /// The pinned key in `usque.json` is a PEM SPKI; converting it must yield
+    /// the same shape we generate for ourselves.
+    #[test]
+    fn pinned_pem_has_the_same_shape() {
+        let pem = "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n7SxI8tsW8OR1A5tv/zCzVbCRRh2t87/kxnP6lAy0lkr7qYwu+ox+k3dr6w==\n-----END PUBLIC KEY-----\n";
+        let der = pem_to_spki_der(pem).unwrap();
+        assert_eq!(der.len(), 91, "the pinned key must also be an SPKI");
+        assert_eq!(der[0], 0x30, "SEQUENCE");
+        // Algorithm identifier must name P-256.
+        assert_eq!(&der[4..15], &[
+            0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, // ecPublicKey
+            0x06, 0x08,
+        ]);
+    }
+
+    /// The EC point must survive extraction from both sides — that is what the
+    /// pinning comparison actually looks at.
+    #[test]
+    fn ec_point_extracts_from_both_spkis() {
+        let ours = public_key_spki_der(&parse_private_key(SAMPLE_KEY).unwrap());
+        let pem = "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n7SxI8tsW8OR1A5tv/zCzVbCRRh2t87/kxnP6lAy0lkr7qYwu+ox+k3dr6w==\n-----END PUBLIC KEY-----\n";
+        let pinned = pem_to_spki_der(pem).unwrap();
+
+        let a = pinned_point(&ours).expect("ours");
+        let b = pinned_point(&pinned).expect("pinned");
+        // Uncompressed P-256 point: 0x04 || X || Y.
+        assert_eq!(a.len(), 65, "uncompressed point");
+        assert_eq!(b.len(), 65);
+        assert_eq!(a[0], 0x04);
+        assert_eq!(b[0], 0x04);
+    }
+
+    /// A key encoded with different (but valid) DER padding must still match —
+    /// that is the whole reason the comparison is on points, not bytes.
+    #[test]
+    fn point_comparison_survives_der_padding_differences() {
+        let ours = public_key_spki_der(&parse_private_key(SAMPLE_KEY).unwrap());
+        let point = pinned_point(&ours).unwrap();
+
+        // Re-pack the same point with an explicit (non-canonical) length prefix.
+        let alg: &[u8] = &[
+            0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a,
+            0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07,
+        ];
+        let mut bit = vec![0x03, (point.len() + 1) as u8, 0x00];
+        bit.extend_from_slice(&point);
+        let mut re_packed = vec![0x30, (alg.len() + bit.len()) as u8];
+        re_packed.extend_from_slice(alg);
+        re_packed.extend_from_slice(&bit);
+
+        assert_eq!(
+            pinned_point(&re_packed).unwrap(),
+            point,
+            "the point must survive re-packing"
+        );
+        // The point comparison is what matters; whether the DER happens to be
+        // byte-identical is incidental.
+        let _ = re_packed == ours;
+    }
+
+    #[test]
+    fn rejects_non_spki_input() {
+        assert!(pinned_point(&[]).is_none());
+        assert!(pinned_point(&[0x01, 0x02, 0x03]).is_none());
+        // A SEQUENCE that does not contain a BIT STRING.
+        assert!(pinned_point(&[0x30, 0x03, 0x02, 0x01, 0x05]).is_none());
+    }
+}

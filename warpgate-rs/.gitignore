@@ -1,0 +1,11 @@
+target/
+*.log
+deploy-*.ps1
+test-*.ps1
+measure-*.ps1
+run-*.ps1
+build-*.ps1
+verify-*.ps1
+compare-*.ps1
+debug-*.ps1
+probe-chat2api*.ps1

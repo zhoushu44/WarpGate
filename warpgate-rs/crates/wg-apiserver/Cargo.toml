@@ -1,0 +1,25 @@
+[package]
+name = "wg-apiserver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wg-core = { path = "../wg-core" }
+wg-config = { path = "../wg-config" }
+wg-store = { path = "../wg-store" }
+wg-pool = { path = "../wg-pool" }
+wg-socks = { path = "../wg-socks" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+axum = { version = "0.8", features = ["query"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+jsonwebtoken = "9"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tempfile = "3"

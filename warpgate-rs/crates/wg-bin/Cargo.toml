@@ -1,0 +1,29 @@
+[package]
+name = "wg-bin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "warpgate"
+path = "src/main.rs"
+
+[[bin]]
+name = "warpgate-probe"
+path = "src/bin/probe.rs"
+
+[dependencies]
+wg-core = { path = "../wg-core" }
+wg-config = { path = "../wg-config" }
+wg-store = { path = "../wg-store" }
+wg-socks = { path = "../wg-socks" }
+wg-tunnel = { path = "../wg-tunnel" }
+wg-pool = { path = "../wg-pool" }
+wg-apiserver = { path = "../wg-apiserver" }
+tokio = { workspace = true }
+tokio-util = { version = "0.7", features = ["rt"] }
+axum = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
