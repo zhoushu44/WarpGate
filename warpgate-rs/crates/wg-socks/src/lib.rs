@@ -91,8 +91,6 @@ pub async fn serve(server: Arc<Server>) -> Result<(), SocksError> {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => continue,
             Err(e) => {
-                #[cfg(test)]
-                eprintln!("DIAG: serve accept error: {e}");
                 return Err(SocksError::Io(e.to_string()));
             }
         };
@@ -100,7 +98,7 @@ pub async fn serve(server: Arc<Server>) -> Result<(), SocksError> {
         tokio::spawn(async move {
             let r = handle_conn(&s, conn, peer).await;
             if let Err(e) = &r {
-                eprintln!("DIAG: handle_conn error: {e}");
+                tracing::debug!("连接处理结束: {e}");
             }
         });
     }
@@ -132,10 +130,6 @@ async fn handle_conn(
 
     let has_user_pass = methods.contains(&METHOD_USER_PASS);
     let has_no_auth = methods.contains(&METHOD_NO_AUTH);
-    eprintln!(
-        "DIAG: require_auth={} has_up={} has_na={}",
-        s.require_auth, has_user_pass, has_no_auth
-    );
 
     match (s.require_auth, has_user_pass, has_no_auth) {
         (true, true, _) => {

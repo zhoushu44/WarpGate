@@ -274,10 +274,69 @@ async fn unknown_api_path_is_404() {
 }
 
 #[tokio::test]
-async fn proxies_returns_text_plain() {
+async fn proxies_with_an_empty_pool_is_a_business_error() {
+    // The Node version answers `P0001` rather than an empty body, so a caller
+    // can tell "no proxies right now" from "the API broke".
     let (app, _t) = app_with("secret", vec![]).await;
     let resp = app
         .oneshot(get_with_key("/api/proxies?num=3", "secret"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["code"], "P0001");
+}
+
+/// With a live instance the text endpoint must emit a dialable URL that
+/// carries the credentials — callers have no other channel to learn them.
+#[tokio::test]
+async fn proxies_text_carries_credentials_when_auth_is_on() {
+    use wg_config::Config;
+    use wg_pool::Manager;
+    use wg_store::UsqueConfig;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = Config::default();
+    cfg.api_key = "secret".into();
+    cfg.ip_whitelist = Vec::new(); // credential mode
+    cfg.proxy_auth_enabled = true;
+    cfg.proxy_username = "warpuser".into();
+    cfg.proxy_password = "s3cret".into();
+    cfg.rate_limit_enabled = false;
+    cfg.base_port = 40010;
+
+    let mgr = Arc::new(Manager::new(Arc::new(cfg.clone()), tmp.path().to_path_buf()));
+    let dir = wg_store::dir(tmp.path(), 0);
+    std::fs::create_dir_all(&dir).unwrap();
+    UsqueConfig {
+        private_key: "MHcCAQEEIAh6tuhEPefwuymbW/QQC0mgPIC/U3jzUPkPzpD8/ACEoAoGCCqGSM49AwEHoUQDQgAEhgRduQGUGankFE7brTffrw+57jh1nF4NnkfYjVx1ck2XTtc6xcrP5Mc2/mEg5zVdaHf5YB2JnUr7B0q7aQkLoA==".into(),
+        endpoint_v4: "162.159.198.2".into(),
+        endpoint_v6: String::new(),
+        endpoint_h2_v4: "162.159.198.2".into(),
+        endpoint_h2_v6: String::new(),
+        endpoint_pub_key: "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n7SxI8tsW8OR1A5tv/zCzVbCRRh2t87/kxnP6lAy0lkr7qYwu+ox+k3dr6w==\n-----END PUBLIC KEY-----\n".into(),
+        id: "t".into(),
+        access_token: "t".into(),
+        ipv4: "172.16.0.2/32".into(),
+        ipv6: "2606:4700:110::1/128".into(),
+    }
+    .save(&wg_store::paths::usque_conf_path(&dir))
+    .unwrap();
+    mgr.start_with_config(0, UsqueConfig::read(&dir).unwrap().unwrap(), false)
+        .await
+        .unwrap();
+
+    let state = AppState {
+        cfg: Arc::new(cfg),
+        mgr,
+        auth: Arc::new(wg_apiserver::AuthState::new("secret")),
+        limiter: Arc::new(wg_apiserver::LoginLimiter::new(60)),
+    };
+    let app = router(state);
+
+    let resp = app
+        .oneshot(get_with_key("/api/proxies?num=1", "secret"))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -285,6 +344,13 @@ async fn proxies_returns_text_plain() {
         resp.headers().get("content-type").unwrap(),
         "text/plain; charset=utf-8"
     );
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.starts_with("socks5://warpuser:s3cret@"),
+        "credentials must be in the URL, got: {text}"
+    );
+    assert!(text.contains(":40010"), "must point at the instance port: {text}");
 }
 
 #[tokio::test]

@@ -66,7 +66,14 @@ async fn main() -> std::process::ExitCode {
     println!("  dial : {}:443", endpoint);
     println!();
 
-    match wg_tunnel::connectip::probe_connect_ip(&endpoint, &cfg.private_key).await {
+    match wg_tunnel::connectip::probe_connect_ip(
+        &endpoint,
+        &cfg.endpoint_pub_key,
+        &cfg.private_key,
+        true,
+    )
+    .await
+    {
         Ok(r) => {
             println!("== 结果 ==");
             println!("  HTTP status        : {}", r.http_status);

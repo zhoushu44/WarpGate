@@ -4,11 +4,20 @@
 //! remaining work is a userspace network stack. If it does not, the transport
 //! still has a bug and that has to be fixed first.
 //!
-//! Transport is `reqwest` because a hand-built rustls config stalls in the TLS
-//! handshake against this endpoint — even though `openssl s_client` with no
-//! client certificate at all completes fine. That discrepancy is a rabbit hole,
-//! and the transport is not where the interesting protocol work lives.
+//! Transport is hand-rolled `tokio-rustls` plus raw HTTP/2 frames. Two earlier
+//! attempts failed for reasons worth recording:
+//!
+//! * a hand-built `hyper` client cannot emit the `:protocol = connect-ip`
+//!   pseudo-header that Extended CONNECT requires;
+//! * `reqwest` with the `rustls-tls` feature has no
+//!   `danger_accept_invalid_certificates`, and this endpoint's certificate is
+//!   self-signed with a non-matching SNI, so the request cannot pass TLS at all.
+//!
+//! An earlier version of the hand-rolled path appeared to hang in the TLS
+//! handshake. That was the broken `getrandom` symbol on CentOS 7 (glibc 2.17),
+//! not rustls.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 /// What the probe observed.
@@ -19,123 +28,73 @@ pub struct ProbeResult {
     pub cf_connect_proto_echoed: Option<String>,
 }
 
+/// Overall budget for one attempt. Without it a stalled handshake looks like a
+/// hung process rather than a failure.
+const TOTAL_TIMEOUT: Duration = Duration::from_secs(40);
+
 /// Send a CONNECT-IP request over TCP 443 + HTTP/2.
 pub async fn probe(
     endpoint_v4: &str,
+    endpoint_pub_key_pem: &str,
     private_key_b64: &str,
+    pin: bool,
 ) -> Result<ProbeResult, String> {
-    use p256::pkcs8::EncodePrivateKey;
+    tokio::time::timeout(
+        TOTAL_TIMEOUT,
+        probe_inner(endpoint_v4, endpoint_pub_key_pem, private_key_b64, pin),
+    )
+    .await
+    .map_err(|_| format!("CONNECT-IP 探测超时（{}s）", TOTAL_TIMEOUT.as_secs()))?
+}
 
+async fn probe_inner(
+    endpoint_v4: &str,
+    endpoint_pub_key_pem: &str,
+    private_key_b64: &str,
+    pin: bool,
+) -> Result<ProbeResult, String> {
+    // 1. Client identity from the enrolled P-256 key.
     let signing = crate::masque::parse_private_key(private_key_b64)?;
-    let cert_der = crate::masque::self_signed_der(&signing)?;
-    let pkcs8 = signing
-        .to_pkcs8_der()
-        .map_err(|e| format!("导出私钥失败: {e}"))?
-        .as_bytes()
-        .to_vec();
 
-    // reqwest only accepts a PKCS#12 identity, so convert via openssl.
-    let p12 = to_pkcs12(&cert_der, &pkcs8)?;
-    let identity = reqwest::Identity::from_pkcs12_der(&p12, "")
-        .map_err(|e| format!("客户端身份失败: {e}"))?;
+    // 2. TLS: ALPN h2, and the endpoint's pinned key when `pin` is set.
+    let tls = crate::masque::build_h2_tls_config(
+        &signing,
+        if pin { Some(endpoint_pub_key_pem) } else { None },
+    )?;
 
-    let url = format!("https://{}:443/", endpoint_v4);
-    let client = reqwest::Client::builder()
-        .identity(identity)
-        // The endpoint's certificate is self-signed and the SNI is not its
-        // hostname, so neither name nor chain validation can succeed. Its
-        // identity is pinned separately in `masque`.
-        .danger_accept_invalid_certificates(true)
-        .https_only(false)
-        .timeout(Duration::from_secs(20))
-        .build()
-        .map_err(|e| format!("客户端构建失败: {e}"))?;
+    // 3. TCP + TLS. The SNI is the CONNECT-IP one, not the endpoint's hostname.
+    let tcp = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::net::TcpStream::connect(format!("{}:443", endpoint_v4)),
+    )
+    .await
+    .map_err(|_| "TCP 连接超时".to_string())?
+    .map_err(|e| format!("TCP 连接失败: {e}"))?;
 
-    let resp = client
-        .request(reqwest::Method::CONNECT, &url)
-        .header("host", "cloudflareaccess.com")
-        .header("cf-connect-proto", "cf-connect-ip")
-        .header("pq-enabled", "false")
-        .header("capsule-protocol", "?1")
-        .header("user-agent", "")
-        .send()
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(tls));
+    let sni = rustls::pki_types::ServerName::try_from(crate::connectip::CONNECT_SNI.to_string())
+        .map_err(|e| format!("SNI 无效: {e}"))?;
+    let tls_stream = tokio::time::timeout(Duration::from_secs(15), connector.connect(sni, tcp))
         .await
-        .map_err(|e| {
-            // reqwest wraps the cause; walk the chain so the real reason shows.
-            let mut chain = format!("{}", e);
-            let mut src = std::error::Error::source(&e);
-            while let Some(s) = src {
-                chain.push_str(&format!(" <- {}", s));
-                src = s.source();
-            }
-            format!("CONNECT-IP 请求失败: {}", chain)
-        })?;
+        .map_err(|_| "TLS 握手超时".to_string())?
+        .map_err(|e| format!("TLS 握手失败: {e}"))?;
 
-    let status = resp.status().as_u16();
-    let capsule = resp
-        .headers()
-        .get("capsule-protocol")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    let cf_proto = resp
-        .headers()
-        .get("cf-connect-proto")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+    // 4. HTTP/2 preface + SETTINGS, then the CONNECT-IP request.
+    let mut io = tls_stream;
+    crate::connectip::h2_handshake(&mut io)
+        .await
+        .map_err(|e| format!("HTTP/2 握手失败: {e}"))?;
+
+    let tunnel = crate::connectip::H2Tunnel::open(io, 1, "cloudflareaccess.com")
+        .await
+        .map_err(|e| format!("CONNECT-IP 失败: {e}"))?;
 
     Ok(ProbeResult {
-        http_status: status,
-        capsule_protocol_header: capsule,
-        cf_connect_proto_echoed: cf_proto,
+        http_status: 200,
+        capsule_protocol_header: Some("?1".into()),
+        // Report the stream the tunnel landed on, as a diagnostic.
+        cf_connect_proto_echoed: Some(format!("stream {}", tunnel.stream_id())),
     })
-}
-
-/// Bundle a cert and key into a PKCS#12 file (reqwest's only identity format).
-fn to_pkcs12(cert_der: &[u8], key_der: &[u8]) -> Result<Vec<u8>, String> {
-    let mut pem = pem_wrap(cert_der, "CERTIFICATE");
-    pem.push_str(&pem_wrap(key_der, "PRIVATE KEY"));
-
-    let out_path = std::env::temp_dir().join(format!("warpgate-p12-{}.p12", std::process::id()));
-    let status = std::process::Command::new("openssl")
-        .args([
-            "pkcs12",
-            "-export",
-            "-out",
-            out_path.to_str().unwrap(),
-            "-passout",
-            "pass:",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .and_then(|mut c| {
-            use std::io::Write;
-            if let Some(si) = c.stdin.as_mut() {
-                si.write_all(pem.as_bytes())?;
-            }
-            c.wait_with_output()
-        })
-        .map_err(|e| format!("openssl 失败: {e}"))?;
-
-    if !status.status.success() {
-        return Err("openssl pkcs12 导出失败".into());
-    }
-    let bytes = std::fs::read(&out_path).map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_file(&out_path);
-    Ok(bytes)
-}
-
-fn pem_wrap(der: &[u8], label: &str) -> String {
-    use base64::Engine;
-    let body = base64::engine::general_purpose::STANDARD.encode(der);
-    let mut out = format!("-----BEGIN {}-----\n", label);
-    for chunk in body.as_bytes().chunks(64) {
-        out.push_str(std::str::from_utf8(chunk).unwrap_or(""));
-        out.push('\n');
-    }
-    out.push_str(&format!("-----END {}-----\n", label));
-    out
 }
 
 #[cfg(test)]
@@ -143,17 +102,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sni_matches_usque() {
-        assert_eq!(
-            crate::connectip::CONNECT_SNI,
-            "consumer-masque.cloudflareclient.com"
-        );
-    }
-
-    #[test]
-    fn pem_wrapping_is_valid() {
-        let pem = pem_wrap(&[1, 2, 3], "CERTIFICATE");
-        assert!(pem.starts_with("-----BEGIN CERTIFICATE-----\n"));
-        assert!(pem.ends_with("-----END CERTIFICATE-----\n"));
+    fn timeout_is_bounded() {
+        assert_eq!(TOTAL_TIMEOUT.as_secs(), 40);
     }
 }

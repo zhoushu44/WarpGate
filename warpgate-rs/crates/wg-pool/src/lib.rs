@@ -572,9 +572,11 @@ impl Manager {
             .cloned()
             .ok_or(PoolError::NotFound(idx))?;
 
-        // The engine port is an internal detail, not part of the shared config
-        // contract, so it gets its own base well clear of the SOCKS5 ports.
-        const ENGINE_PORT_BASE: i64 = 30000;
+        // `20000` is not arbitrary: it is the Node version's `ENGINE_PORT_BASE`,
+        // and chatgpt2api-go holds per-account proxy bindings of the form
+        // `127.0.0.1:20000+<index>`. Reusing the same base means those bindings
+        // keep resolving to a live engine without touching the consumer.
+        const ENGINE_PORT_BASE: i64 = 20000;
         let engine_port = (ENGINE_PORT_BASE + idx) as u16;
         let engine = wg_tunnel::ExternalEngine::new(binary);
         let pid = engine
@@ -845,12 +847,16 @@ impl Manager {
     }
 
     /// The public IP used in the `proxy` field of an acquire response.
+    ///
+    /// `auto-detect` means "whatever address a client should dial". A bare
+    /// `127.0.0.1` is wrong when the caller is a sibling container: it would
+    /// resolve to the container itself. Prefer the host's docker-bridge address
+    /// (172.17.0.1) when it exists, then fall back to the primary interface.
     pub async fn public_ip(&self) -> String {
         if self.cfg.public_ip != "auto-detect" && !self.cfg.public_ip.is_empty() {
             return self.cfg.public_ip.clone();
         }
-        // Loopback for a local deployment; a real deployment detects it.
-        "127.0.0.1".to_string()
+        detect_public_ip()
     }
 
     /// Apply a new whitelist, reopening the whitelist listeners.
@@ -886,6 +892,59 @@ fn now_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// The address a client should dial to reach this host's SOCKS5 ports.
+///
+/// Order of preference:
+///
+/// 1. `172.17.0.1` — the docker bridge gateway. Sibling containers reach the
+///    host here, and it is also valid from the host itself. This is the case
+///    that matters: the Node version's callers are all containers.
+/// 2. The first non-loopback IPv4 on an interface.
+/// 3. `127.0.0.1`, for a host-only deployment.
+///
+/// Detected once and cached: the address does not change while the process runs,
+/// and this is on the hot path of every `/api/proxies` call.
+fn detect_public_ip() -> String {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<String> = OnceLock::new();
+    CACHED.get_or_init(detect_public_ip_uncached).clone()
+}
+
+fn detect_public_ip_uncached() -> String {
+    // The docker bridge gateway. Present whenever docker is installed, which is
+    // the deployment shape this system targets.
+    if let Ok(addrs) = local_ipv4_addrs() {
+        if addrs.iter().any(|a| a == "172.17.0.1") {
+            return "172.17.0.1".to_string();
+        }
+        // Otherwise the first private address that is not loopback.
+        if let Some(a) = addrs.iter().find(|a| *a != "127.0.0.1") {
+            return a.clone();
+        }
+    }
+    "127.0.0.1".to_string()
+}
+
+/// Non-loopback IPv4 addresses of this host.
+fn local_ipv4_addrs() -> std::result::Result<Vec<String>, std::io::Error> {
+    #[cfg(unix)]
+    {
+        // `hostname -I` is the portable-enough way to list addresses without a
+        // netlink dependency; it exists on both glibc and musl images.
+        let out = std::process::Command::new("hostname").arg("-I").output()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        Ok(text
+            .split_whitespace()
+            .filter(|s| s.parse::<std::net::Ipv4Addr>().is_ok())
+            .map(|s| s.to_string())
+            .collect())
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(Vec::new())
+    }
 }
 
 #[cfg(test)]
@@ -1167,6 +1226,24 @@ mod tests {
         );
         // And an unhealthy instance is not schedulable.
         assert!(m.acquire(false, "").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn public_ip_is_not_loopback_when_a_bridge_exists() {
+        let (m, _t) = pool_with(1).await;
+        let ip = m.public_ip().await;
+        // On a docker host the bridge gateway is preferred; on a bare host any
+        // non-loopback address will do. Only assert it is usable.
+        assert!(!ip.is_empty(), "must always return something");
+        if ip == "127.0.0.1" {
+            // Acceptable only if the machine really has no other address.
+            let addrs = local_ipv4_addrs().unwrap_or_default();
+            assert!(
+                addrs.iter().all(|a| a == "127.0.0.1"),
+                "loopback returned but other addresses exist: {:?}",
+                addrs
+            );
+        }
     }
 
     #[tokio::test]

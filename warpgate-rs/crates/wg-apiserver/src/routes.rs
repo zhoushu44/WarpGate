@@ -374,33 +374,100 @@ struct ProxiesQuery {
     time: Option<u32>,
     #[serde(default)]
     ip_mode: String,
+    /// `txt` (default) or `json`.
+    #[serde(default)]
+    r#type: String,
+    /// `n` (default, LF) or `rn` (CRLF).
+    #[serde(default)]
+    format: String,
 }
 
 async fn handle_proxies(
     State(st): State<AppState>,
     Query(q): Query<ProxiesQuery>,
 ) -> axum::response::Response {
-    let n = q.num.unwrap_or(1).min(500);
+    let n = q.num.unwrap_or(1).min(20);
     let public_ip = st.mgr.public_ip().await;
     let sticky = !q.sid.is_empty();
+    // The Node version returns the WHITELIST port when the whitelist is active:
+    // callers are other containers whose source IP is already allowed, so the
+    // credential-free port is what they can actually use. Returning the
+    // credential port here made every caller fail SOCKS5 auth.
+    let whitelist_active = !st.cfg.ip_whitelist.is_empty();
+    let sep = if q.format == "rn" { "\r\n" } else { "\n" };
 
-    let mut lines = Vec::new();
+    let mut picked = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for _ in 0..n {
         match st.mgr.acquire(sticky, &q.sid).await {
             Ok(inst) => {
-                let key = inst.meta().await.ipv6.clone();
+                let meta = inst.meta().await;
                 // `ip4` mode dedups by exit IPv4; the embedded pool only tracks
                 // IPv6, so dedup on that instead of silently returning dupes.
-                if q.ip_mode == "ip4" && !seen.insert(key.clone()) {
+                if q.ip_mode == "ip4" && !seen.insert(meta.ipv6.clone()) {
                     continue;
                 }
-                lines.push(format!("{}:{}", public_ip, inst.port));
+                let port = if whitelist_active {
+                    inst.whitelist_port
+                } else {
+                    inst.port
+                };
+                // The Node version's rule: when the whitelist is active, the
+                // *primary* address a caller should use is the whitelist port
+                // (credential-free, gated on source IP). `proxy` must follow
+                // `port` — returning the credential port here leaves callers
+                // that read `proxy` first (regiforge's `wary` provider does)
+                // failing SOCKS5 auth.
+                picked.push(json!({
+                    "ip": public_ip,
+                    "port": port,
+                    "exit_ip": meta.ipv6,
+                    "username": if whitelist_active { Value::Null } else { json!(st.cfg.proxy_username) },
+                    "password": if whitelist_active { Value::Null } else { json!(st.cfg.proxy_password) },
+                    "proxy": format!("socks5://{}:{}", public_ip, port),
+                    "proxy_whitelist": if whitelist_active {
+                        json!(format!("socks5://{}:{}", public_ip, inst.whitelist_port))
+                    } else {
+                        Value::Null
+                    },
+                    "whitelist_mode": whitelist_active,
+                    "session_id": if sticky { json!(q.sid) } else { Value::Null },
+                    "name": wg_store::name(inst.index),
+                }));
             }
             Err(_) => break,
         }
     }
-    let body = lines.join("\r\n");
+
+    if picked.is_empty() {
+        return business_error(codes::NO_AVAILABLE_PROXY, "无可用代理，请稍后重试");
+    }
+
+    if q.r#type == "json" {
+        return ok(json!({ "count": picked.len(), "proxies": picked }));
+    }
+
+    // Text mode. When credentials are required, emit the full URL
+    // (`socks5://user:pass@host:port`): callers like regiforge parse text into a
+    // proxy and have no other way to learn the username and password, so a bare
+    // `host:port` leaves them failing SOCKS5 auth. The whitelist port needs no
+    // credentials, so it stays a bare address.
+    let body: String = picked
+        .iter()
+        .map(|p| {
+            let host = p["ip"].as_str().unwrap_or("");
+            let port = p["port"].as_i64().unwrap_or(0);
+            if whitelist_active {
+                format!("{}:{}", host, port)
+            } else {
+                let user = st.cfg.proxy_username.as_str();
+                let pass = st.cfg.proxy_password.as_str();
+                format!("socks5://{}:{}@{}:{}", user, pass, host, port)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(sep)
+        + sep;
     (
         [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         body,

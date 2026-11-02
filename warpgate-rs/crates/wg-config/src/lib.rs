@@ -49,6 +49,12 @@ pub struct Config {
     pub proxy_auth_enabled: bool,
     pub proxy_username: String,
     pub proxy_password: String,
+    /// CIDR or bare IP entries.
+    ///
+    /// The Node version stores objects (`{ip, remark, region, added_at}`) so the
+    /// console can show provenance; the Go version and this one accept plain
+    /// strings too. `whitelist_entries` normalises both shapes.
+    #[serde(default, deserialize_with = "de_ip_whitelist")]
     pub ip_whitelist: Vec<String>,
     pub whitelist_port_offset: i64,
     pub api_key: String,
@@ -80,6 +86,36 @@ fn default_reconnect_max() -> i64 {
 }
 fn default_dns() -> Vec<String> {
     vec!["1.1.1.1".into(), "8.8.8.8".into()]
+}
+
+/// Accept `ip_whitelist` in either on-disk shape.
+///
+/// * Node: `[{"ip": "1.2.3.4", "remark": "", "region": "..."}]`
+/// * Go / this crate: `["1.2.3.4", "10.0.0.0/8"]`
+///
+/// Both reduce to the address list, which is all the SOCKS5 layer needs.
+fn de_ip_whitelist<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Entry {
+        Plain(String),
+        Object { ip: String },
+    }
+
+    let raw = Vec::<Entry>::deserialize(d)?;
+    Ok(raw
+        .into_iter()
+        .map(|e| match e {
+            Entry::Plain(s) => s,
+            Entry::Object { ip } => ip,
+        })
+        .filter(|s| !s.trim().is_empty())
+        .collect())
 }
 fn default_connect_port() -> i64 {
     443
@@ -233,6 +269,34 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ip_whitelist_accepts_both_on_disk_shapes() {
+        // Merge each shape into a full config so only the whitelist differs.
+        let base = serde_json::to_value(Config::default()).unwrap();
+
+        let mut plain_json = base.clone();
+        plain_json["ip_whitelist"] = serde_json::json!(["1.2.3.4", "10.0.0.0/8"]);
+        let plain: Config = serde_json::from_value(plain_json).expect("plain list");
+        assert_eq!(plain.ip_whitelist, vec!["1.2.3.4", "10.0.0.0/8"]);
+
+        // Node: objects carrying provenance the console shows.
+        let mut node_json = base;
+        node_json["ip_whitelist"] = serde_json::json!([
+            {"ip": "1.2.3.4", "remark": "", "region": "中国 浙江"},
+            {"ip": "172.17.0.0/16"}
+        ]);
+        let node: Config = serde_json::from_value(node_json).expect("node object list");
+        assert_eq!(node.ip_whitelist, vec!["1.2.3.4", "172.17.0.0/16"]);
+    }
+
+    #[test]
+    fn ip_whitelist_skips_blank_entries() {
+        let mut json = serde_json::to_value(Config::default()).unwrap();
+        json["ip_whitelist"] = serde_json::json!(["", "1.2.3.4", "  "]);
+        let c: Config = serde_json::from_value(json).expect("must parse");
+        assert_eq!(c.ip_whitelist, vec!["1.2.3.4"]);
+    }
 
     #[test]
     fn defaults_match_the_go_version() {
