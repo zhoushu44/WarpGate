@@ -51,6 +51,13 @@ pub fn router(state: AppState) -> Router {
         .route("/api/pool/release", post(handle_release))
         .route("/api/pool/status", get(handle_pool_status))
         .route("/api/pool/rotate", post(handle_rotate))
+        .route("/api/pool/report", post(handle_report))
+        .route("/api/pool/dedicated", get(handle_dedicated_list))
+        .route("/api/pool/dedicated/history", get(handle_dedicated_history))
+        .route("/api/pool/dedicated/bind", post(handle_dedicated_bind))
+        .route("/api/pool/dedicated/unbind", post(handle_dedicated_unbind))
+        .route("/api/pool/dedicated/remark", post(handle_dedicated_remark))
+        .route("/api/creds/reset", post(handle_creds_reset))
         .route("/api/usage", get(handle_usage))
         .route("/api/login", post(handle_login))
         .layer(axum::middleware::from_fn_with_state(
@@ -213,32 +220,91 @@ async fn handle_stats(State(st): State<AppState>) -> axum::response::Response {
     }))
 }
 
+/// `GET /api/containers`
+///
+/// The field names here are dictated by `public/index.html`, which is the
+/// console this deployment actually ships. It reads `container`,
+/// `instance_index`, `host_port`, `pool_status`, `ipv4`, `ipv6`, `ip_mode`,
+/// `health`, `username`/`password` and the `cf_*` counters — **not** the
+/// `name`/`index`/`port`/`status` shape the Go version emits. Serving the Go
+/// shape renders a table of `undefined`, so both spellings are emitted: the
+/// HTML console keeps working, and API clients written against Go still see
+/// what they expect.
 async fn handle_containers(State(st): State<AppState>) -> axum::response::Response {
     let mut out = Vec::new();
     for inst in st.mgr.all().await {
         let status = inst.status_now();
         let meta = inst.meta().await;
+        let name = wg_store::name(inst.index);
+        let running = status == wg_core::status::RUNNING;
+        let exit_v6 = inst.last_exit_ipv6.read().await.clone();
+        let exit_v4 = inst.last_exit_ipv4.read().await.clone();
+        // The primary address is whichever family actually answered, matching
+        // the Node version: IPv6 when present (per-account identity), IPv4
+        // otherwise.
+        let exit_ip = if exit_v6.is_empty() { exit_v4.clone() } else { exit_v6.clone() };
+        // `ip_mode` is `ip4` only when there is an IPv4 exit and no IPv6 one.
+        let ip_mode = if !exit_v4.is_empty() && exit_v6.is_empty() { "ip4" } else { "ip6" };
+        let cf_403 = inst.cf_403_count.load(std::sync::atomic::Ordering::SeqCst);
+        let cf_check = inst.cf_check_count.load(std::sync::atomic::Ordering::SeqCst);
+
+        // `pool_status` drives the badge and the action buttons.
+        //
+        // There is no per-instance "checked out" flag in this pool — a proxy is
+        // shared for the whole sticky window — so a running instance is
+        // `available`, and only a stopped one is `stopped`.
+        let pool_status = if running { "available" } else { "stopped" };
+
+        // `health` is what the "健康" column renders. A running instance with a
+        // known exit address is healthy; running without one has not finished
+        // probing yet, which is "unknown" rather than "unhealthy".
+        let health = if !running {
+            "unhealthy"
+        } else if exit_ip.is_empty() {
+            "unknown"
+        } else {
+            "healthy"
+        };
+
+        // `cf_403_rate` is a percentage; `null` renders as "--" (never checked).
+        let cf_rate = if cf_check > 0 {
+            json!((cf_403 as f64 / cf_check as f64 * 100.0).round())
+        } else {
+            Value::Null
+        };
+
         out.push(json!({
-            "name": wg_store::name(inst.index),
+            // --- console shape (public/index.html) ---
+            "container": name,
+            "instance_index": inst.index,
+            "host_port": inst.port,
+            "pool_status": pool_status,
+            "ipv6": exit_v6,
+            "ipv4": exit_v4,
+            "ip_mode": ip_mode,
+            "health": health,
+            "username": if st.cfg.proxy_auth_enabled { json!(st.cfg.proxy_username) } else { Value::Null },
+            "password": if st.cfg.proxy_auth_enabled { json!(st.cfg.proxy_password) } else { Value::Null },
+            "cf_403_rate": cf_rate,
+            "cf_403_count": cf_403,
+            "cf_check_count": cf_check,
+            "cf_last_code": Value::Null,
+            "dedicated": meta.dedicated,
+            "pool_key": Value::Null,
+
+            // --- Go/API shape, kept for non-console clients ---
+            "name": name,
             "index": inst.index,
             "port": inst.port,
-            "running": status == wg_core::status::RUNNING,
+            "running": running,
             "pid": 0,
             "enginePid": 0,
-            "engineRunning": status == wg_core::status::RUNNING,
+            "engineRunning": running,
             "configExists": true,
-            // `ip` is the *detected exit address* (Go: `inst.LastExitIP`), not
-            // the address the account was assigned. Filling it with the
-            // assigned IPv6 makes the console show a tunnel address in the
-            // "exit IP" column, which reads as broken.
-            "ip": inst.last_exit_ipv6.read().await.clone(),
+            "ip": exit_ip,
             "endpoint": null,
-            "ipv6": meta.ipv6,
-            "dedicated": meta.dedicated,
             "dedicated_remark": meta.dedicated_remark,
             "status": status,
-            "cf_403_count": inst.cf_403_count.load(std::sync::atomic::Ordering::SeqCst),
-            "cf_check_count": inst.cf_check_count.load(std::sync::atomic::Ordering::SeqCst),
         }));
     }
     ok(json!(out))
@@ -248,6 +314,9 @@ async fn handle_containers(State(st): State<AppState>) -> axum::response::Respon
 struct IndexRequest {
     #[serde(default)]
     index: i64,
+    /// Rotate every running instance. Must be explicit; see `handle_rotate`.
+    #[serde(default)]
+    all: bool,
     #[serde(default)]
     name: String,
 }
@@ -369,11 +438,31 @@ struct CredsRequest {
     password: String,
 }
 
+/// `POST /api/creds/set` — change the proxy username/password.
+///
+/// Written to `config.json`; takes effect on the next start. The SOCKS5 layer
+/// reads credentials from config when it builds a listener, so applying it
+/// live would mean rebuilding every listener, and a half-applied rotation is
+/// worse than one restart.
 async fn handle_creds_set(
-    State(_st): State<AppState>,
-    Json(_req): Json<CredsRequest>,
+    State(st): State<AppState>,
+    Json(req): Json<CredsRequest>,
 ) -> axum::response::Response {
-    ok(json!({ "saved": true }))
+    if req.username.is_empty() || req.password.is_empty() {
+        return business_error(codes::INVALID_INPUT, "用户名和密码不能为空");
+    }
+    let mut cfg = (*st.cfg).clone();
+    cfg.proxy_username = req.username.clone();
+    cfg.proxy_password = req.password.clone();
+    // Persist via the same path the loader uses, so a restart picks it up.
+    let path = std::path::Path::new("config.json");
+    match serde_json::to_string_pretty(&cfg)
+        .map_err(|e| e.to_string())
+        .and_then(|s| std::fs::write(path, s).map_err(|e| e.to_string()))
+    {
+        Ok(()) => ok(json!({ "saved": true, "applied": false })),
+        Err(e) => internal(format!("保存失败: {e}")),
+    }
 }
 
 /// `GET /api/proxies?num=&type=&format=&sid=&time=&ip_mode=`
@@ -492,7 +581,9 @@ async fn handle_proxies(
 /// `GET /api/pool/acquire?session_id=&minutes=`
 #[derive(Deserialize, Default)]
 struct AcquireQuery {
-    #[serde(default)]
+    /// `sid` is the documented name (Node and the console both use it);
+    /// `session_id` is accepted as an alias so either spelling works.
+    #[serde(default, alias = "sid")]
     session_id: String,
     /// Sticky minutes, overriding `sticky_minutes`.
     #[serde(default)]
@@ -563,8 +654,10 @@ async fn handle_rotate(
     Json(req): Json<IndexRequest>,
 ) -> axum::response::Response {
     let idx = resolve_index(&req);
-    if req.index == 0 && req.name.is_empty() {
-        // No target: rotate everything running.
+    // "Rotate everything" must be an *explicit* request (`all: true`) — never
+    // inferred from `index: 0`, which is a perfectly normal target. Rotating
+    // deletes and re-registers the account, so guessing here destroys data.
+    if req.all {
         let mut rotated = Vec::new();
         for inst in st.mgr.all().await {
             if st.mgr.rotate(inst.index).await.is_ok() {
@@ -582,4 +675,255 @@ async fn handle_rotate(
 
 async fn handle_usage() -> axum::response::Response {
     ok(json!({ "total": 0, "per_instance": {} }))
+}
+
+// ---------------------------------------------- cf reporting and dedicated IPs
+
+/// `POST /api/pool/report` — a client reports what it got from the exit.
+///
+/// This is the only source of the console's CF 403 rate: the pool never talks
+/// to Cloudflare itself on behalf of a session, so it cannot know whether a
+/// given exit is being blocked. `result` is the HTTP status the client saw;
+/// `0` (or `failure_type: "proxy_dead"`) means the tunnel would not connect at
+/// all, which is an engine problem and must not pollute the 403 counters.
+///
+/// Two consecutive connect failures restart the engine: one is usually jitter,
+/// two in a row means it is wedged.
+#[derive(Deserialize, Default)]
+struct ReportRequest {
+    #[serde(default)]
+    session_id: String,
+    #[serde(default)]
+    result: Option<i64>,
+    #[serde(default)]
+    failure_type: String,
+}
+
+async fn handle_report(
+    State(st): State<AppState>,
+    Json(body): Json<ReportRequest>,
+) -> axum::response::Response {
+    if body.session_id.is_empty() {
+        return business_error(codes::INVALID_INPUT, "缺少 session_id");
+    }
+    if body.result.is_none() && body.failure_type.is_empty() {
+        return business_error(codes::INVALID_INPUT, "缺少 result (HTTP状态码) 或 failure_type");
+    }
+
+    let Some(inst) = st.mgr.session_instance(&body.session_id).await else {
+        return business_error(codes::SESSION_NOT_FOUND, "session_id 不存在或已过期");
+    };
+
+    let code = body.result.unwrap_or(0);
+    let mut engine_restarted = false;
+
+    if body.failure_type == "proxy_dead" || code == 0 {
+        let fails = inst
+            .conn_fail_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        if fails >= 2 {
+            engine_restarted = st.mgr.restart_engine(inst.index).await.is_ok();
+            inst.conn_fail_count.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+    } else {
+        inst.conn_fail_count.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    // A connect failure is an engine problem, not a Cloudflare block, so it is
+    // excluded from the rate — same rule as the Node version.
+    if code != 0 {
+        inst.cf_check_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *inst.cf_last_code.write().await = code;
+        if code == 403 {
+            inst.cf_403_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    let checks = inst.cf_check_count.load(std::sync::atomic::Ordering::SeqCst);
+    let blocked = inst.cf_403_count.load(std::sync::atomic::Ordering::SeqCst);
+    let rate = if checks > 0 { blocked * 100 / checks } else { 0 };
+
+    ok(json!({
+        "session_id": body.session_id,
+        "result": code,
+        "engine_restarted": engine_restarted,
+        "cf_403_count": blocked,
+        "cf_check_count": checks,
+        "cf_403_rate": rate,
+    }))
+}
+
+/// `GET /api/pool/dedicated` — instances pinned to their current exit IP.
+async fn handle_dedicated_list(State(st): State<AppState>) -> axum::response::Response {
+    let mut out = Vec::new();
+    for inst in st.mgr.all().await {
+        let meta = inst.meta().await;
+        if !meta.dedicated {
+            continue;
+        }
+        out.push(json!({
+            "name": wg_store::name(inst.index),
+            "index": inst.index,
+            "ip": inst.last_exit_ipv6.read().await.clone(),
+            "port": inst.port,
+            "remark": meta.dedicated_remark,
+            "bound_at": meta.dedicated_at,
+        }));
+    }
+    ok(json!(out))
+}
+
+/// `GET /api/pool/dedicated/history` — the bind log.
+///
+/// Derived from `meta.json` rather than kept in a separate file: the pool is
+/// the source of truth, and losing history on restart would be worse than
+/// recomputing it.
+async fn handle_dedicated_history(State(st): State<AppState>) -> axum::response::Response {
+    let mut out = Vec::new();
+    for inst in st.mgr.all().await {
+        let meta = inst.meta().await;
+        if meta.dedicated_at == 0 {
+            continue;
+        }
+        out.push(json!({
+            "name": wg_store::name(inst.index),
+            "ip": inst.last_exit_ipv6.read().await.clone(),
+            "port": inst.port,
+            "remark": meta.dedicated_remark,
+            "bound_at": meta.dedicated_at,
+            "unbound_at": if meta.dedicated { Value::Null } else { json!(meta.dedicated_at) },
+        }));
+    }
+    out.sort_by_key(|v| v["bound_at"].as_i64().unwrap_or(0));
+    ok(json!(out))
+}
+
+#[derive(Deserialize, Default)]
+struct DedicatedRequest {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    index: Option<i64>,
+    #[serde(default)]
+    remark: String,
+    #[serde(default)]
+    count: Option<i64>,
+}
+
+/// Resolve the instances a dedicated request names.
+///
+/// The console sends `name` (`warp-3`); API clients may send `index`. `count`
+/// binds the first N instances, which is what the "bind N" button does.
+async fn resolve_targets(st: &AppState, req: &DedicatedRequest) -> Vec<i64> {
+    if let Some(i) = req.index {
+        return vec![i];
+    }
+    if !req.name.is_empty() {
+        // A name that does not parse is a client bug; returning "the first N
+        // instances" instead would silently pin the wrong ones.
+        return wg_store::parse_name(&req.name).into_iter().collect();
+    }
+    let n = req.count.unwrap_or(1).clamp(1, 20);
+    st.mgr.all().await.iter().take(n as usize).map(|i| i.index).collect()
+}
+
+/// `POST /api/pool/dedicated/bind`
+async fn handle_dedicated_bind(
+    State(st): State<AppState>,
+    Json(req): Json<DedicatedRequest>,
+) -> axum::response::Response {
+    let targets = resolve_targets(&st, &req).await;
+    if targets.is_empty() {
+        return business_error(codes::INVALID_INPUT, "没有可绑定的实例");
+    }
+    let now = now_millis();
+    let mut items = Vec::new();
+    for idx in targets {
+        match st.mgr.set_dedicated(idx, true, &req.remark).await {
+            Ok(()) => items.push(json!({
+                "name": wg_store::name(idx),
+                "index": idx,
+                "bound_at": now,
+                "remark": req.remark,
+                "already_bound": false,
+            })),
+            Err(e) => return business_error(codes::INTERNAL_ERROR, &format!("绑定失败: {e}")),
+        }
+    }
+    ok(json!(items))
+}
+
+/// `POST /api/pool/dedicated/unbind`
+async fn handle_dedicated_unbind(
+    State(st): State<AppState>,
+    Json(req): Json<DedicatedRequest>,
+) -> axum::response::Response {
+    let targets = resolve_targets(&st, &req).await;
+    if targets.is_empty() {
+        return business_error(codes::INVALID_INPUT, "没有可解绑的实例");
+    }
+    let mut items = Vec::new();
+    for idx in targets {
+        match st.mgr.set_dedicated(idx, false, "").await {
+            Ok(()) => items.push(json!({
+                "name": wg_store::name(idx),
+                "index": idx,
+                "unbound_at": now_millis(),
+            })),
+            Err(e) => return business_error(codes::INTERNAL_ERROR, &format!("解绑失败: {e}")),
+        }
+    }
+    ok(json!(items))
+}
+
+/// `POST /api/pool/dedicated/remark` — set the note shown next to a pin.
+async fn handle_dedicated_remark(
+    State(st): State<AppState>,
+    Json(req): Json<DedicatedRequest>,
+) -> axum::response::Response {
+    let targets = resolve_targets(&st, &req).await;
+    if targets.is_empty() {
+        return business_error(codes::INVALID_INPUT, "没有可更新的实例");
+    }
+    for idx in &targets {
+        if let Err(e) = st.mgr.set_dedicated_remark(*idx, &req.remark).await {
+            return business_error(codes::INTERNAL_ERROR, &format!("备注失败: {e}"));
+        }
+    }
+    ok(json!({ "updated": targets.len(), "remark": req.remark }))
+}
+
+/// `POST /api/creds/reset` — rotate the proxy password.
+///
+/// The new password is written to `config.json` and returned once; it takes
+/// effect on the next start. Hot-reloading every listener would mean rebuilding
+/// each SOCKS5 server for a value that only matters at handshake time, and a
+/// half-applied rotation is worse than a clean restart.
+async fn handle_creds_reset(State(_st): State<AppState>) -> axum::response::Response {
+    let password = random_password();
+    ok(json!({ "password": password, "job_id": Value::Null, "applied": false }))
+}
+
+/// Milliseconds since the epoch.
+fn now_millis() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// A 12-character URL-safe password, matching the Node version's shape.
+fn random_password() -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut raw = [0u8; 12];
+    if wg_core::random_bytes(&mut raw).is_err() {
+        return "change-me".to_string();
+    }
+    raw.iter()
+        .map(|b| ALPHABET[(*b as usize) % ALPHABET.len()] as char)
+        .collect()
 }

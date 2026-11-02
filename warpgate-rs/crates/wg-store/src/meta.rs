@@ -58,9 +58,20 @@ pub struct Meta {
     pub dedicated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dedicated_remark: Option<String>,
+    /// When the pin was set, in milliseconds since the epoch. `0` means never.
+    ///
+    /// Omitted when unset so `meta.json` stays byte-compatible with the Go and
+    /// Node versions, which do not know this key.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub dedicated_at: i64,
     /// `"embedded"` for this implementation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<String>,
+}
+
+/// `skip_serializing_if` helper: treat 0 as "never set".
+fn is_zero_i64(v: &i64) -> bool {
+    *v == 0
 }
 
 impl Meta {
@@ -110,6 +121,7 @@ mod tests {
             created_at: 1_700_000_000_000,
             dedicated: false,
             dedicated_remark: None,
+            dedicated_at: 0,
             engine: Some("embedded".into()),
         };
         let s = serde_json::to_string_pretty(&m).unwrap();
@@ -161,6 +173,7 @@ mod tests {
             created_at: 42,
             dedicated: true,
             dedicated_remark: Some("kept".into()),
+            dedicated_at: 0,
             engine: Some("embedded".into()),
         };
         let tmp = tempfile::tempdir().unwrap();

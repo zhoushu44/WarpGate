@@ -37,6 +37,14 @@ pub fn name(index: i64) -> String {
     format!("warp-{}", index)
 }
 
+/// Inverse of [`name`]: `warp-7` -> `7`.
+///
+/// The console addresses instances by name (`warp-3`) in its action buttons,
+/// so the API has to be able to turn that back into an index.
+pub fn parse_name(s: &str) -> Option<i64> {
+    s.strip_prefix("warp-").and_then(|n| n.parse().ok())
+}
+
 /// `<base>/warp-<i>`, matching Go `store.Dir`.
 pub fn dir(base: &std::path::Path, index: i64) -> std::path::PathBuf {
     base.join(name(index))

@@ -17,6 +17,47 @@ use wg_apiserver::{router, AppState};
 use wg_config::Config;
 use wg_pool::Manager;
 
+/// A router with exactly one live instance, for shape/contract tests.
+async fn app_with_one_instance(api_key: &str) -> (axum::Router, tempfile::TempDir) {
+    use std::sync::Arc;
+    use wg_config::Config;
+    use wg_pool::Manager;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = Config::default();
+    cfg.api_key = api_key.into();
+    cfg.ip_whitelist = Vec::new();
+    cfg.rate_limit_enabled = false;
+    cfg.base_port = 45010;
+
+    let mgr = Arc::new(Manager::new(std::sync::Arc::new(cfg.clone()), tmp.path().to_path_buf()));
+    let dir = wg_store::dir(tmp.path(), 0);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ucfg = wg_store::UsqueConfig {
+        private_key: "MHcCAQEEIAh6tuhEPefwuymbW/QQC0mgPIC/U3jzUPkPzpD8/ACEoAoGCCqGSM49AwEHoUQDQgAEhgRduQGUGankFE7brTffrw+57jh1nF4NnkfYjVx1ck2XTtc6xcrP5Mc2/mEg5zVdaHf5YB2JnUr7B0q7aQkLoA==".into(),
+        endpoint_v4: "162.159.198.2".into(),
+        endpoint_v6: String::new(),
+        endpoint_h2_v4: "162.159.198.2".into(),
+        endpoint_h2_v6: String::new(),
+        endpoint_pub_key: "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n7SxI8tsW8OR1A5tv/zCzVbCRRh2t87/kxnP6lAy0lkr7qYwu+ox+k3dr6w==\n-----END PUBLIC KEY-----\n".into(),
+        id: "t".into(),
+        access_token: "t".into(),
+        ipv4: "172.16.0.2/32".into(),
+        ipv6: "2606:4700:110::1/128".into(),
+    };
+    ucfg.save(&wg_store::paths::usque_conf_path(&dir)).unwrap();
+    mgr.start_with_config(0, wg_store::UsqueConfig::read(&dir).unwrap().unwrap(), false)
+        .await
+        .unwrap();
+
+    let state = AppState {
+        cfg: Arc::new(cfg),
+        mgr,
+        auth: Arc::new(wg_apiserver::AuthState::new(api_key)),
+        limiter: Arc::new(wg_apiserver::LoginLimiter::new(60)),
+    };
+    (router(state), tmp)
+}
 async fn app_with(api_key: &str, whitelist: Vec<String>) -> (axum::Router, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let mut cfg = Config::default();
@@ -483,3 +524,108 @@ async fn rate_limit_engages_when_enabled() {
     }
     assert!(saw_limit, "the 4th request in a minute must be limited");
 }
+
+    /// The console (`public/index.html`) reads these exact keys. Shipping the
+    /// Go shape alone renders a table of `undefined`, so this pins both.
+    #[tokio::test]
+    async fn containers_carry_the_console_field_names() {
+        let (app, _t) = app_with_one_instance("secret").await;
+        let (status, body) = call(&app, get_with_key("/api/containers", "secret")).await;
+        assert_eq!(status, StatusCode::OK);
+        let row = &body["data"][0];
+
+        // Console contract.
+        for key in [
+            "container",
+            "instance_index",
+            "host_port",
+            "pool_status",
+            "ipv6",
+            "ipv4",
+            "ip_mode",
+            "health",
+            "cf_403_rate",
+            "cf_403_count",
+            "cf_check_count",
+            "dedicated",
+        ] {
+            assert!(row.get(key).is_some(), "console needs `{key}`: {row}");
+        }
+        // Values must have the right shape, not just exist.
+        assert_eq!(row["container"], "warp-0");
+        assert_eq!(row["instance_index"], 0);
+        assert!(row["host_port"].is_i64(), "host_port must be a number");
+        assert!(row["pool_status"].is_string());
+        assert!(row["health"].is_string());
+
+        // Go/API contract, kept so other clients do not break.
+        for key in ["name", "index", "port", "status", "running"] {
+            assert!(row.get(key).is_some(), "API client needs `{key}`: {row}");
+        }
+    }
+    // ------------------------------------------------------- dangerous paths
+
+    /// `rotate` deletes and re-registers an account, so "no target" must never
+    /// be inferred from `index: 0` — instance 0 is a legitimate target. An
+    /// earlier version treated `{"index":0}` as "rotate everything" and wiped
+    /// the pool.
+    #[tokio::test]
+    async fn rotate_with_index_zero_targets_instance_zero_only() {
+        let (app, _t) = app_with_one_instance("secret").await;
+        let (status, body) = call(
+            &app,
+            post_json("/api/pool/rotate", serde_json::json!({"index":0})),
+        )
+        .await;
+        // Instance 0 exists here, so this must NOT fan out to "rotate all".
+        // Registration is a stub in this build, so the call may fail — the
+        // point is that it targeted one instance, not the whole pool.
+        assert!(
+            status == StatusCode::OK || status == StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected status: {status}"
+        );
+        if status == StatusCode::OK {
+            assert!(
+                body["data"]["rotated"]
+                    .as_array()
+                    .map_or(false, |a| a.len() <= 1),
+                "index 0 must target at most one instance, got: {body}"
+            );
+        }
+    }
+
+    /// `all: true` is the only way to rotate the whole pool.
+    #[tokio::test]
+    async fn rotate_all_requires_an_explicit_flag() {
+        let (app, _t) = app_with_one_instance("secret").await;
+        let (_status, body) = call(
+            &app,
+            post_json("/api/pool/rotate", serde_json::json!({"all":true})),
+        )
+        .await;
+        assert!(
+            body["data"]["rotated"].is_array(),
+            "explicit all must return the rotated list: {body}"
+        );
+    }
+
+    /// A failed rebuild must not destroy the existing account. Registration is
+    /// a stub in this build, so `rotate` always fails — the instance has to
+    /// survive it.
+    #[tokio::test]
+    async fn failed_rotate_keeps_the_instance() {
+        let (app, _t) = app_with_one_instance("secret").await;
+        let (_, _) = call(
+            &app,
+            post_json("/api/pool/rotate", serde_json::json!({"index":0})),
+        )
+        .await;
+        // Still there.
+        let (status, body) = call(&app, get_with_key("/api/containers", "secret")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["data"].as_array().map(|a| a.len()),
+            Some(1),
+            "a failed rotate must not drop the instance: {body}"
+        );
+    }

@@ -262,3 +262,12 @@ mod tests {
         assert_eq!(v["uniqueIps"], 8);
     }
 }
+
+/// Fill `buf` with cryptographically secure random bytes.
+///
+/// A thin wrapper so callers need not depend on `getrandom` directly; on
+/// glibc 2.17 (CentOS 7) the syscall is unavailable and the crate falls back
+/// to `/dev/urandom`, which is why this must not be hand-declared.
+pub fn random_bytes(buf: &mut [u8]) -> std::result::Result<(), getrandom::Error> {
+    getrandom::getrandom(buf)
+}

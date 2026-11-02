@@ -587,13 +587,27 @@ mod tests {
 /// Returns an empty string when the probe fails; callers keep the assigned
 /// value rather than failing the instance over a probe.
 pub async fn probe_exit_ipv6(dial: &DialFn, url: &str, timeout: Duration) -> String {
+    probe_exit(dial, url, timeout).await.0
+}
+
+/// Fetch an echo endpoint through the tunnel and return the bare address.
+///
+/// Returns `(v6, v4)`:
+///
+/// * `v6` — non-empty when the route resolved to IPv6 (the normal case: every
+///   WARP account gets its own IPv6, which is the whole point).
+/// * `v4` — the address seen over IPv4. Cloudflare NATs this, so it is shared
+///   between accounts and only useful as a connectivity check. The Node
+///   version reports it too (`checkExitIP` returns `{ip, v4, v6}`), and the
+///   console has an "IPv4 出口" column for it.
+pub async fn probe_exit(dial: &DialFn, url: &str, timeout: Duration) -> (String, String) {
     let Some(target) = parse_http_target(url) else {
-        return String::new();
+        return (String::new(), String::new());
     };
 
     let mut stream = match tokio::time::timeout(timeout, dial(target)).await {
         Ok(Ok(s)) => s,
-        _ => return String::new(),
+        _ => return (String::new(), String::new()),
     };
 
     // Plain HTTP/1.1 GET; the response body is the bare address.
@@ -604,7 +618,7 @@ pub async fn probe_exit_ipv6(dial: &DialFn, url: &str, timeout: Duration) -> Str
     );
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     if stream.write_all(req.as_bytes()).await.is_err() {
-        return String::new();
+        return (String::new(), String::new());
     }
     let mut buf = Vec::with_capacity(512);
     let mut chunk = [0u8; 512];
@@ -615,7 +629,12 @@ pub async fn probe_exit_ipv6(dial: &DialFn, url: &str, timeout: Duration) -> Str
                 buf.extend_from_slice(&chunk[..n]);
                 if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
                     let body = String::from_utf8_lossy(&buf[pos + 4..]).trim().to_string();
-                    return normalize_address(&body);
+                    let addr = normalize_address(&body);
+                    return if addr.contains(':') {
+                        (addr, String::new())
+                    } else {
+                        (String::new(), addr)
+                    };
                 }
                 if buf.len() > 16 * 1024 {
                     break;
@@ -624,7 +643,7 @@ pub async fn probe_exit_ipv6(dial: &DialFn, url: &str, timeout: Duration) -> Str
             _ => break,
         }
     }
-    String::new()
+    (String::new(), String::new())
 }
 
 /// `https://host:port/path` -> `host:port` to dial for a probe.

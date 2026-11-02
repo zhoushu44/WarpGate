@@ -38,12 +38,21 @@ pub struct Instance {
     /// SOCKS5 port in whitelist mode (`base_port + offset + index`).
     pub whitelist_port: i64,
     /// Last known exit IPv6.
+    /// The address the tunnel is observed to exit from, probed at start.\n    /// The address the tunnel is observed to exit from, probed at start.
     pub last_exit_ipv6: RwLock<String>,
+    /// The IPv4 address seen through the tunnel. Cloudflare NATs this, so it
+    /// is shared between accounts and only proves connectivity.
+    pub last_exit_ipv4: RwLock<String>,
     /// Last CF 403 counter and check count, for the rotate heuristic.
     pub cf_403_count: std::sync::atomic::AtomicI64,
     pub cf_check_count: std::sync::atomic::AtomicI64,
     /// Consecutive failures, for the reconnect backoff.
     pub fail_streak: std::sync::atomic::AtomicU32,
+    /// Consecutive *connection* failures reported by clients. Two in a row
+    /// means the engine is wedged and gets restarted.
+    pub conn_fail_count: std::sync::atomic::AtomicI64,
+    /// The last HTTP status a client reported for this exit.
+    pub cf_last_code: RwLock<i64>,
     /// The outbound dial for this instance's SOCKS5 listeners.
     dial: RwLock<Option<wg_tunnel::DialFn>>,
 }
@@ -490,9 +499,12 @@ impl Manager {
             port: self.cfg.account_port(idx),
             whitelist_port: self.cfg.whitelist_port(idx),
             last_exit_ipv6: RwLock::new(String::new()),
+            last_exit_ipv4: RwLock::new(String::new()),
             cf_403_count: std::sync::atomic::AtomicI64::new(0),
             cf_check_count: std::sync::atomic::AtomicI64::new(0),
             fail_streak: std::sync::atomic::AtomicU32::new(0),
+            conn_fail_count: std::sync::atomic::AtomicI64::new(0),
+            cf_last_code: RwLock::new(0),
             // The outbound dial for this instance's SOCKS5 listeners.
             dial: RwLock::new(None),
         });
@@ -668,21 +680,44 @@ impl Manager {
 
         let opened = self.attach_dial(idx, dial.clone()).await?;
 
-        // Detect the real exit address. This is what the console's "exit IP"
-        // column shows, and the assigned IPv6 is *not* it — Cloudflare routes
-        // from whatever the tunnel actually negotiated. A failed probe keeps
-        // the instance running; it only leaves the column blank.
+        // Detect the real exit addresses. This is what the console's "IPv6/IPv4
+        // 出口" columns show, and the assigned address is *not* the exit — the
+        // tunnel decides what Cloudflare routes from.
+        //
+        // Both families are probed, like the Node version's `checkExitIP`:
+        // IPv6 is the per-account identity, IPv4 verifies connectivity through
+        // Cloudflare's shared NAT. A failed probe leaves the column blank
+        // rather than failing the instance.
         if opened > 0 {
-            let url = self.cfg.ip_check_url_v6.trim();
-            if !url.is_empty() {
-                // `ip_check_interval` is milliseconds; clamp to a sane probe
-                // timeout so a small value cannot fail a probe on a slow link.
-                let secs = (self.cfg.ip_check_interval.max(1) as u64 / 1000).max(5);
-                let found =
-                    wg_tunnel::probe_exit_ipv6(&dial, url, Duration::from_secs(secs)).await;
-                if !found.is_empty() {
-                    if let Some(inst) = self.instances.read().await.get(&idx) {
-                        *inst.last_exit_ipv6.write().await = found;
+            // `ip_check_interval` is milliseconds; clamp to a sane probe
+            // timeout so a small value cannot fail a probe on a slow link.
+            let secs = (self.cfg.ip_check_interval.max(1) as u64 / 1000).max(5);
+            let timeout = Duration::from_secs(secs);
+
+            let v6 = {
+                let url = self.cfg.ip_check_url_v6.trim();
+                if url.is_empty() {
+                    String::new()
+                } else {
+                    wg_tunnel::probe_exit(&dial, url, timeout).await.0
+                }
+            };
+            let v4 = {
+                let url = self.cfg.ip_check_url.trim();
+                if url.is_empty() {
+                    String::new()
+                } else {
+                    wg_tunnel::probe_exit(&dial, url, timeout).await.1
+                }
+            };
+
+            if !v6.is_empty() || !v4.is_empty() {
+                if let Some(inst) = self.instances.read().await.get(&idx) {
+                    if !v6.is_empty() {
+                        *inst.last_exit_ipv6.write().await = v6;
+                    }
+                    if !v4.is_empty() {
+                        *inst.last_exit_ipv4.write().await = v4;
                     }
                 }
             }
@@ -828,18 +863,69 @@ impl Manager {
         Ok(())
     }
 
-    /// Rebuild: delete the directory and recreate at the same index.
+    /// Rebuild: re-register the account at the same index.
+    ///
+    /// The old account is only discarded once the new one exists. Deleting
+    /// first meant a failed registration (no network, registration API down)
+    /// left the pool permanently short one instance — the caller saw an error
+    /// *and* lost capacity, which is the worst of both.
     pub async fn rebuild(&self, idx: i64) -> Result<()> {
+        // Register into a scratch directory first, so a failure is a no-op.
+        let tmp = self.base.join(format!(".rebuild-{}-{}", idx, now_millis()));
+        std::fs::create_dir_all(&tmp)
+            .map_err(|e| PoolError::InstanceError(idx, e.to_string()))?;
+
+        // Register first; the old account stays untouched if this fails.
+        let ucfg = match self.register_account(idx).await {
+            Ok(u) => u,
+            Err(e) => {
+                let _ = wg_store::remove(&tmp);
+                return Err(e);
+            }
+        };
+        let _ = wg_store::remove(&tmp);
+
+        // New account in hand: stop the old tunnel and swap the config in.
         if let Some(inst) = self.instances.write().await.remove(&idx) {
             inst.tunnel.stop();
         }
-        wg_store::remove(&wg_store::dir(&self.base, idx))?;
-        self.create(idx).await
+        let dir = wg_store::dir(&self.base, idx);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| PoolError::InstanceError(idx, e.to_string()))?;
+        ucfg.save(&wg_store::paths::usque_conf_path(&dir))?;
+        self.start_with_config(idx, ucfg, false).await.map(|_| ())
     }
 
+
+
     /// Rotate: a rebuild gets a new account, hence a new exit IPv6.
+    ///
+    /// This **destroys the account** — it deletes the instance directory and
+    /// registers a new one. Callers that only want to un-wedge a tunnel should
+    /// use [`restart_engine`] instead, which keeps the same exit IP.
     pub async fn rotate(&self, idx: i64) -> Result<()> {
         self.rebuild(idx).await
+    }
+
+    /// Restart the data plane for one instance, keeping its account.
+    ///
+    /// The Node version's `restartInstanceEngine`: stop the engine, start it
+    /// again from the same `usque.json`. No re-registration, so the exit IP is
+    /// unchanged — this is the recovery path for a wedged tunnel, and it must
+    /// never delete anything.
+    pub async fn restart_engine(&self, idx: i64) -> Result<()> {
+        let inst = self
+            .instances
+            .read()
+            .await
+            .get(&idx)
+            .cloned()
+            .ok_or(PoolError::NotFound(idx))?;
+        inst.tunnel.stop();
+        let Some(ucfg) = wg_store::UsqueConfig::read(&inst.dir)? else {
+            return Err(PoolError::InstanceError(idx, "缺少 usque.json".into()));
+        };
+        self.start_with_config(idx, ucfg, false).await.map(|_| ())
     }
 
     // ---------------------------------------------------------------- queries
@@ -898,6 +984,73 @@ impl Manager {
     pub fn start_loops(self: &Arc<Self>, cancel: tokio_util::sync::CancellationToken) {
         let m = self.clone();
         tokio::spawn(async move { m.cleanup_loop(cancel).await });
+    }
+
+    // ------------------------------------------------- dedicated IP pins
+
+    /// Pin (or unpin) an instance to its current exit IP.
+    ///
+    /// Pinning is a *scheduling* promise, not a tunnel change: the exit address
+    /// is whatever the account was assigned, so all this does is mark the
+    /// instance so rotation skips it. The flag lives in `meta.json`, which is
+    /// what the console reads and what survives a restart.
+    pub async fn set_dedicated(&self, idx: i64, on: bool, remark: &str) -> Result<()> {
+        let inst = self
+            .instances
+            .read()
+            .await
+            .get(&idx)
+            .cloned()
+            .ok_or(PoolError::NotFound(idx))?;
+        {
+            let mut m = inst.meta.write().await;
+            m.dedicated = on;
+            if on {
+                m.dedicated_at = now_millis();
+                if !remark.is_empty() {
+                    m.dedicated_remark = Some(remark.to_string());
+                }
+            }
+        }
+        let meta = inst.meta.read().await.clone();
+        meta.write(&inst.dir)?;
+        Ok(())
+    }
+
+    /// Update only the note on an existing pin.
+    pub async fn set_dedicated_remark(&self, idx: i64, remark: &str) -> Result<()> {
+        let inst = self
+            .instances
+            .read()
+            .await
+            .get(&idx)
+            .cloned()
+            .ok_or(PoolError::NotFound(idx))?;
+        {
+            let mut m = inst.meta.write().await;
+            m.dedicated_remark = if remark.is_empty() {
+                None
+            } else {
+                Some(remark.to_string())
+            };
+        }
+        let meta = inst.meta.read().await.clone();
+        meta.write(&inst.dir)?;
+        Ok(())
+    }
+
+    pub async fn session_instance(&self, session_id: &str) -> Option<Arc<Instance>> {
+        let (idx, alive) = {
+            let map = self.sticky.read().await;
+            match map.get(session_id) {
+                Some(e) => (e.index, e.expires_at > std::time::Instant::now()),
+                None => return None,
+            }
+        };
+        if !alive {
+            return None;
+        }
+        self.instances.read().await.get(&idx).cloned()
     }
 }
 
