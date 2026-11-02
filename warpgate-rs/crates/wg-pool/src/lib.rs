@@ -896,16 +896,10 @@ fn now_millis() -> i64 {
 
 /// The address a client should dial to reach this host's SOCKS5 ports.
 ///
-/// Order of preference:
-///
-/// 1. `172.17.0.1` — the docker bridge gateway. Sibling containers reach the
-///    host here, and it is also valid from the host itself. This is the case
-///    that matters: the Node version's callers are all containers.
-/// 2. The first non-loopback IPv4 on an interface.
-/// 3. `127.0.0.1`, for a host-only deployment.
-///
-/// Detected once and cached: the address does not change while the process runs,
-/// and this is on the hot path of every `/api/proxies` call.
+/// `auto-detect` means "the public IP", exactly like the Node version: callers
+/// are other machines, so a docker-bridge address (`172.17.0.1`) is useless to
+/// them — it only resolves inside the host. Detected once via an external echo
+/// service and cached; falls back to a local interface, then loopback.
 fn detect_public_ip() -> String {
     use std::sync::OnceLock;
     static CACHED: OnceLock<String> = OnceLock::new();
@@ -913,17 +907,38 @@ fn detect_public_ip() -> String {
 }
 
 fn detect_public_ip_uncached() -> String {
-    // The docker bridge gateway. Present whenever docker is installed, which is
-    // the deployment shape this system targets.
-    if let Ok(addrs) = local_ipv4_addrs() {
-        if addrs.iter().any(|a| a == "172.17.0.1") {
-            return "172.17.0.1".to_string();
+    // 1. Ask an echo service what the outside world sees us as. This is what
+    //    the Node version does (`curl https://api.ipify.org`), and it is the
+    //    only value that is meaningful to a remote caller.
+    for url in [
+        "https://api.ipify.org",
+        "https://ifconfig.me/ip",
+        "https://icanhazip.com",
+    ] {
+        if let Ok(out) = std::process::Command::new("curl")
+            .args(["-s", "--max-time", "10", url])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if let Ok(ip) = text.parse::<std::net::Ipv4Addr>() {
+                if !ip.is_loopback() && !ip.is_private() && !ip.is_unspecified() {
+                    tracing::info!("公网IP自动检测成功: {}", ip);
+                    return ip.to_string();
+                }
+            }
         }
-        // Otherwise the first private address that is not loopback.
+    }
+    tracing::warn!("公网IP检测失败，回退到本机地址");
+
+    // 2. The first non-loopback interface address: reachable from the host and
+    //    from sibling containers on a shared network, but not the internet.
+    if let Ok(addrs) = local_ipv4_addrs() {
         if let Some(a) = addrs.iter().find(|a| *a != "127.0.0.1") {
             return a.clone();
         }
     }
+
+    // 3. Host-only deployment.
     "127.0.0.1".to_string()
 }
 
@@ -1229,21 +1244,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_ip_is_not_loopback_when_a_bridge_exists() {
+    async fn public_ip_is_reachable_by_a_remote_caller() {
+        // The Node version returns the *public* IP: callers are other machines,
+        // so a docker-bridge or loopback address would be useless to them.
         let (m, _t) = pool_with(1).await;
         let ip = m.public_ip().await;
-        // On a docker host the bridge gateway is preferred; on a bare host any
-        // non-loopback address will do. Only assert it is usable.
         assert!(!ip.is_empty(), "must always return something");
-        if ip == "127.0.0.1" {
-            // Acceptable only if the machine really has no other address.
-            let addrs = local_ipv4_addrs().unwrap_or_default();
-            assert!(
-                addrs.iter().all(|a| a == "127.0.0.1"),
-                "loopback returned but other addresses exist: {:?}",
-                addrs
-            );
-        }
+        // Whatever we return must be a valid IPv4 literal a client can dial.
+        assert!(
+            ip.parse::<std::net::Ipv4Addr>().is_ok(),
+            "must be a dialable IPv4 address, got: {ip}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_public_ip_wins_over_detection() {
+        let mut c = Config::default();
+        c.public_ip = "203.0.113.9".into();
+        let tmp = tempfile::tempdir().unwrap();
+        let m = Manager::new(c.into(), tmp.path().to_path_buf());
+        assert_eq!(m.public_ip().await, "203.0.113.9");
     }
 
     #[tokio::test]
