@@ -111,7 +111,7 @@ impl NativeTunnel {
             .map_err(|e| format!("HTTP/2 握手失败: {e}"))?;
         eprintln!("[native] h2 ok");
         eprintln!("[native] connect-ip...");
-        let tunnel = crate::connectip::H2Tunnel::open(io, 1, "cloudflareaccess.com")
+        let tunnel = crate::connectip::H2Tunnel::open(io, 1, crate::connectip::CONNECT_AUTHORITY)
             .await
             .map_err(|e| format!("CONNECT-IP 失败: {e}"))?;
         eprintln!("[native] connect-ip ok, stack up");
@@ -132,6 +132,13 @@ impl NativeTunnel {
                 .map_err(|e| format!("IPv4 地址非法 {ipv4}: {e}"))?
         };
         let stack = Arc::new(UserspaceStack::new(local));
+        // The account owns an IPv4 as well (`172.16.0.2` in `usque.json`). Both
+        // families ride the same tunnel, and most destinations are A-only, so
+        // the interface needs both addresses or IPv4 dials fail as
+        // "unaddressable destination".
+        if let Ok(v4) = ipv4.trim().parse::<std::net::Ipv4Addr>() {
+            stack.add_ipv4(v4.into()).await;
+        }
         let pump = stack.attach(tunnel);
 
         Ok(Self {
@@ -277,7 +284,7 @@ pub async fn diagnose(
 ) -> Vec<String> {
     let mut out = Vec::new();
 
-    let _signing = match crate::masque::parse_private_key(private_key_b64) {
+    let signing = match crate::masque::parse_private_key(private_key_b64) {
         Ok(k) => {
             out.push("key: SEC1/PKCS8 parse OK".into());
             k
@@ -288,7 +295,17 @@ pub async fn diagnose(
         }
     };
 
-    let tls = match crate::masque::build_tls_for_test(Some(endpoint_pub_key_pem.to_string())) {
+    // NOTE: this must be the enrolled key. An earlier version called
+    // `build_tls_for_test`, which mints a *fresh random* P-256 key for the
+    // client certificate; the edge accepts the TLS handshake (it checks only
+    // that a certificate was presented, at the TLS layer) and then, once the
+    // HTTP/2 request names an account, rejects the stream. That turned a
+    // perfectly good account into what looked like a broken CONNECT-IP
+    // implementation.
+    let tls = match crate::masque::build_h2_tls_config(
+        &signing,
+        Some(endpoint_pub_key_pem),
+    ) {
         Ok(t) => {
             out.push(format!("tls-config: alpn={:?}", t.alpn_protocols));
             t
@@ -365,7 +382,7 @@ pub async fn diagnose(
         }
     }
 
-    match crate::connectip::H2Tunnel::open(tls_stream, 1, "cloudflareaccess.com").await {
+    match crate::connectip::H2Tunnel::open(tls_stream, 1, crate::connectip::CONNECT_AUTHORITY).await {
         Ok(t) => out.push(format!("connect-ip: OK stream={}", t.stream_id())),
         Err(e) => out.push(format!("connect-ip: FAILED {e}")),
     }

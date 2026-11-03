@@ -85,7 +85,7 @@ async fn probe_inner(
         .await
         .map_err(|e| format!("HTTP/2 握手失败: {e}"))?;
 
-    let tunnel = crate::connectip::H2Tunnel::open(io, 1, "cloudflareaccess.com")
+    let tunnel = crate::connectip::H2Tunnel::open(io, 1, crate::connectip::CONNECT_AUTHORITY)
         .await
         .map_err(|e| format!("CONNECT-IP 失败: {e}"))?;
 

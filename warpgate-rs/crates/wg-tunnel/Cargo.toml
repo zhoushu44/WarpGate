@@ -38,3 +38,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 tempfile = "3"
+# Only for the cert-shape diagnostics under examples/: they set explicit
+# validity windows, and rcgen does not re-export `time`.
+time = "0.3"

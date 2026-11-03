@@ -128,6 +128,15 @@ pub struct UserspaceStack {
     /// Local address inside the tunnel. Kept for diagnostics and for callers
     /// that need to know which family this stack speaks.
     pub local: IpAddress,
+    /// Next ephemeral source port to hand out.
+    ///
+    /// smoltcp's `TcpSocket::connect` returns `ConnectError::Unaddressable`
+    /// when the *local* port is zero (see `socket/tcp.rs`: `if
+    /// local_endpoint.port == 0 { return Err(Unaddressable) }`). The earlier
+    /// code passed `port: 0` meaning "pick one for me", which is not what that
+    /// API does, so every dial failed with the misleading message
+    /// "connect: unaddressable destination".
+    next_port: std::sync::atomic::AtomicU16,
 }
 
 impl UserspaceStack {
@@ -163,12 +172,82 @@ impl UserspaceStack {
             iface: Arc::new(Mutex::new(iface)),
             sockets: Arc::new(Mutex::new(SocketSet::new(Vec::new()))),
             local,
+            // 49152..=65535 is the IANA ephemeral range.
+            next_port: std::sync::atomic::AtomicU16::new(49152),
         }
+    }
+
+    /// Also assign an IPv4 address to the interface.
+    ///
+    /// A WARP account owns *both* an IPv6 and a `172.16.0.2`-style IPv4. The
+    /// tunnel carries either, but smoltcp refuses to originate a packet whose
+    /// source address the interface does not have: with only the IPv6 assigned,
+    /// every IPv4 destination fails with `ConnectError::Unaddressable`
+    /// ("connect: unaddressable destination"), which is what `api.ipify.org`
+    /// (A record only) hit.
+    pub async fn add_ipv4(&self, addr: smoltcp::wire::Ipv4Address) {
+        let mut iface = self.iface.lock().await;
+        let _ = iface.update_ip_addrs(|addrs| {
+            if !addrs.iter().any(|c| matches!(c, IpCidr::Ipv4(_))) {
+                let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(addr), 32));
+            }
+        });
+        let _ = iface
+            .routes_mut()
+            .add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(0, 0, 0, 0));
+    }
+
+    /// Hand out the next unused ephemeral source port.
+    ///
+    /// Wraps within 49152..=65535 and skips ports that are still connected.
+    async fn alloc_port(&self) -> u16 {
+        use std::sync::atomic::Ordering;
+        loop {
+            let port = self.next_port.fetch_add(1, Ordering::Relaxed);
+            let port = if port < 49152 { 49152 } else { port };
+            let taken = {
+                let set = self.sockets.lock().await;
+                let busy = set.iter().any(|(_, any)| match any {
+                    // Only TCP sockets are in this set.
+                    smoltcp::socket::Socket::Tcp(s) => s
+                        .local_endpoint()
+                        .map(|e| e.port == port)
+                        .unwrap_or(false),
+                });
+                busy
+            };
+            if !taken {
+                return port;
+            }
+        }
+    }
+
+    /// Whether the interface has an address of the given family.
+    async fn has_family(&self, want_v6: bool) -> bool {
+        let iface = self.iface.lock().await;
+        iface.ip_addrs().iter().any(|c| match c {
+            IpCidr::Ipv4(_) => !want_v6,
+            IpCidr::Ipv6(_) => want_v6,
+        })
     }
 
     /// Open a TCP connection to `host:port` and return it as a byte stream.
     pub async fn connect(&self, host: &str, port: u16) -> io::Result<AnyStream> {
         let remote = resolve(host).await?;
+        // A v4 destination needs a v4 source address on the interface; without
+        // one smoltcp reports the opaque `unaddressable destination`. Say which
+        // address family is missing instead.
+        if matches!(remote, IpAddress::Ipv4(_)) && !self.has_family(false).await {
+            return Err(io::Error::other(
+                "connect: no IPv4 address on the tunnel interface (call add_ipv4)",
+            ));
+        }
+        if matches!(remote, IpAddress::Ipv6(_)) && !self.has_family(true).await {
+            return Err(io::Error::other("connect: no IPv6 address on the tunnel interface"));
+        }
+        // Pick a real ephemeral source port. smoltcp rejects a zero local port
+        // outright, so "let the stack choose" has to be done here.
+        let local_port = self.alloc_port().await;
         let handle = {
             let mut set = self.sockets.lock().await;
             let rx = tcp::SocketBuffer::new(vec![0u8; 64 * 1024]);
@@ -180,7 +259,7 @@ impl UserspaceStack {
                 smoltcp::wire::IpEndpoint::new(remote, port),
                 IpListenEndpoint {
                     addr: None,
-                    port: 0,
+                    port: local_port,
                 },
             )
             .map_err(|e| io::Error::other(format!("connect: {e}")))?;
@@ -289,18 +368,36 @@ impl UserspaceStack {
 
 
 
-        StackPump { _reader: reader }
+        // A second task drives smoltcp. Without it nothing ever calls
+        // `Interface::poll`, so the stack never emits a SYN and never consumes
+        // an inbound packet: `connect-ip` succeeds, the tunnel reports UP, and
+        // every dial hangs until its timeout.
+        let stack = self.clone();
+        let driver = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(2));
+            loop {
+                ticker.tick().await;
+                stack.pump_once().await;
+            }
+        });
+
+        StackPump {
+            _reader: reader,
+            _driver: driver,
+        }
     }
 
     /// Process one round of the stack: move packets both ways.
     async fn pump_once(&self) {
         let now = SmolInstant::now();
-        let q = self.queue.lock().await;
+        // Do NOT hold the queue lock across `poll`. `TunnelDevice::receive`
+        // takes it (non-blocking) to pop an inbound packet, so holding it here
+        // makes every `receive` return `None` and the stack never sees a
+        // single packet — the symptom is a tunnel that opens fine and then
+        // never completes a TCP handshake.
         let mut dev = TunnelDevice {
             queue: self.queue.clone(),
         };
-        // Drop the lock before polling: `poll` calls back into the device.
-        drop(q);
         let mut iface = self.iface.lock().await;
         let mut set = self.sockets.lock().await;
         let _ = iface.poll(now, &mut dev, &mut set);
@@ -310,6 +407,8 @@ impl UserspaceStack {
 /// Keeps the tunnel pump tasks alive; dropping it stops them.
 pub struct StackPump {
     _reader: tokio::task::JoinHandle<()>,
+    /// Drives `Interface::poll` so the stack makes progress.
+    _driver: tokio::task::JoinHandle<()>,
 }
 
 /// A TCP connection running inside the userspace stack.
