@@ -1,0 +1,20 @@
+[Unit]
+Description=WarpGate Rust proxy pool
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/warpgate-rs/app
+Environment=WARP_NATIVE=quic
+LimitNOFILE=65535
+ExecStart=/root/warpgate-rs/app/target/release/warpgate --config /root/warpgate-rs/rust-config.json --instances /root/warpgate-rs/instances
+StandardOutput=append:/root/warpgate-rs/warpgate.log
+StandardError=append:/root/warpgate-rs/warpgate.log
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

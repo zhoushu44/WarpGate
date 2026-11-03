@@ -84,42 +84,62 @@ async fn main() -> ExitCode {
 
     let cancel = CancellationToken::new();
 
-    // Warm-start existing accounts, then top up to resident_count.
-    tracing::info!(target: "BOOT", "开始恢复/创建实例（并发上限 {}）...", cfg.max_concurrent_create);
-    let boot_start = std::time::Instant::now();
-    mgr.boot(&cancel).await;
+    // Instance bring-up runs in the background on purpose.
+    //
+    // 500 instances take minutes to attach (each usque needs its port to come
+    // up), and doing that before `axum::serve` means the console is unreachable
+    // for the entire time — it looks like the deployment failed. Binding first
+    // and filling the pool afterwards keeps the UI usable throughout; the
+    // counters simply climb while it works.
+    let boot_mgr = mgr.clone();
+    let boot_cancel = cancel.clone();
+    let boot_engine = engine_binary.clone();
+    tokio::spawn(async move {
+        tracing::info!(target: "BOOT", "开始恢复/创建实例（并发上限 {}）...", boot_mgr.config().max_concurrent_create);
+        let boot_start = std::time::Instant::now();
+        boot_mgr.boot(&boot_cancel).await;
 
-    // Attach the data plane to every running instance. A failure here marks the
-    // instance unhealthy rather than aborting the boot, so a partially-working
-    // pool is still usable.
-    if use_engine {
-        let mut ok = 0;
-        let mut failed = 0;
-        for inst in mgr.all().await {
-            match mgr.attach_engine(inst.index, &engine_binary, cfg.masque_http2).await {
-                Ok(_) => ok += 1,
-                Err(e) => {
-                    failed += 1;
-                    tracing::warn!(target: "BOOT", "warp-{} 数据面启动失败: {}", inst.index, e);
+        // Attach the data plane to every running instance. A failure here marks
+        // the instance unhealthy rather than aborting, so a partially-working
+        // pool is still usable.
+        if use_engine {
+            let mut ok = 0;
+            let mut failed = 0;
+            for inst in boot_mgr.all().await {
+                if boot_cancel.is_cancelled() {
+                    return;
+                }
+                match boot_mgr
+                    .attach_engine(inst.index, &boot_engine, boot_mgr.config().masque_http2)
+                    .await
+                {
+                    Ok(_) => ok += 1,
+                    Err(e) => {
+                        failed += 1;
+                        tracing::warn!(target: "BOOT", "warp-{} 数据面启动失败: {}", inst.index, e);
+                    }
+                }
+            }
+            tracing::info!(target: "BOOT", "数据面就绪 {}/{}（失败 {}）", ok, ok + failed, failed);
+        } else {
+            for inst in boot_mgr.all().await {
+                if boot_cancel.is_cancelled() {
+                    return;
+                }
+                if let Err(e) = boot_mgr.attach_masque(inst.index).await {
+                    tracing::warn!(target: "BOOT", "warp-{} MASQUE 失败: {}", inst.index, e);
                 }
             }
         }
-        tracing::info!(target: "BOOT", "数据面就绪 {}/{}（失败 {}）", ok, ok + failed, failed);
-    } else {
-        for inst in mgr.all().await {
-            if let Err(e) = mgr.attach_masque(inst.index).await {
-                tracing::warn!(target: "BOOT", "warp-{} MASQUE 失败: {}", inst.index, e);
-            }
-        }
-    }
 
-    tracing::info!(
-        target: "BOOT",
-        "实例就绪 {}/{}，耗时 {:?}",
-        mgr.healthy_count().await,
-        cfg.resident_count,
-        boot_start.elapsed()
-    );
+        tracing::info!(
+            target: "BOOT",
+            "实例就绪 {}/{}，耗时 {:?}",
+            boot_mgr.healthy_count().await,
+            boot_mgr.config().resident_count,
+            boot_start.elapsed()
+        );
+    });
 
     mgr.start_loops(cancel.clone());
 
@@ -135,7 +155,6 @@ async fn main() -> ExitCode {
         limiter,
     };
     let app = wg_apiserver::router(state);
-
     let bind = format!("{}:{}", cfg.bind_address, cfg.port);
     let listener = match tokio::net::TcpListener::bind(&bind).await {
         Ok(l) => l,

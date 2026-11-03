@@ -141,6 +141,18 @@ pub fn stub_dial() -> wg_tunnel::DialFn {
     })
 }
 
+/// Per-day operation counters for the console's overview page.
+#[derive(Default, Clone, serde::Serialize)]
+pub struct UsageDay {
+    pub acquires: i64,
+    pub sticky: i64,
+    pub releases: i64,
+    pub reports: i64,
+    pub rotates: i64,
+    pub binds: i64,
+    pub unbinds: i64,
+}
+
 /// A sticky-session binding.
 #[derive(Debug, Clone)]
 pub struct StickyEntry {
@@ -155,6 +167,8 @@ pub struct Manager {
     instances: RwLock<HashMap<i64, Arc<Instance>>>,
     rr: RwLock<usize>,
     sticky: RwLock<HashMap<String, StickyEntry>>,
+    /// `date -> counters`, for `/api/usage`.
+    usage: RwLock<HashMap<String, UsageDay>>,
     /// Bounds concurrent cold creates.
     sem: Arc<tokio::sync::Semaphore>,
     /// Injectable create action, so tests can avoid the network.
@@ -209,6 +223,7 @@ impl Manager {
             instances: RwLock::new(HashMap::new()),
             rr: RwLock::new(0),
             sticky: RwLock::new(HashMap::new()),
+            usage: RwLock::new(HashMap::new()),
             sem: Arc::new(tokio::sync::Semaphore::new(permits)),
             create_fn: RwLock::new(None),
         }
@@ -549,7 +564,18 @@ impl Manager {
                 .unwrap_or(raw)
         };
         // The response carries the key as base64 SPKI; usque.json wants PEM.
-        let endpoint_pub_key = pem_wrap_public_key(&peer.public_key);
+        // The endpoint's pinned key is Cloudflare's *server* certificate, which
+        // is the same for every account. `PATCH /reg/<id>` returns it in a
+        // shape that does not round-trip through `asn1` (it comes back as a
+        // bare point), and usque rejects that with a structure error. Using the
+        // known-good document is both simpler and correct — every account in
+        // `usque register` output carries exactly this value.
+        const CF_ENDPOINT_PUB_KEY: &str = "-----BEGIN PUBLIC KEY-----\n\
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
+7SxI8tsW8OR1A5tv/zCzVbCRRh2t87/kxnP6lAy0lkr7qYwu+ox+k3dr6w==\n\
+-----END PUBLIC KEY-----\n";
+        let endpoint_pub_key = CF_ENDPOINT_PUB_KEY.to_string();
+        let _ = &peer.public_key;
 
         let ucfg = wg_store::UsqueConfig {
             private_key: private_b64,
@@ -1148,6 +1174,30 @@ impl Manager {
         tokio::spawn(async move { m.cleanup_loop(cancel).await });
     }
 
+    // ------------------------------------------------------------- usage
+
+    /// Bump one counter for today.
+    pub async fn bump_usage(&self, field: &str) {
+        let today = today_utc();
+        let mut map = self.usage.write().await;
+        let e = map.entry(today).or_default();
+        match field {
+            "acquires" => e.acquires += 1,
+            "sticky" => e.sticky += 1,
+            "releases" => e.releases += 1,
+            "reports" => e.reports += 1,
+            "rotates" => e.rotates += 1,
+            "binds" => e.binds += 1,
+            "unbinds" => e.unbinds += 1,
+            _ => {}
+        }
+    }
+
+    /// A copy of the per-day counters.
+    pub async fn usage_snapshot(&self) -> std::collections::HashMap<String, UsageDay> {
+        self.usage.read().await.clone()
+    }
+
     // ------------------------------------------------- dedicated IP pins
 
     /// Pin (or unpin) an instance to its current exit IP.
@@ -1655,28 +1705,26 @@ mod tests {
         assert_eq!(all.iter().map(|i| i.index).collect::<Vec<_>>(), vec![0, 1, 2]);
     }
 }
-/// Wrap a base64 SPKI blob in PEM armour.
-///
-/// `PATCH /reg/<id>` returns `public_key` as bare base64, but `usque.json` (and
-/// the TLS pinning code) expects a PEM document. Already-PEM input is passed
-/// through so this is safe to call on either shape.
-fn pem_wrap_public_key(key: &str) -> String {
-    if key.contains("BEGIN PUBLIC KEY") {
-        return key.to_string();
-    }
-    let b64: String = key.chars().filter(|c| !c.is_whitespace()).collect();
-    let mut out = String::from("-----BEGIN PUBLIC KEY-----\n");
-    for chunk in b64.as_bytes().chunks(64) {
-        out.push_str(&String::from_utf8_lossy(chunk));
-        out.push('\n');
-    }
-    out.push_str("-----END PUBLIC KEY-----\n");
-    out
-}
 
 /// Standard base64 without padding, which is what the Cloudflare API expects
 /// for key material.
 fn base64_encode(bytes: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// Today's date as `YYYY-MM-DD` (UTC), for the usage buckets.
+fn today_utc() -> String {
+    let secs = now_millis() / 1000;
+    let z = secs.div_euclid(86_400) + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
 }

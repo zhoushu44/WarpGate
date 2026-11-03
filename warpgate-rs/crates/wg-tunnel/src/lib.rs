@@ -371,23 +371,54 @@ impl ExternalEngine {
         let child = cmd
             .spawn()
             .map_err(|e| TunnelError::Engine(format!("spawn usque: {}", e)))?;
-        let pid = child.id().unwrap_or(0);
         // Wrap so the handle is never dropped: with kill_on_drop(false) that
         // would be harmless, but `ManuallyDrop` makes it explicit and immune to
         // future changes in tokio's default.
-        let mut child = std::mem::ManuallyDrop::new(child);
-        // Log the engine's stderr so a failed startup is diagnosable. This also
-        // drains the pipe, which otherwise fills up and blocks the child.
-        if let Some(stderr) = child.stderr.take() {
+        let mut child = child;
+        let pid = child.id().unwrap_or(0);
+
+        // Drain and log both pipes, then reap the child.
+        //
+        // `stdout`/`stderr` were `piped`, so they must be read: a full pipe
+        // blocks the child, which then never binds its port. And the child must
+        // be `wait`ed on — with `kill_on_drop(false)` nothing else reaps it, so
+        // every exit left a zombie behind (501 of them accumulated, at which
+        // point the whole pool appeared dead while the OS held the PIDs).
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        if let Some(out) = stdout {
             tokio::spawn(async move {
                 use tokio::io::AsyncBufReadExt;
-                let reader = tokio::io::BufReader::new(stderr);
-                let mut lines = reader.lines();
+                let mut lines = tokio::io::BufReader::new(out).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(target: "ENGINE", "[{}] {}", pid, line);
+                    tracing::debug!(target: "ENGINE", "[{}] out: {}", pid, line);
                 }
             });
         }
+        if let Some(err) = stderr {
+            tokio::spawn(async move {
+                use tokio::io::AsyncBufReadExt;
+                let mut lines = tokio::io::BufReader::new(err).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    tracing::debug!(target: "ENGINE", "[{}] err: {}", pid, line);
+                }
+            });
+        }
+
+        // Reaper: this keeps the handle alive (so the child is not killed) *and*
+        // collects the exit status, which is what prevents zombies.
+        tokio::spawn(async move {
+            match child.wait().await {
+                Ok(status) => {
+                    tracing::warn!(target: "ENGINE", "[{}] exited: {:?}", pid, status);
+                }
+                Err(e) => {
+                    tracing::warn!(target: "ENGINE", "[{}] wait failed: {}", pid, e);
+                }
+            }
+        });
+
         Ok(pid)
     }
 

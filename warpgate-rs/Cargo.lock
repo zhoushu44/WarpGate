@@ -2332,7 +2332,7 @@ dependencies = [
 
 [[package]]
 name = "wg-apiserver"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "axum",
  "http-body-util",
@@ -2353,7 +2353,7 @@ dependencies = [
 
 [[package]]
 name = "wg-bin"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "axum",
  "clap",
@@ -2373,7 +2373,7 @@ dependencies = [
 
 [[package]]
 name = "wg-config"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2383,7 +2383,7 @@ dependencies = [
 
 [[package]]
 name = "wg-core"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "getrandom 0.2.17",
  "serde",
@@ -2393,7 +2393,7 @@ dependencies = [
 
 [[package]]
 name = "wg-pool"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "base64 0.22.1",
  "ipnet",
@@ -2415,7 +2415,7 @@ dependencies = [
 
 [[package]]
 name = "wg-socks"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "ipnet",
  "thiserror 2.0.21",
@@ -2427,7 +2427,7 @@ dependencies = [
 
 [[package]]
 name = "wg-store"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2438,7 +2438,7 @@ dependencies = [
 
 [[package]]
 name = "wg-tunnel"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",

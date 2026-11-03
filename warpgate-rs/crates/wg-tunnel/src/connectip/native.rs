@@ -96,19 +96,25 @@ impl NativeTunnel {
         let connector = tokio_rustls::TlsConnector::from(Arc::new(tls));
         let sni = rustls::pki_types::ServerName::try_from(crate::connectip::CONNECT_SNI.to_string())
             .map_err(|e| format!("SNI 无效: {e}"))?;
+        eprintln!("[native] tls connecting...");
         let tls_stream = tokio::time::timeout(Duration::from_secs(15), connector.connect(sni, tcp))
             .await
             .map_err(|_| "TLS 握手超时".to_string())?
             .map_err(|e| format!("TLS 握手失败: {e}"))?;
+        eprintln!("[native] tls ok");
 
         // 4. HTTP/2 preface, then the CONNECT-IP stream.
         let mut io = tls_stream;
+        eprintln!("[native] h2 handshake...");
         crate::connectip::h2_handshake(&mut io)
             .await
             .map_err(|e| format!("HTTP/2 握手失败: {e}"))?;
+        eprintln!("[native] h2 ok");
+        eprintln!("[native] connect-ip...");
         let tunnel = crate::connectip::H2Tunnel::open(io, 1, "cloudflareaccess.com")
             .await
             .map_err(|e| format!("CONNECT-IP 失败: {e}"))?;
+        eprintln!("[native] connect-ip ok, stack up");
 
         // 5. The userspace stack, bound to the address the account owns.
         let local = if !ipv6.trim().is_empty() {
@@ -168,6 +174,203 @@ fn split_target(target: &str) -> std::io::Result<(&str, u16)> {
     Ok((host, port))
 }
 
+/// Report the endpoint's actual public key next to what the config pins.
+///
+/// A pinning mismatch shows up as `UnknownIssuer`, which is indistinguishable
+/// from a genuinely untrusted certificate; this makes the two obvious.
+pub async fn compare_pin(endpoint_v4: &str, endpoint_pub_key_pem: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    match crate::masque::pem_to_spki_der(endpoint_pub_key_pem) {
+        Ok(der) => {
+            let pt = crate::masque::pinned_point(&der).unwrap_or_default();
+            out.push(format!("pinned   = {}", hex(&pt)));
+        }
+        Err(e) => out.push(format!("pinned parse FAILED: {e}")),
+    }
+
+    let host = endpoint_v4.trim_end_matches(":0");
+    let tls = match crate::masque::build_h2_tls_config_no_pin_for_probe() {
+        Ok(t) => t,
+        Err(e) => {
+            out.push(format!("tls cfg FAILED: {e}"));
+            return out;
+        }
+    };
+    let tcp = match tokio::net::TcpStream::connect(format!("{host}:443")).await {
+        Ok(s) => s,
+        Err(e) => {
+            out.push(format!("tcp FAILED: {e}"));
+            return out;
+        }
+    };
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(tls));
+    let sni_name = std::env::var("WARP_H2_SNI")
+        .unwrap_or_else(|_| crate::connectip::CONNECT_SNI.to_string());
+    let sni = match rustls::pki_types::ServerName::try_from(sni_name) {
+        Ok(s) => s,
+        Err(e) => {
+            out.push(format!("sni FAILED: {e}"));
+            return out;
+        }
+    };
+    match tokio::time::timeout(Duration::from_secs(20), connector.connect(sni, tcp)).await {
+        Ok(Ok(stream)) => {
+            out.push("tls: OK without pinning".into());
+            if let Some(certs) = stream.get_ref().1.peer_certificates() {
+                if let Some(leaf) = certs.first() {
+                    if let Ok((_, cert)) = x509_parser::parse_x509_certificate(leaf.as_ref()) {
+                        out.push(format!(
+                            "peer     = {}",
+                            hex(&crate::masque::ec_point_of(cert.public_key()))
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(Err(e)) => out.push(format!("tls FAILED: {e}")),
+        Err(_) => out.push("tls TIMEOUT".into()),
+    }
+
+    // Bisect: is the failure the pinning verifier, or the client certificate?
+    // A = accept-any verifier + client cert; B = pinning verifier + client cert.
+    for (label, pinned) in [("A accept-any+clientcert", false), ("B pinned+clientcert", true)] {
+        let tls = match crate::masque::build_tls_for_test(pinned.then(|| endpoint_pub_key_pem.to_string())) {
+            Ok(t) => t,
+            Err(e) => {
+                out.push(format!("{label}: cfg FAILED {e}"));
+                continue;
+            }
+        };
+        let tcp = match tokio::net::TcpStream::connect(format!("{host}:443")).await {
+            Ok(s) => s,
+            Err(e) => {
+                out.push(format!("{label}: tcp FAILED {e}"));
+                continue;
+            }
+        };
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(tls));
+        let sni = rustls::pki_types::ServerName::try_from(
+            crate::connectip::CONNECT_SNI.to_string(),
+        )
+        .unwrap();
+        match tokio::time::timeout(Duration::from_secs(15), connector.connect(sni, tcp)).await {
+            Ok(Ok(_)) => out.push(format!("{label}: OK")),
+            Ok(Err(e)) => out.push(format!("{label}: FAILED {e}")),
+            Err(_) => out.push(format!("{label}: TIMEOUT")),
+        }
+    }
+    out
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Bring the tunnel up one stage at a time, reporting where it stops.
+///
+/// A single error string cannot distinguish "TCP is blocked" from "TLS
+/// rejected our client certificate" from "CONNECT-IP was refused"; this can.
+pub async fn diagnose(
+    endpoint_v4: &str,
+    endpoint_pub_key_pem: &str,
+    private_key_b64: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+
+    let _signing = match crate::masque::parse_private_key(private_key_b64) {
+        Ok(k) => {
+            out.push("key: SEC1/PKCS8 parse OK".into());
+            k
+        }
+        Err(e) => {
+            out.push(format!("key: PARSE FAILED {e}"));
+            return out;
+        }
+    };
+
+    let tls = match crate::masque::build_tls_for_test(Some(endpoint_pub_key_pem.to_string())) {
+        Ok(t) => {
+            out.push(format!("tls-config: alpn={:?}", t.alpn_protocols));
+            t
+        }
+        Err(e) => {
+            out.push(format!("tls-config: FAILED {e}"));
+            return out;
+        }
+    };
+
+    let host = endpoint_v4.trim_end_matches(":0");
+    let tcp = match tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::net::TcpStream::connect(format!("{host}:443")),
+    )
+    .await
+    {
+        Ok(Ok(s)) => {
+            out.push(format!("tcp: OK -> {host}:443"));
+            s
+        }
+        Ok(Err(e)) => {
+            out.push(format!("tcp: FAILED {e}"));
+            return out;
+        }
+        Err(_) => {
+            out.push("tcp: TIMEOUT".into());
+            return out;
+        }
+    };
+    tcp.set_nodelay(true).ok();
+
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(tls));
+    let sni_name = std::env::var("WARP_H2_SNI")
+        .unwrap_or_else(|_| crate::connectip::CONNECT_SNI.to_string());
+    let sni = match rustls::pki_types::ServerName::try_from(sni_name) {
+        Ok(s) => s,
+        Err(e) => {
+            out.push(format!("sni: INVALID {e}"));
+            return out;
+        }
+    };
+
+    let mut tls_stream =
+        match tokio::time::timeout(Duration::from_secs(20), connector.connect(sni, tcp)).await {
+            Ok(Ok(s)) => {
+                out.push("tls: OK (client cert accepted)".into());
+                s
+            }
+            Ok(Err(e)) => {
+                out.push(format!("tls: FAILED {e}"));
+                return out;
+            }
+            Err(_) => {
+                out.push("tls: TIMEOUT".into());
+                return out;
+            }
+        };
+
+    match tokio::time::timeout(
+        Duration::from_secs(15),
+        crate::connectip::h2_handshake(&mut tls_stream),
+    )
+    .await
+    {
+        Ok(Ok(())) => out.push("h2: handshake OK".into()),
+        Ok(Err(e)) => {
+            out.push(format!("h2: FAILED {e}"));
+            return out;
+        }
+        Err(_) => {
+            out.push("h2: TIMEOUT".into());
+            return out;
+        }
+    }
+
+    match crate::connectip::H2Tunnel::open(tls_stream, 1, "cloudflareaccess.com").await {
+        Ok(t) => out.push(format!("connect-ip: OK stream={}", t.stream_id())),
+        Err(e) => out.push(format!("connect-ip: FAILED {e}")),
+    }
+    out
+}
 #[cfg(test)]
 mod tests {
     use super::*;

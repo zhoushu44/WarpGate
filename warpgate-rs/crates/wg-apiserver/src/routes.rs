@@ -209,14 +209,68 @@ async fn handle_set_config(
     ok(json!({ "saved": true }))
 }
 
+/// `GET /api/stats`
+///
+/// Emits both vocabularies. The console reads `running_containers` and
+/// `total_instances`; API clients written against the Go version read
+/// `resident_count`/`instance_count`/`healthy_count`. Serving only one of them
+/// leaves half the dashboard showing zeros.
+/// `GET /api/stats`
+///
+/// Field names are dictated by `public/index.html`, which reads
+/// `running_containers`, `total_instances`, `available`, `in_use`,
+/// `unhealthy`, `unique_ips`, `dedicated` and `sessions`. Serving only the Go
+/// vocabulary left most of the dashboard at zero.
 async fn handle_stats(State(st): State<AppState>) -> axum::response::Response {
+    let all = st.mgr.all().await;
+    let total = all.len() as i64;
+
+    let mut running = 0i64;
+    let mut unhealthy = 0i64;
+    let mut dedicated = 0i64;
+    let mut ips = std::collections::HashSet::new();
+    for inst in &all {
+        if inst.is_running_now() {
+            running += 1;
+            let ip = inst.last_exit_ipv6.read().await.clone();
+            if ip.is_empty() {
+                // Running but never produced an exit address: the console's
+                // "unhealthy" bucket.
+                unhealthy += 1;
+            } else {
+                ips.insert(ip);
+            }
+        } else {
+            unhealthy += 1;
+        }
+        if inst.dedicated().await {
+            dedicated += 1;
+        }
+    }
+
+    let sessions = st.mgr.sticky_active().await as i64;
+
     ok(json!({
+        // console vocabulary
+        "running_containers": running,
+        "total_instances": total,
+        "available": running.saturating_sub(sessions),
+        "in_use": sessions,
+        "unhealthy": unhealthy,
+        "unique_ips": ips.len() as i64,
+        "dedicated": dedicated,
+        "sessions": sessions,
+        // API vocabulary
         "resident_count": st.cfg.resident_count,
-        "instance_count": st.mgr.count().await,
+        "instance_count": total,
         "healthy_count": st.mgr.healthy_count().await,
-        "sticky_sessions": st.mgr.sticky_active().await,
+        "sticky_sessions": sessions,
         "mode": "embedded",
         "transport": "masque",
+        // The header reads this: there is no sing-box in this build, and
+        // reporting "not installed" made the status light look broken.
+        "engine": "embedded-usque",
+        "engine_running": true,
     }))
 }
 
@@ -410,21 +464,47 @@ async fn handle_job(Path(id): Path<String>) -> axum::response::Response {
 }
 
 async fn handle_get_whitelist(State(st): State<AppState>) -> axum::response::Response {
-    ok(json!({ "whitelist": st.cfg.ip_whitelist }))
+    let list = st.cfg.ip_whitelist.clone();
+    ok(json!({ "ips": list, "whitelist": st.cfg.ip_whitelist, "client_ip": Value::Null }))
 }
 
+/// `POST /api/whitelist`
+///
+/// Three shapes are accepted because three callers exist:
+///
+/// * `{"add": "1.2.3.4"}` — the console's "add one" button
+/// * `{"remove": "1.2.3.4"}` — the console's chip ✕
+/// * `{"whitelist": [...]}` — replace the whole list (API clients)
 #[derive(Deserialize, Default)]
 struct WhitelistRequest {
     #[serde(default)]
     whitelist: Vec<String>,
+    #[serde(default)]
+    add: String,
+    #[serde(default)]
+    remove: String,
 }
 
 async fn handle_set_whitelist(
     State(st): State<AppState>,
     Json(req): Json<WhitelistRequest>,
 ) -> axum::response::Response {
-    match st.mgr.set_whitelist(&req.whitelist).await {
-        Ok(()) => ok(json!({ "whitelist": req.whitelist })),
+    let mut list = st.cfg.ip_whitelist.clone();
+
+    if !req.add.trim().is_empty() {
+        let v = req.add.trim().to_string();
+        if !list.iter().any(|x| x == &v) {
+            list.push(v);
+        }
+    } else if !req.remove.trim().is_empty() {
+        let v = req.remove.trim();
+        list.retain(|x| x != v);
+    } else {
+        list = req.whitelist;
+    }
+
+    match st.mgr.set_whitelist(&list).await {
+        Ok(()) => ok(json!({ "ips": list, "whitelist": list })),
         Err(e) => bad_request(format!("白名单无效: {}", e)),
     }
 }
@@ -595,7 +675,11 @@ async fn handle_acquire(
     Query(q): Query<AcquireQuery>,
 ) -> axum::response::Response {
     let sticky = !q.session_id.is_empty();
-    match st.mgr.acquire(sticky, &q.session_id).await {
+    let r = st.mgr.acquire(sticky, &q.session_id).await;
+    if r.is_ok() {
+        st.mgr.bump_usage(if sticky { "sticky" } else { "acquires" }).await;
+    }
+    match r {
         Ok(inst) => {
             let public_ip = st.mgr.public_ip().await;
             let meta = inst.meta().await;
@@ -629,6 +713,9 @@ async fn handle_release(
         return bad_request("missing session_id");
     }
     let found = st.mgr.release(&req.session_id).await;
+    if found {
+        st.mgr.bump_usage("releases").await;
+    }
     if !found {
         return business_error(codes::SESSION_NOT_FOUND, "会话不存在或已过期");
     }
@@ -673,8 +760,195 @@ async fn handle_rotate(
     }
 }
 
-async fn handle_usage() -> axum::response::Response {
-    ok(json!({ "total": 0, "per_instance": {} }))
+/// `GET /api/usage?days=N` — the overview page's data source.
+///
+/// The console expects `{days: [{date, acquires, sticky, releases, reports,
+/// rotates, binds, unbinds, total}]}`. Returning a bare `{total: 0}` left the
+/// chart and table blank, which reads as a broken page.
+async fn handle_usage(
+    State(st): State<AppState>,
+    Query(q): Query<UsageQuery>,
+) -> axum::response::Response {
+    let days = q.days.unwrap_or(30).clamp(1, 90);
+    let counters = st.mgr.usage_snapshot().await;
+
+    // One bucket per day, oldest first, ending today.
+    let mut out = Vec::with_capacity(days as usize);
+    for back in (0..days).rev() {
+        let date = utc_date_minus(back);
+        let c = counters.get(&date).cloned().unwrap_or_default();
+        let total = c.acquires + c.sticky + c.releases + c.reports + c.rotates + c.binds + c.unbinds;
+        out.push(json!({
+            "date": date,
+            "acquires": c.acquires,
+            "sticky": c.sticky,
+            "releases": c.releases,
+            "reports": c.reports,
+            "rotates": c.rotates,
+            "binds": c.binds,
+            "unbinds": c.unbinds,
+            "total": total,
+        }));
+    }
+
+    ok(json!({
+        "days": out,
+        // Live host metrics: the console has no other way to show whether the
+        // box is coping, and "is it healthy" is the first question an operator
+        // asks of a 500-instance pool.
+        "system": system_metrics(),
+    }))
+}
+
+#[derive(Deserialize, Default)]
+struct UsageQuery {
+    #[serde(default)]
+    days: Option<i64>,
+}
+
+/// `YYYY-MM-DD` for `days_ago` before today (UTC).
+fn utc_date_minus(days_ago: i64) -> String {
+    let secs = now_millis() / 1000 - days_ago * 86_400;
+    // Civil-from-days (Howard Hinnant's algorithm), so this needs no chrono.
+    let z = secs.div_euclid(86_400) + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// CPU, memory and network for the whole host.
+///
+/// Read from `/proc`, which is the only portable option here: the box has no
+/// python, no `free`-as-a-library, and adding a sysinfo crate for three numbers
+/// is not worth it.
+fn system_metrics() -> serde_json::Value {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    // CPU usage is a rate, so two samples are needed; the previous one is kept
+    // here and the first call reports 0.
+    static PREV: OnceLock<std::sync::Mutex<(u64, u64)>> = OnceLock::new();
+    static NET_PREV: OnceLock<std::sync::Mutex<(u64, u64, i64)>> = OnceLock::new();
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+
+    let read = |path: &str| std::fs::read_to_string(path).unwrap_or_default();
+
+    // ---- CPU
+    let stat = read("/proc/stat");
+    let (idle, total) = stat
+        .lines()
+        .find(|l| l.starts_with("cpu "))
+        .map(|l| {
+            let f: Vec<u64> = l
+                .split_whitespace()
+                .skip(1)
+                .filter_map(|x| x.parse().ok())
+                .collect();
+            let idle = f.get(3).copied().unwrap_or(0) + f.get(4).copied().unwrap_or(0);
+            (idle, f.iter().sum::<u64>())
+        })
+        .unwrap_or((0, 0));
+
+    let prev = PREV.get_or_init(|| std::sync::Mutex::new((idle, total)));
+    let cpu_pct = {
+        let mut p = prev.lock().unwrap_or_else(|e| e.into_inner());
+        let (pi, pt) = *p;
+        let di = idle.saturating_sub(pi);
+        let dt = total.saturating_sub(pt);
+        *p = (idle, total);
+        if dt == 0 {
+            0.0
+        } else {
+            ((dt.saturating_sub(di)) as f64 / dt as f64 * 1000.0).round() / 10.0
+        }
+    };
+    CALLS.fetch_add(1, Ordering::Relaxed);
+
+    // ---- memory
+    let meminfo = read("/proc/meminfo");
+    let get_kb = |key: &str| -> u64 {
+        meminfo
+            .lines()
+            .find(|l| l.starts_with(key))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    };
+    let mem_total_mb = get_kb("MemTotal:") / 1024;
+    let mem_avail_mb = get_kb("MemAvailable:") / 1024;
+    let mem_used_mb = mem_total_mb.saturating_sub(mem_avail_mb);
+    let mem_pct = if mem_total_mb > 0 {
+        (mem_used_mb as f64 / mem_total_mb as f64 * 1000.0).round() / 10.0
+    } else {
+        0.0
+    };
+
+    // ---- network (sum over physical interfaces, excluding loopback)
+    let mut rx: u64 = 0;
+    let mut tx: u64 = 0;
+    for line in read("/proc/net/dev").lines().skip(2) {
+        let Some((name, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if name == "lo" || name.starts_with("docker") || name.starts_with("veth") {
+            continue;
+        }
+        let f: Vec<u64> = rest
+            .split_whitespace()
+            .filter_map(|x| x.parse().ok())
+            .collect();
+        rx += f.first().copied().unwrap_or(0);
+        tx += f.get(8).copied().unwrap_or(0);
+    }
+
+    let now = now_millis();
+    let net_prev = NET_PREV.get_or_init(|| std::sync::Mutex::new((rx, tx, now)));
+    let (rx_rate, tx_rate) = {
+        let mut p = net_prev.lock().unwrap_or_else(|e| e.into_inner());
+        let (prx, ptx, pt) = *p;
+        let dt_ms = now.saturating_sub(pt).max(1);
+        let rx_rate = rx.saturating_sub(prx) as f64 * 1000.0 / dt_ms as f64;
+        let tx_rate = tx.saturating_sub(ptx) as f64 * 1000.0 / dt_ms as f64;
+        *p = (rx, tx, now);
+        (rx_rate, tx_rate)
+    };
+
+    // ---- load average
+    let load = read("/proc/loadavg");
+    let loads: Vec<f64> = load
+        .split_whitespace()
+        .take(3)
+        .filter_map(|x| x.parse().ok())
+        .collect();
+
+    json!({
+        "cpu_pct": cpu_pct,
+        "cpu_count": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+        "load1": loads.first().copied().unwrap_or(0.0),
+        "load5": loads.get(1).copied().unwrap_or(0.0),
+        "load15": loads.get(2).copied().unwrap_or(0.0),
+        "mem_total_mb": mem_total_mb,
+        "mem_used_mb": mem_used_mb,
+        "mem_avail_mb": mem_avail_mb,
+        "mem_pct": mem_pct,
+        "net_rx_bytes": rx,
+        "net_tx_bytes": tx,
+        "net_rx_bps": rx_rate.round() as u64,
+        "net_tx_bps": tx_rate.round() as u64,
+        "uptime_secs": read("/proc/uptime")
+            .split_whitespace()
+            .next()
+            .and_then(|x| x.parse::<f64>().ok())
+            .unwrap_or(0.0) as u64,
+    })
 }
 
 // ---------------------------------------------- cf reporting and dedicated IPs
@@ -724,6 +998,9 @@ async fn handle_report(
             + 1;
         if fails >= 2 {
             engine_restarted = st.mgr.restart_engine(inst.index).await.is_ok();
+            if engine_restarted {
+                st.mgr.bump_usage("rotates").await;
+            }
             inst.conn_fail_count.store(0, std::sync::atomic::Ordering::SeqCst);
         }
     } else {
@@ -742,6 +1019,7 @@ async fn handle_report(
         }
     }
 
+    st.mgr.bump_usage("reports").await;
     let checks = inst.cf_check_count.load(std::sync::atomic::Ordering::SeqCst);
     let blocked = inst.cf_403_count.load(std::sync::atomic::Ordering::SeqCst);
     let rate = if checks > 0 { blocked * 100 / checks } else { 0 };
@@ -773,7 +1051,7 @@ async fn handle_dedicated_list(State(st): State<AppState>) -> axum::response::Re
             "bound_at": meta.dedicated_at,
         }));
     }
-    ok(json!(out))
+    ok(json!({ "items": out }))
 }
 
 /// `GET /api/pool/dedicated/history` — the bind log.
@@ -798,7 +1076,7 @@ async fn handle_dedicated_history(State(st): State<AppState>) -> axum::response:
         }));
     }
     out.sort_by_key(|v| v["bound_at"].as_i64().unwrap_or(0));
-    ok(json!(out))
+    ok(json!({ "items": out }))
 }
 
 #[derive(Deserialize, Default)]

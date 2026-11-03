@@ -232,7 +232,7 @@ impl ServerCertVerifier for PinningVerifier {
 /// `subject_public_key.data` is the BIT STRING contents — the point itself. That
 /// is what the pinning comparison looks at, because two DER encodings of the
 /// same key can differ while the point is identical.
-fn ec_point_of(spki: &x509_parser::x509::SubjectPublicKeyInfo<'_>) -> Vec<u8> {
+pub fn ec_point_of(spki: &x509_parser::x509::SubjectPublicKeyInfo<'_>) -> Vec<u8> {
     spki.subject_public_key.data.to_vec()
 }
 
@@ -441,10 +441,125 @@ pub fn build_h2_tls_config(
     signing: &SigningKey,
     pinned_endpoint_pem: Option<&str>,
 ) -> Result<rustls::ClientConfig, String> {
-    let cfg = build_tls_config(signing, pinned_endpoint_pem)?;
+    // The HTTP/2 CONNECT-IP endpoint wants ALPN `h2` and a client certificate
+    // whose CN is *its* SNI (`consumer-masque.cloudflareclient.com`). The QUIC
+    // path uses a different SNI, so reusing its certificate here gets the
+    // handshake reset — Cloudflare answers with a TCP RST and no TLS alert,
+    // which is why this looked like a network problem for so long.
+    let cert_der = self_signed_der_for(signing, crate::connectip::CONNECT_SNI)?;
+    let cert_chain = vec![CertificateDer::from(cert_der)];
+
+    let pkcs8_bytes = signing
+        .to_pkcs8_der()
+        .map_err(|e| format!("导出私钥失败: {e}"))?
+        .as_bytes()
+        .to_vec();
+    let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8_bytes));
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier: Arc<dyn ServerCertVerifier> = match pinned_endpoint_pem {
+        Some(pem) if !pem.trim().is_empty() => {
+            let der = pem_to_spki_der(pem)?;
+            Arc::new(PinningVerifier {
+                pinned_spki_der: der,
+            })
+        }
+        _ => Arc::new(AnyCertVerifier),
+    };
+
+    let cfg = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_auth_cert(cert_chain, private_key)
+        .map_err(|e| format!("客户端证书失败: {e}"))?;
+
     let mut cfg = cfg;
     cfg.alpn_protocols = vec![b"h2".to_vec()];
     Ok(cfg)
+}
+
+/// TLS config for bisection: same client certificate, optional pinning.
+///
+/// Lets a diagnostic tell a pinning failure apart from a client-certificate
+/// rejection, which both surface as opaque TLS errors.
+pub fn build_tls_for_test(pinned_pem: Option<String>) -> Result<rustls::ClientConfig, String> {
+    let mut cfg = build_h2_tls_config_for_test_inner(pinned_pem.as_deref())?;
+    cfg.alpn_protocols = vec![b"h2".to_vec()];
+    Ok(cfg)
+}
+
+fn build_h2_tls_config_for_test_inner(
+    pinned: Option<&str>,
+) -> Result<rustls::ClientConfig, String> {
+    // Reuse the production path, but with a signing key generated here so the
+    // caller does not have to thread one through.
+    let mut seed = [0u8; 32];
+    getrandom::getrandom(&mut seed).map_err(|e| e.to_string())?;
+    let signing = SigningKey::from_bytes(&seed.into()).map_err(|e| e.to_string())?;
+    let cert_der = self_signed_der_for(&signing, crate::connectip::CONNECT_SNI)?;
+    let cert_chain = vec![CertificateDer::from(cert_der)];
+    let pkcs8 = signing
+        .to_pkcs8_der()
+        .map_err(|e| e.to_string())?
+        .as_bytes()
+        .to_vec();
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8));
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier: Arc<dyn ServerCertVerifier> = match pinned {
+        Some(pem) if !pem.trim().is_empty() => {
+            let der = pem_to_spki_der(pem)?;
+            Arc::new(PinningVerifier {
+                pinned_spki_der: der,
+            })
+        }
+        _ => Arc::new(AnyCertVerifier),
+    };
+    rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_auth_cert(cert_chain, key)
+        .map_err(|e| e.to_string())
+}
+
+/// TLS config that accepts any server certificate.
+///
+/// Diagnostic only: it lets a probe reach the HTTP/2 layer so the peer's real
+/// key can be recorded, which is how a pinning mismatch is identified.
+pub fn build_h2_tls_config_no_pin_for_probe() -> Result<rustls::ClientConfig, String> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let cfg = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AnyCertVerifier))
+        .with_no_client_auth();
+    let mut cfg = cfg;
+    cfg.alpn_protocols = vec![b"h2".to_vec()];
+    Ok(cfg)
+}
+
+/// A self-signed certificate with an explicit CN.
+///
+/// The CN has to match the SNI of the endpoint being dialled; the QUIC and
+/// HTTP/2 endpoints use different names, so the certificate cannot be shared.
+fn self_signed_der_for(signing: &SigningKey, cn: &str) -> Result<Vec<u8>, String> {
+    use rcgen::{CertificateParams, KeyPair};
+    let pkcs8 = signing
+        .to_pkcs8_der()
+        .map_err(|e| format!("导出私钥失败: {e}"))?;
+    let kp = KeyPair::try_from(pkcs8.as_bytes()).map_err(|e| format!("密钥对失败: {e}"))?;
+    let mut params =
+        CertificateParams::new(vec![cn.to_string()]).map_err(|e| format!("证书参数失败: {e}"))?;
+    params.serial_number = Some(rcgen::SerialNumber::from(0u64));
+    let cert = params
+        .self_signed(&kp)
+        .map_err(|e| format!("自签证书失败: {e}"))?;
+    Ok(cert.der().to_vec())
 }
 
 // ---------------------------------------------------------------- the dialer
