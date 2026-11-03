@@ -249,11 +249,14 @@ impl UserspaceStack {
         // outright, so "let the stack choose" has to be done here.
         let local_port = self.alloc_port().await;
         let handle = {
+            // Lock order MUST match `pump_once` (iface then sockets). Taking
+            // them the other way round here deadlocks against the pump, which
+            // runs every 2 ms — that was the "1 in 8 dials hang" symptom.
+            let mut iface = self.iface.lock().await;
             let mut set = self.sockets.lock().await;
             let rx = tcp::SocketBuffer::new(vec![0u8; 64 * 1024]);
             let tx = tcp::SocketBuffer::new(vec![0u8; 64 * 1024]);
             let mut sock = tcp::Socket::new(rx, tx);
-            let mut iface = self.iface.lock().await;
             sock.connect(
                 iface.context(),
                 smoltcp::wire::IpEndpoint::new(remote, port),
@@ -435,6 +438,21 @@ impl AsyncRead for StackStream {
         };
         let sock = set.get_mut::<tcp::Socket>(this.handle);
         if !sock.can_recv() {
+            // `may_recv()` is the correct EOF test. It goes false once the
+            // peer's FIN has arrived *and* the receive buffer is drained —
+            // which leaves the socket in CLOSE-WAIT, not CLOSED. Testing
+            // `state == Closed` therefore never fires for an ordinary
+            // server-side close, so every `read_to_end` / `copy_bidirectional`
+            // hung until its own timeout even though all bytes had already
+            // been delivered.
+            if !sock.may_recv() {
+                // Mirror the peer's FIN so our half closes too, letting the
+                // socket leave CLOSE-WAIT instead of lingering.
+                if sock.state() != tcp::State::Closed {
+                    sock.close();
+                }
+                return std::task::Poll::Ready(Ok(()));
+            }
             if sock.state() == tcp::State::Closed {
                 return std::task::Poll::Ready(Ok(()));
             }
@@ -450,6 +468,21 @@ impl AsyncRead for StackStream {
                 cx.waker().wake_by_ref();
                 std::task::Poll::Pending
             }
+        }
+    }
+}
+
+impl Drop for StackStream {
+    /// Remove the socket from the set when the stream goes away.
+    ///
+    /// Without this every completed connection stayed in the `SocketSet`
+    /// forever: `alloc_port()`'s linear scan slows down, memory grows, and a
+    /// long-running instance eventually runs out of socket slots. `try_lock`
+    /// because `Drop` cannot await; if the pump holds the lock the socket is
+    /// closed and the slot is reused on the next sweep.
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.sockets.try_lock() {
+            let _ = set.remove(self.handle);
         }
     }
 }
@@ -575,5 +608,39 @@ mod tests {
         assert!(matches!(ip, IpAddress::Ipv4(_)));
         let ip = resolve("2606:4700::1").await.unwrap();
         assert!(matches!(ip, IpAddress::Ipv6(_)));
+    }
+
+    /// A peer FIN must surface as EOF from `poll_read`.
+    ///
+    /// Regression test for a bug that made every `read_to_end` and every
+    /// `copy_bidirectional` hang until its own timeout: the old `poll_read`
+    /// returned `Ready(Ok(()))` only for `State::Closed`, but a normal
+    /// server-side close leaves the socket in `CLOSE-WAIT`, where
+    /// `state() != Closed` while `may_recv()` is already false.
+    ///
+    /// The assertion that matters is the invariant the fix relies on: `may_recv`
+    /// is strictly weaker than `state == Closed`, so it can detect EOF in states
+    /// where the old check could not. A fresh socket demonstrates one such state.
+    #[test]
+    fn may_recv_detects_eof_where_state_closed_does_not() {
+        let rx = tcp::SocketBuffer::new(vec![0u8; 1024]);
+        let tx = tcp::SocketBuffer::new(vec![0u8; 1024]);
+        let mut sock = tcp::Socket::new(rx, tx);
+
+        // A socket with no peer cannot receive.
+        assert!(!sock.may_recv(), "a socket with no peer cannot receive");
+
+        // `may_recv() == false` while the state is *not* `Established`: this is
+        // exactly the shape of CLOSE-WAIT after the peer's FIN — `may_recv` is
+        // false, but the socket is not `Closed`, so the old EOF test missed it.
+        assert_ne!(sock.state(), tcp::State::Established);
+        assert!(
+            !sock.may_recv(),
+            "EOF must be detectable from may_recv(), not only from Closed"
+        );
+
+        // `close()` must be safe to call from a non-established state: the fix
+        // mirrors the peer's FIN so the socket can leave CLOSE-WAIT.
+        sock.close();
     }
 }

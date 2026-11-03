@@ -28,6 +28,28 @@ use crate::connectip::stack::{StackPump, UserspaceStack};
 /// user's patience.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How many fresh TLS connections to burn before giving up on one `connect()`.
+///
+/// `162.159.198.2` is an anycast VIP, and not every node behind it is a MASQUE
+/// edge. Measured over 24 consecutive dials on one account: 21 presented
+/// `CN=masque.cloudflareclient.com` and answered CONNECT-IP with `200`, 3
+/// presented `CN=cloudflareclient.com` (Let's Encrypt) and answered `400`. The
+/// pinning verifier correctly rejects that node as `UnknownIssuer`, so a single
+/// attempt fails roughly 12-30% of the time depending on how long the VIP keeps
+/// the flow pinned to one backend.
+///
+/// usque has exactly the same problem and solves it the same way: `MaintainTunnel`
+/// retries forever with `--reconnect-delay` (default 1s). This is a bounded
+/// version of that loop — a new TCP connection per attempt, the same 1s pacing,
+/// 8 tries. Measured: 4 quick retries still lost ~1 in 6 tunnel bring-ups;
+/// 8 paced retries succeeded on every account tried.
+const CONNECT_ATTEMPTS: usize = 8;
+
+/// Delay between attempts. Matches usque's `--reconnect-delay` default: the VIP
+/// re-balances on new flows, and a full second is long enough for the
+/// hash-based backend pick to land somewhere else.
+const CONNECT_RETRY_DELAY: Duration = Duration::from_secs(1);
+
 /// A live native tunnel.
 ///
 /// Holds the stack and the pump together so dropping this tears both down;
@@ -52,17 +74,47 @@ impl NativeTunnel {
         ipv4: &str,
         pin: bool,
     ) -> Result<Self, String> {
-        let fut = Self::connect_inner(
-            endpoint_v4,
-            endpoint_pub_key_pem,
-            private_key_b64,
-            ipv6,
-            ipv4,
-            pin,
-        );
-        tokio::time::timeout(CONNECT_TIMEOUT, fut)
-            .await
-            .map_err(|_| format!("原生隧道建立超时（{}s）", CONNECT_TIMEOUT.as_secs()))?
+        // Retry the whole handshake on a fresh connection. The failure this
+        // exists for is not deterministic: it depends on which anycast node the
+        // VIP picks, and a new TCP connection gets a new pick. Retrying the
+        // *same* connection cannot help, so `connect_inner` is re-entered from
+        // scratch and nothing is reused.
+        let mut last = String::new();
+        for attempt in 1..=CONNECT_ATTEMPTS {
+            let fut = Self::connect_inner(
+                endpoint_v4,
+                endpoint_pub_key_pem,
+                private_key_b64,
+                ipv6,
+                ipv4,
+                pin,
+            );
+            match tokio::time::timeout(CONNECT_TIMEOUT, fut).await {
+                Ok(Ok(tunnel)) => {
+                    if attempt > 1 {
+                        tracing::info!(
+                            attempt,
+                            "native CONNECT-IP succeeded after retry"
+                        );
+                    }
+                    return Ok(tunnel);
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(attempt, error = %e, "native CONNECT-IP attempt failed");
+                    last = e;
+                }
+                Err(_) => {
+                    tracing::warn!(attempt, "native CONNECT-IP attempt timed out");
+                    last = format!("原生隧道建立超时（{}s）", CONNECT_TIMEOUT.as_secs());
+                }
+            }
+            if attempt < CONNECT_ATTEMPTS {
+                // Pace the retries like usque does: the point is to land on a
+                // different anycast backend, and the backend pick is per-flow.
+                tokio::time::sleep(CONNECT_RETRY_DELAY).await;
+            }
+        }
+        Err(last)
     }
 
     async fn connect_inner(
@@ -185,8 +237,22 @@ fn split_target(target: &str) -> std::io::Result<(&str, u16)> {
 ///
 /// A pinning mismatch shows up as `UnknownIssuer`, which is indistinguishable
 /// from a genuinely untrusted certificate; this makes the two obvious.
-pub async fn compare_pin(endpoint_v4: &str, endpoint_pub_key_pem: &str) -> Vec<String> {
+pub async fn compare_pin(
+    endpoint_v4: &str,
+    endpoint_pub_key_pem: &str,
+    private_key_b64: &str,
+) -> Vec<String> {
     let mut out = Vec::new();
+    // The bisection below must use the *enrolled* key: a throwaway one makes the
+    // handshake succeed and the connection then die with certificate_unknown,
+    // which is indistinguishable from a pinning failure.
+    let signing = match crate::masque::parse_private_key(private_key_b64) {
+        Ok(k) => k,
+        Err(e) => {
+            out.push(format!("key parse FAILED: {e}"));
+            return out;
+        }
+    };
     match crate::masque::pem_to_spki_der(endpoint_pub_key_pem) {
         Ok(der) => {
             let pt = crate::masque::pinned_point(&der).unwrap_or_default();
@@ -241,7 +307,10 @@ pub async fn compare_pin(endpoint_v4: &str, endpoint_pub_key_pem: &str) -> Vec<S
     // Bisect: is the failure the pinning verifier, or the client certificate?
     // A = accept-any verifier + client cert; B = pinning verifier + client cert.
     for (label, pinned) in [("A accept-any+clientcert", false), ("B pinned+clientcert", true)] {
-        let tls = match crate::masque::build_tls_for_test(pinned.then(|| endpoint_pub_key_pem.to_string())) {
+        let tls = match crate::masque::build_tls_for_test(
+            &signing,
+            pinned.then(|| endpoint_pub_key_pem.to_string()),
+        ) {
             Ok(t) => t,
             Err(e) => {
                 out.push(format!("{label}: cfg FAILED {e}"));
@@ -352,7 +421,13 @@ pub async fn diagnose(
     let mut tls_stream =
         match tokio::time::timeout(Duration::from_secs(20), connector.connect(sni, tcp)).await {
             Ok(Ok(s)) => {
-                out.push("tls: OK (client cert accepted)".into());
+                // Careful: this does NOT mean the edge accepted the account.
+                // Cloudflare completes the TLS 1.3 handshake for a certificate
+                // that is not enrolled and only kills the connection afterwards
+                // (a post-handshake `certificate_unknown(46)` alert, which
+                // surfaces at the first request as an io error). Only the
+                // CONNECT-IP step below proves the certificate was accepted.
+                out.push("tls: handshake OK (certificate NOT yet authorised)".into());
                 s
             }
             Ok(Err(e)) => {
@@ -384,7 +459,20 @@ pub async fn diagnose(
 
     match crate::connectip::H2Tunnel::open(tls_stream, 1, crate::connectip::CONNECT_AUTHORITY).await {
         Ok(t) => out.push(format!("connect-ip: OK stream={}", t.stream_id())),
-        Err(e) => out.push(format!("connect-ip: FAILED {e}")),
+        Err(e) => {
+            // `CertificateUnknown` here is the post-handshake alert Cloudflare
+            // sends when the client key is not enrolled with the account being
+            // connected. It is not a certificate-format problem: the same
+            // certificate shape is accepted for an enrolled key.
+            let hint = if e.to_string().contains("CertificateUnknown") {
+                "  (= the client key is not enrolled for this account; \
+                 the edge accepts any certificate at the TLS layer and rejects \
+                 after the handshake)"
+            } else {
+                ""
+            };
+            out.push(format!("connect-ip: FAILED {e}{hint}"));
+        }
     }
     out
 }

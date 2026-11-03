@@ -26,6 +26,7 @@ async fn main() {
     for s in wg_tunnel::connectip::native::compare_pin(
         &get("endpoint_v4"),
         &get("endpoint_pub_key"),
+        &get("private_key"),
     )
     .await
     {

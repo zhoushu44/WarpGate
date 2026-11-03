@@ -167,6 +167,32 @@ impl PinningVerifier {
     }
 }
 
+/// Check a `CertificateVerify` signature against the peer's certificate.
+///
+/// Pinning only answers "is this the key I expect". It says nothing about
+/// whether the peer *owns* that key: the certificate is public, and the pinned
+/// SPKI is written in plaintext in every `usque.json`. Without this check an
+/// attacker who copies the certificate can present it, sign the handshake
+/// transcript with any key at all, and rustls will accept the connection —
+/// a full MITM of the tunnel.
+///
+/// `AnyCertVerifier` may keep asserting: it exists precisely to accept a peer
+/// whose identity cannot be established. `PinningVerifier` must not.
+fn verify_handshake_signature(
+    message: &[u8],
+    cert: &CertificateDer<'_>,
+    dss: &DigitallySignedStruct,
+    tls13: bool,
+) -> Result<HandshakeSignatureValid, rustls::Error> {
+    let provider = rustls::crypto::ring::default_provider();
+    let algs = &provider.signature_verification_algorithms;
+    if tls13 {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, algs)
+    } else {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, algs)
+    }
+}
+
 impl ServerCertVerifier for PinningVerifier {
     fn verify_server_cert(
         &self,
@@ -205,27 +231,28 @@ impl ServerCertVerifier for PinningVerifier {
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        verify_handshake_signature(message, cert, dss, false)
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        verify_handshake_signature(message, cert, dss, true)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        AnyCertVerifier.supported_verify_schemes()
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
-
 
 /// The raw EC point out of a parsed SubjectPublicKeyInfo.
 ///
@@ -398,6 +425,20 @@ pub fn self_signed_der(signing: &SigningKey) -> Result<Vec<u8>, String> {
 }
 
 /// Parse a PEM public key (or certificate) into SPKI DER bytes for pinning.
+/// PEM-armour a DER SPKI. Test-only helper.
+#[cfg(test)]
+fn spki_pem(spki_der: &[u8]) -> String {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(spki_der);
+    let mut out = String::from("-----BEGIN PUBLIC KEY-----\n");
+    for chunk in b64.as_bytes().chunks(64) {
+        out.push_str(&String::from_utf8_lossy(chunk));
+        out.push('\n');
+    }
+    out.push_str("-----END PUBLIC KEY-----\n");
+    out
+}
+
 pub fn pem_to_spki_der(pem: &str) -> Result<Vec<u8>, String> {
     let mut reader = std::io::BufReader::new(pem.as_bytes());
     let item = rustls_pemfile::read_one(&mut reader)
@@ -480,25 +521,32 @@ pub fn build_h2_tls_config(
     Ok(cfg)
 }
 
-/// TLS config for bisection: same client certificate, optional pinning.
+/// TLS config for bisection: the account's client certificate, optional pinning.
 ///
 /// Lets a diagnostic tell a pinning failure apart from a client-certificate
 /// rejection, which both surface as opaque TLS errors.
-pub fn build_tls_for_test(pinned_pem: Option<String>) -> Result<rustls::ClientConfig, String> {
-    let mut cfg = build_h2_tls_config_for_test_inner(pinned_pem.as_deref())?;
+///
+/// `signing` must be the account's enrolled key. A throwaway key here produces
+/// a handshake that succeeds and a connection that then dies with
+/// `certificate_unknown(46)` — see `build_h2_tls_config_for_test_inner`.
+pub fn build_tls_for_test(
+    signing: &SigningKey,
+    pinned_pem: Option<String>,
+) -> Result<rustls::ClientConfig, String> {
+    let mut cfg = build_h2_tls_config_for_test_inner(signing, pinned_pem.as_deref())?;
     cfg.alpn_protocols = vec![b"h2".to_vec()];
     Ok(cfg)
 }
 
 fn build_h2_tls_config_for_test_inner(
+    signing: &SigningKey,
     pinned: Option<&str>,
 ) -> Result<rustls::ClientConfig, String> {
-    // Reuse the production path, but with a signing key generated here so the
-    // caller does not have to thread one through.
-    let mut seed = [0u8; 32];
-    getrandom::getrandom(&mut seed).map_err(|e| e.to_string())?;
-    let signing = SigningKey::from_bytes(&seed.into()).map_err(|e| e.to_string())?;
-    let cert_der = self_signed_der_for(&signing, crate::connectip::CONNECT_SNI)?;
+    // The account's *enrolled* key. Generating a throwaway key here (an earlier
+    // version did) makes the TLS handshake succeed and then gets the connection
+    // killed with `certificate_unknown(46)`, because the edge checks enrollment
+    // after the handshake — which reads exactly like a certificate-format bug.
+    let cert_der = self_signed_der_for(signing, crate::connectip::CONNECT_SNI)?;
     let cert_chain = vec![CertificateDer::from(cert_der)];
     let pkcs8 = signing
         .to_pkcs8_der()
@@ -1059,5 +1107,96 @@ mod tests {
         assert!(pinned_point(&[0x01, 0x02, 0x03]).is_none());
         // A SEQUENCE that does not contain a BIT STRING.
         assert!(pinned_point(&[0x30, 0x03, 0x02, 0x01, 0x05]).is_none());
+    }
+
+    /// A pinned certificate is *public data*: the pinned SPKI is written in
+    /// plaintext in every `usque.json`. If `PinningVerifier` does not verify the
+    /// `CertificateVerify` signature, anyone can replay that certificate and
+    /// complete the handshake with a key they control — a full MITM.
+    ///
+    /// This runs the attack end to end: a server presents the pinned
+    /// certificate but signs the handshake with a *different* private key. A
+    /// correct verifier must refuse the connection.
+    #[tokio::test]
+    async fn pinning_verifier_rejects_a_forged_handshake_signature() {
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+        use rustls::sign::CertifiedKey;
+        use std::sync::Arc;
+
+        /// Serves one fixed certificate/key pair regardless of SNI.
+        #[derive(Debug)]
+        struct OneCert(Arc<CertifiedKey>);
+        impl rustls::server::ResolvesServerCert for OneCert {
+            fn resolve(
+                &self,
+                _hello: rustls::server::ClientHello<'_>,
+            ) -> Option<Arc<CertifiedKey>> {
+                Some(self.0.clone())
+            }
+        }
+
+        let pinned_key = parse_private_key(SAMPLE_KEY).unwrap();
+        // Same certificate (so pinning passes), but a different signing key.
+        let pinned_cert = self_signed_der(&pinned_key).unwrap();
+        let impostor = parse_private_key(
+            "MHcCAQEEIO6OjjpycMkS6rPX55WAi0EDnqx0NMQHvgaY29rTETmkoAoGCCqGSM49AwEHoUQDQgAEUGQ5C9p3T6eZl2O5MUb5nudcPgPLnnUXqWfyVwYrgqulhxJOFdLtP6jNO7zG+ONMwemwg3kuatvAIeX9icY7GA==",
+        )
+        .unwrap();
+        let impostor_pkcs8 = impostor.to_pkcs8_der().unwrap().as_bytes().to_vec();
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let signing_key = provider
+            .key_provider
+            .load_private_key(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(impostor_pkcs8)))
+            .unwrap();
+        let certified = CertifiedKey::new(vec![CertificateDer::from(pinned_cert)], signing_key);
+
+        let mut server_cfg = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(OneCert(Arc::new(certified))));
+        server_cfg.alpn_protocols = vec![b"h2".to_vec()];
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+        tokio::spawn(async move {
+            if let Ok((sock, _)) = listener.accept().await {
+                let _ = acceptor.accept(sock).await;
+            }
+        });
+
+        let client_cfg: rustls::ClientConfig =
+            build_h2_tls_config(&pinned_key, Some(&spki_pem(&public_key_spki_der(&pinned_key))))
+                .unwrap();
+        let sni = ServerName::try_from(crate::connectip::CONNECT_SNI.to_string()).unwrap();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio_rustls::TlsConnector::from(Arc::new(client_cfg)).connect(sni, tcp),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(_)) => panic!(
+                "handshake accepted a certificate whose key the peer does not own — \
+                 CertificateVerify is not being checked"
+            ),
+            Ok(Err(_)) | Err(_) => {}
+        }
+    }
+
+    /// The verifier's advertised schemes must be the provider's real ones;
+    /// advertising a scheme it cannot verify is a second way to weaken the
+    /// handshake.
+    #[test]
+    fn pinning_verifier_advertises_only_verifiable_schemes() {
+        use rustls::client::danger::ServerCertVerifier;
+        let key = parse_private_key(SAMPLE_KEY).unwrap();
+        let v = PinningVerifier::new(public_key_spki_der(&key));
+        let schemes = v.supported_verify_schemes();
+        assert!(!schemes.is_empty());
+        assert!(schemes.contains(&SignatureScheme::ECDSA_NISTP256_SHA256));
     }
 }

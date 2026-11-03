@@ -1037,9 +1037,48 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
         Ok(())
     }
 
+    /// Probe one instance's exit addresses, if it has a live tunnel.
+    async fn probe_one(&self, idx: i64) {
+        let Some(inst) = self.get(idx).await else {
+            return;
+        };
+        let Some(dial) = inst.dial_now() else {
+            return;
+        };
+        let timeout = std::time::Duration::from_secs(12);
+        let v6 = {
+            let url = self.cfg.ip_check_url_v6.trim();
+            if url.is_empty() {
+                String::new()
+            } else {
+                wg_tunnel::probe_exit(&dial, url, timeout).await.0
+            }
+        };
+        let v4 = {
+            let url = self.cfg.ip_check_url.trim();
+            if url.is_empty() {
+                String::new()
+            } else {
+                wg_tunnel::probe_exit(&dial, url, timeout).await.1
+            }
+        };
+        if !v6.is_empty() {
+            *inst.last_exit_ipv6.write().await = v6;
+        }
+        if !v4.is_empty() {
+            *inst.last_exit_ipv4.write().await = v4;
+        }
+    }
+
     /// Start a stopped instance (warm path).
+    ///
+    /// Probes right after start: otherwise a restarted instance keeps its
+    /// stale (often empty) exit address and looks unhealthy forever, which
+    /// made `start` appear to do nothing.
     pub async fn start_instance(&self, idx: i64) -> Result<()> {
-        self.start_existing(idx).await
+        self.start_existing(idx).await?;
+        self.probe_one(idx).await;
+        Ok(())
     }
 
     /// Delete an instance: stop it and remove the directory.
