@@ -495,7 +495,7 @@ impl AsyncRead for StackStream {
         let mut set = match this.sockets.try_lock() {
             Ok(g) => g,
             Err(_) => {
-                cx.waker().wake_by_ref();
+                this.shared.register(cx.waker());
                 return std::task::Poll::Pending;
             }
         };
@@ -519,7 +519,7 @@ impl AsyncRead for StackStream {
             if sock.state() == tcp::State::Closed {
                 return std::task::Poll::Ready(Ok(()));
             }
-            cx.waker().wake_by_ref();
+            this.shared.register(cx.waker());
             return std::task::Poll::Pending;
         }
         match sock.recv_slice(buf.initialize_unfilled()) {
@@ -528,7 +528,7 @@ impl AsyncRead for StackStream {
                 std::task::Poll::Ready(Ok(()))
             }
             Err(_) => {
-                cx.waker().wake_by_ref();
+                this.shared.register(cx.waker());
                 std::task::Poll::Pending
             }
         }

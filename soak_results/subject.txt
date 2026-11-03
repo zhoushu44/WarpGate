@@ -1,0 +1,11 @@
+=== soak subject ===
+start 2026-11-04 04:45:09 CST
+nativecheck_md5 f401d8f94673c1fd90a36928b91dffb2
+nativepress_md5 00bbebd80db66810892a950b5433b724
+stack_rs_md5 dd882e030c6cb2bcf8f67a4612473ce2
+stack_rs_lines 655
+drop_fix 1
+lockorder_fix 1
+host ser543725161893.local
+kernel 3.10.0-957.1.3.el7.x86_64
+nproc 16
