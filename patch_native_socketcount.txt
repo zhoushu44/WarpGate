@@ -1,0 +1,17 @@
+--- a/crates/wg-tunnel/src/connectip/native.rs
++++ b/crates/wg-tunnel/src/connectip/native.rs
+@@
+     /// The dial function for the SOCKS5 layer.
+     pub fn dial_fn(self: &Arc<Self>) -> crate::DialFn {
+@@
+     }
++
++    /// Number of TCP sockets currently held by this tunnel's smoltcp socket set.
++    ///
++    /// Diagnostic only, used by the stress harness to detect socket leaks that
++    /// `/proc/<pid>/fd` cannot see (smoltcp sockets are heap state, not fds).
++    pub async fn socket_count(&self) -> usize {
++        self.stack.socket_count().await
++    }
+ }
+*** End Patch

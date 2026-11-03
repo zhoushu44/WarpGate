@@ -1,0 +1,19 @@
+--- a/crates/wg-tunnel/src/connectip/stack.rs
++++ b/crates/wg-tunnel/src/connectip/stack.rs
+@@
+     /// Whether the interface has an address of the given family.
+     async fn has_family(&self, want_v6: bool) -> bool {
+@@
+     }
++
++    /// Number of TCP sockets currently held in the socket set.
++    ///
++    /// Diagnostic only: a socket that is never removed keeps its 128 KiB of
++    /// buffers alive for the life of the tunnel, which `/proc/<pid>/fd` cannot
++    /// show because none of it is a file descriptor.
++    pub async fn socket_count(&self) -> usize {
++        self.sockets.lock().await.iter().count()
++    }
+ 
+     /// Open a TCP connection to `host:port` and return it as a byte stream.
+     pub async fn connect(&self, host: &str, port: u16) -> io::Result<AnyStream> {

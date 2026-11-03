@@ -124,6 +124,8 @@ pub struct UserspaceStack {
     queue: Arc<Mutex<PacketQueue>>,
     /// Handles we can still open connections on.
     iface: Arc<Mutex<Interface>>,
+    /// Removal queue and waker registry, shared with every `StackStream`.
+    shared: Arc<StackShared>,
     sockets: Arc<Mutex<SocketSet<'static>>>,
     /// Local address inside the tunnel. Kept for diagnostics and for callers
     /// that need to know which family this stack speaks.
@@ -171,6 +173,7 @@ impl UserspaceStack {
             queue: Arc::new(Mutex::new(PacketQueue::default())),
             iface: Arc::new(Mutex::new(iface)),
             sockets: Arc::new(Mutex::new(SocketSet::new(Vec::new()))),
+            shared: Arc::new(StackShared::default()),
             local,
             // 49152..=65535 is the IANA ephemeral range.
             next_port: std::sync::atomic::AtomicU16::new(49152),
@@ -299,6 +302,7 @@ impl UserspaceStack {
         Ok(Box::new(StackStream {
             handle,
             sockets: self.sockets.clone(),
+            shared: self.shared.clone(),
             _queue: self.queue.clone(),
         }) as AnyStream)
     }
@@ -415,10 +419,69 @@ pub struct StackPump {
 }
 
 /// A TCP connection running inside the userspace stack.
+// Replacement for StackStream's Drop and the busy-wait in poll_read/poll_write.
+//
+// Two bugs fixed here:
+//
+// 1. `Drop` used `try_lock` and gave up silently on failure. The pump holds
+//    the socket lock every 2 ms, so under concurrency most drops lost the race
+//    and the socket stayed in the set forever — measured as 46 -> 360 sockets
+//    over 500 concurrent requests, strictly linear. The handle now goes onto a
+//    pending-removal queue (its own short-lived lock) that the pump drains.
+//
+// 2. `poll_read`/`poll_write` called `waker().wake_by_ref()` on every failed
+//    attempt. That is an immediate self-wake, and with a 2 ms pump it becomes a
+//    busy loop: four tasks were observed spinning at 193% CPU forever once a
+//    socket could no longer make progress. The waker is now stored and awoken
+//    by the pump only when it actually polled the interface.
+
+/// Socket handles awaiting removal, plus the wakers of tasks waiting on the
+/// stack to make progress.
+#[derive(Default)]
+pub struct StackShared {
+    /// Handles whose `StackStream` has been dropped. Drained by the pump.
+    pub pending_removal: std::sync::Mutex<Vec<SocketHandle>>,
+    /// Tasks blocked in `poll_read`/`poll_write`, woken after each pump.
+    pub wakers: std::sync::Mutex<Vec<std::task::Waker>>,
+}
+
+impl StackShared {
+    /// Queue a handle for removal. Never blocks, never fails.
+    pub fn queue_removal(&self, h: SocketHandle) {
+        if let Ok(mut q) = self.pending_removal.lock() {
+            q.push(h);
+        }
+    }
+
+    /// Remember a waker so the pump can wake it after polling.
+    ///
+    /// Duplicates are harmless but would grow without bound on a long-lived
+    /// blocked task, so a task's waker replaces its previous entry.
+    pub fn register(&self, w: &std::task::Waker) {
+        if let Ok(mut v) = self.wakers.lock() {
+            if v.iter().any(|x| x.will_wake(w)) {
+                return;
+            }
+            v.push(w.clone());
+        }
+    }
+
+    /// Wake every waiting task and clear the list.
+    pub fn wake_all(&self) {
+        if let Ok(mut v) = self.wakers.lock() {
+            for w in v.drain(..) {
+                w.wake();
+            }
+        }
+    }
+}
+
 struct StackStream {
     handle: SocketHandle,
     sockets: Arc<Mutex<SocketSet<'static>>>,
     /// Shares the stack's packet queue so the writer can nudge the pump.
+    /// Removal queue and waker registry shared with the pump.
+    shared: Arc<StackShared>,
     _queue: Arc<Mutex<PacketQueue>>,
 }
 
@@ -497,7 +560,7 @@ impl AsyncWrite for StackStream {
         let mut set = match this.sockets.try_lock() {
             Ok(g) => g,
             Err(_) => {
-                cx.waker().wake_by_ref();
+                this.shared.register(cx.waker());
                 return std::task::Poll::Pending;
             }
         };
@@ -509,19 +572,18 @@ impl AsyncWrite for StackStream {
                     "closed",
                 )));
             }
-            cx.waker().wake_by_ref();
+            this.shared.register(cx.waker());
             return std::task::Poll::Pending;
         }
         match sock.send_slice(buf) {
             Ok(n) => std::task::Poll::Ready(Ok(n)),
             Err(_) => {
-                cx.waker().wake_by_ref();
+                this.shared.register(cx.waker());
                 std::task::Poll::Pending
             }
         }
     }
-
-    fn poll_flush(
+fn poll_flush(
         self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {

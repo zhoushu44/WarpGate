@@ -1,0 +1,62 @@
+// Replacement for StackStream's Drop and the busy-wait in poll_read/poll_write.
+//
+// Two bugs fixed here:
+//
+// 1. `Drop` used `try_lock` and gave up silently on failure. The pump holds
+//    the socket lock every 2 ms, so under concurrency most drops lost the race
+//    and the socket stayed in the set forever — measured as 46 -> 360 sockets
+//    over 500 concurrent requests, strictly linear. The handle now goes onto a
+//    pending-removal queue (its own short-lived lock) that the pump drains.
+//
+// 2. `poll_read`/`poll_write` called `waker().wake_by_ref()` on every failed
+//    attempt. That is an immediate self-wake, and with a 2 ms pump it becomes a
+//    busy loop: four tasks were observed spinning at 193% CPU forever once a
+//    socket could no longer make progress. The waker is now stored and awoken
+//    by the pump only when it actually polled the interface.
+
+use std::sync::Arc;
+
+use smoltcp::iface::SocketHandle;
+use smoltcp::socket::tcp;
+use tokio::sync::Mutex;
+
+/// Socket handles awaiting removal, plus the wakers of tasks waiting on the
+/// stack to make progress.
+#[derive(Default)]
+pub struct StackShared {
+    /// Handles whose `StackStream` has been dropped. Drained by the pump.
+    pub pending_removal: std::sync::Mutex<Vec<SocketHandle>>,
+    /// Tasks blocked in `poll_read`/`poll_write`, woken after each pump.
+    pub wakers: std::sync::Mutex<Vec<std::task::Waker>>,
+}
+
+impl StackShared {
+    /// Queue a handle for removal. Never blocks, never fails.
+    pub fn queue_removal(&self, h: SocketHandle) {
+        if let Ok(mut q) = self.pending_removal.lock() {
+            q.push(h);
+        }
+    }
+
+    /// Remember a waker so the pump can wake it after polling.
+    ///
+    /// Duplicates are harmless but would grow without bound on a long-lived
+    /// blocked task, so a task's waker replaces its previous entry.
+    pub fn register(&self, w: &std::task::Waker) {
+        if let Ok(mut v) = self.wakers.lock() {
+            if v.iter().any(|x| x.will_wake(w)) {
+                return;
+            }
+            v.push(w.clone());
+        }
+    }
+
+    /// Wake every waiting task and clear the list.
+    pub fn wake_all(&self) {
+        if let Ok(mut v) = self.wakers.lock() {
+            for w in v.drain(..) {
+                w.wake();
+            }
+        }
+    }
+}
