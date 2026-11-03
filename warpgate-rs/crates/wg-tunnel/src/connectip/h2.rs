@@ -161,6 +161,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Tunnel<S> {
     /// Capsule framing (RFC 9297 §3.1): varint type, varint length, then the
     /// payload. Type 0 is the HTTP Datagram capsule, whose payload is the IP
     /// packet directly.
+    /// Split the tunnel into its raw stream, for a caller that drives packet
+    /// I/O itself (the userspace stack owns the framing loop).
+    pub fn into_stream(self) -> S {
+        self.io
+    }
+
     pub async fn send_packet(&mut self, packet: &[u8]) -> Result<(), ConnectIpError> {
         let capsule = encode_capsule(packet);
         let mut frame = Vec::with_capacity(9 + capsule.len());

@@ -13,6 +13,7 @@
 //!   deciding whether to invest in a userspace network stack.
 
 pub mod h2;
+pub mod stack;
 pub mod probe;
 pub use h2::Tunnel as H2Tunnel;
 pub use h2::handshake as h2_handshake;

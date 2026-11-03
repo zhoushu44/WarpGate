@@ -337,6 +337,16 @@ impl ExternalEngine {
         cmd.kill_on_drop(false);
 
         cmd.env("RUST_LOG", "warn");
+        // Go's GC is lazy by default: it lets the heap grow to 2x live before
+        // collecting, so each usque idles at ~9 MB even though its live set is
+        // ~1 MB. With 100 instances that is the difference between ~900 MB and
+        // ~350 MB. `GOGC=40` collects at 1.4x instead of 2x; `GOMEMLIMIT` is the
+        // backstop that keeps a burst from running away.
+        //
+        // These are advisory: a usque built without them still runs, it just
+        // uses the old amount.
+        cmd.env("GOGC", "40");
+        cmd.env("GOMEMLIMIT", "16MiB");
         // Keep the child's output: usque logs the reason a tunnel failed, and
         // with stdio nulled a startup failure is invisible.
         cmd.stdout(std::process::Stdio::piped());
