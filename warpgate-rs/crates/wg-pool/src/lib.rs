@@ -513,11 +513,14 @@ impl Manager {
                 .map_err(|e| PoolError::InstanceError(idx, format!("私钥非法: {e}")))?
         };
         let private_b64 = {
-            use p256::pkcs8::EncodePrivateKey;
-            let der = signing
-                .to_pkcs8_der()
+            // SEC1 DER: what usque writes, and what `parse_private_key`
+            // reads back. PKCS#8 would work here but not in usque, so the
+            // same account could not be handed to the engine.
+            let secret = p256::SecretKey::from(&signing);
+            let der = secret
+                .to_sec1_der()
                 .map_err(|e| PoolError::InstanceError(idx, format!("导出私钥失败: {e}")))?;
-            base64_encode(der.as_bytes())
+            base64_encode(&der)
         };
         let spki = wg_tunnel::masque::public_key_spki_der(&signing);
         let pubkey_b64 = base64_encode(&spki);
@@ -661,6 +664,33 @@ impl Manager {
             .get(&idx)
             .cloned()
             .ok_or(PoolError::NotFound(idx))?;
+
+        // HTTP/2 CONNECT-IP is the path this deployment can actually use: UDP
+        // 443 to Cloudflare is blocked here, which is why the Node version runs
+        // `usque --http2`. `WARP_NATIVE=quic` forces the QUIC dialer instead.
+        let mode = std::env::var("WARP_NATIVE").unwrap_or_else(|_| "h2".to_string());
+        if mode != "quic" {
+            let ucfg = inst.tunnel.config().clone();
+            let native = wg_tunnel::connectip::NativeTunnel::connect(
+                &ucfg.endpoint_v4,
+                &ucfg.endpoint_pub_key,
+                &ucfg.private_key,
+                &ucfg.ipv6,
+                &ucfg.ipv4,
+                true,
+            )
+            .await
+            .map_err(|e| {
+                PoolError::Tunnel(format!("warp-{} 原生 CONNECT-IP 失败: {}", idx, e))
+            })?;
+            let native = std::sync::Arc::new(native);
+            let dial = native.dial_fn();
+            // Park the tunnel on the instance so it lives as long as the
+            // listeners do; dropping it would tear down the HTTP/2 stream.
+            inst.tunnel.set_native(native);
+            return self.attach_dial(idx, dial).await;
+        }
+
 
         let dialer = wg_tunnel::masque::MasqueDialer::new(
             inst.tunnel.config().clone(),
@@ -1545,7 +1575,12 @@ mod tests {
 
         // A short timeout keeps the test fast; the dialer's own timeout is 10s,
         // so wrap it.
+        // This test pins the *QUIC* failure semantics. The native HTTP/2 path
+        // is the default now, so force the QUIC dialer to keep the assertion
+        // meaningful.
+        std::env::set_var("WARP_NATIVE", "quic");
         let res = tokio::time::timeout(Duration::from_secs(15), m.attach_masque(0)).await;
+        std::env::remove_var("WARP_NATIVE");
         assert!(res.is_ok(), "attach_masque must not hang forever");
         let err = res.unwrap();
         assert!(err.is_err(), "an unreachable endpoint must fail");

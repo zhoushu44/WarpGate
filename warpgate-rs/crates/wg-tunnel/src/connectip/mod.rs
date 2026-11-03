@@ -13,10 +13,12 @@
 //!   deciding whether to invest in a userspace network stack.
 
 pub mod h2;
+pub mod native;
 pub mod stack;
 pub mod probe;
 pub use h2::Tunnel as H2Tunnel;
 pub use h2::handshake as h2_handshake;
+pub use native::NativeTunnel;
 pub use probe::probe as probe_connect_ip;
 
 /// SNI for the HTTP/2 CONNECT-IP endpoint (usque `ConnectSNI`).

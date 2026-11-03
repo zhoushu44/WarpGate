@@ -107,6 +107,11 @@ pub struct Tunnel {
     dial: std::sync::Mutex<Option<DialFn>>,
     status: std::sync::atomic::AtomicU8,
     started_at: std::sync::Mutex<Option<std::time::Instant>>,
+    /// The in-process CONNECT-IP tunnel, when the native path is in use.
+    ///
+    /// Holding it here ties its lifetime to the instance: `stop()` drops it,
+    /// which closes the HTTP/2 stream and the userspace stack's sockets.
+    native: std::sync::Mutex<Option<std::sync::Arc<crate::connectip::NativeTunnel>>>,
 }
 
 // Status as a u8 so it can live in an atomic.
@@ -143,11 +148,21 @@ impl Tunnel {
             dial: std::sync::Mutex::new(None),
             status: std::sync::atomic::AtomicU8::new(S_STARTING),
             started_at: std::sync::Mutex::new(None),
+            native: std::sync::Mutex::new(None),
         }
     }
 
     pub fn config(&self) -> &UsqueConfig {
         &self.cfg
+    }
+
+
+    /// Take ownership of the native tunnel for this instance.
+    ///
+    /// Parking it here ties its lifetime to `stop()`: dropping the instance
+    /// closes the HTTP/2 stream and the userspace stack with it.
+    pub fn set_native(&self, t: std::sync::Arc<crate::connectip::NativeTunnel>) {
+        *self.native.lock().unwrap() = Some(t);
     }
 
     pub fn options(&self) -> &Options {
