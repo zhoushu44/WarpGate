@@ -60,7 +60,34 @@ async fn main() -> ExitCode {
     // networks that block UDP 443.
     let engine_binary = std::env::var("WARP_USQUE_BIN")
         .unwrap_or_else(|_| "/usr/local/bin/usque".to_string());
-    let use_engine = cfg.masque_http2 || std::env::var("WARP_FORCE_ENGINE").is_ok();
+
+    // `WARP_NATIVE` selects the data plane explicitly:
+    //
+    //   h2   — native CONNECT-IP over TCP 443 (needs no child process)
+    //   quic — native QUIC/UDP 443
+    //   *    — the usque subprocess (the historical behaviour)
+    //
+    // It takes precedence over `masque_http2`: that flag describes the
+    // *transport shape* (TCP vs UDP), and both shapes now have native
+    // implementations, so the flag alone can no longer imply "use usque".
+    // `WARP_NATIVE` selects the data plane explicitly:
+    //
+    //   h2    -- native CONNECT-IP over TCP 443 (no child process)
+    //   quic  -- the usque subprocess, which on this host is the only working
+    //            path: UDP 443 to Cloudflare is blocked, so a native QUIC
+    //            client can never complete a handshake here.
+    //   unset -- historical default (`masque_http2` / WARP_FORCE_ENGINE)
+    let native_mode = std::env::var("WARP_NATIVE").unwrap_or_default();
+    let native_h2 = native_mode == "h2";
+    let use_engine = if native_h2 {
+        false
+    } else if native_mode == "quic" {
+        // Deliberately the engine, not the native QUIC dialer: this flag names
+        // the transport shape the *engine* should use, and UDP is unusable here.
+        true
+    } else {
+        cfg.masque_http2 || std::env::var("WARP_FORCE_ENGINE").is_ok()
+    };
     if use_engine {
         if !std::path::Path::new(&engine_binary).exists() {
             eprintln!(
@@ -71,7 +98,11 @@ async fn main() -> ExitCode {
         }
         tracing::info!(target: "BOOT", "数据面: usque 外部引擎 ({})，http2={}", engine_binary, cfg.masque_http2);
     } else {
-        tracing::info!(target: "BOOT", "数据面: Rust 原生 MASQUE（QUIC/UDP）");
+        if native_h2 {
+            tracing::info!(target: "BOOT", "数据面: Rust 原生 CONNECT-IP（HTTP/2 over TCP 443）");
+        } else {
+            tracing::info!(target: "BOOT", "数据面: Rust 原生 MASQUE（QUIC/UDP）");
+        }
     }
 
     let base = cfg.instances_dir_resolved(args.instances.as_deref().unwrap_or(""));
