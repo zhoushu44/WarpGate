@@ -279,6 +279,21 @@ pub struct Tunnel<S> {
     peer_max_frame: u32,
     /// Bytes reassembled from DATA frames but not yet decoded into capsules.
     recv_buf: Vec<u8>,
+    /// Raw bytes read from `io` but not yet parsed into a whole frame.
+    ///
+    /// `recv_packet()` is polled under a short timeout by the stack's reader
+    /// task. `read_exact` is NOT cancel-safe: dropping it mid-frame discards
+    /// the bytes it already consumed and desynchronises the frame parser
+    /// permanently, which is what killed tunnels after a while. Everything is
+    /// therefore read with `read` (cancel-safe) into this buffer, and the
+    /// parser only ever consumes *complete* frames from it.
+    raw: Vec<u8>,
+    /// Header of a frame whose payload has not been read yet.
+    ///
+    /// Without this, cancelling between "header consumed" and "payload
+    /// consumed" would make the payload be parsed as the next header — the same
+    /// desynchronisation, just moved one frame later.
+    pending_header: Option<FrameHeader>,
     /// Whether the peer granted SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 8441).
     ///
     /// Recorded for diagnostics only: this edge never sends it, and the tunnel
@@ -317,6 +332,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Tunnel<S> {
             connection_window: CONNECTION_WINDOW,
             peer_max_frame: DEFAULT_MAX_FRAME_SIZE,
             recv_buf: Vec::with_capacity(8 * 1024),
+            raw: Vec::with_capacity(16 * 1024),
+            pending_header: None,
             peer_enable_connect_protocol: false,
         };
         tunnel.read_response().await?;
@@ -404,13 +421,44 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Tunnel<S> {
         }
     }
 
+    /// Read from `io` until `raw` holds at least `want` bytes.
+    ///
+    /// Uses `AsyncReadExt::read`, which is **cancel-safe**: bytes that were
+    /// copied into `raw` before a cancellation stay there. `read_exact` is not
+    /// — a dropped `read_exact` loses whatever it already consumed, so the next
+    /// call resumes at a frame boundary that no longer exists. The stack's
+    /// reader task polls `recv_packet()` under a 20 ms timeout, so this was hit
+    /// constantly: the parser desynchronised, the tunnel went silent, and all
+    /// 500 instances showed up as "connect-ip ok, stack up" followed by zero
+    /// ESTAB. Keeping the partial bytes here makes an interrupted read
+    /// resumable.
+    async fn fill_raw(&mut self, want: usize) -> Result<(), ConnectIpError> {
+        let mut tmp = [0u8; 8192];
+        while self.raw.len() < want {
+            let n = self
+                .io
+                .read(&mut tmp)
+                .await
+                .map_err(ConnectIpError::Io)?;
+            if n == 0 {
+                return Err(ConnectIpError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "peer closed the tunnel",
+                )));
+            }
+            self.raw.extend_from_slice(&tmp[..n]);
+        }
+        Ok(())
+    }
+
     async fn read_frame_header(&mut self) -> Result<FrameHeader, ConnectIpError> {
-        let mut buf = [0u8; 9];
-        self.io
-            .read_exact(&mut buf)
-            .await
-            .map_err(ConnectIpError::Io)?;
-        let length = u32::from_be_bytes([0, buf[0], buf[1], buf[2]]);
+        // A header whose payload has not been consumed yet is returned again:
+        // the previous poll was cancelled between the two halves of the frame.
+        if let Some(h) = self.pending_header {
+            return Ok(h);
+        }
+        self.fill_raw(9).await?;
+        let length = u32::from_be_bytes([0, self.raw[0], self.raw[1], self.raw[2]]);
         // RFC 9113 §4.2: a frame larger than SETTINGS_MAX_FRAME_SIZE is a
         // connection error. The peer knows our limit, so enforce it.
         if length > DEFAULT_MAX_FRAME_SIZE {
@@ -419,22 +467,33 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Tunnel<S> {
                 format!("frame of {length} bytes exceeds SETTINGS_MAX_FRAME_SIZE"),
             )));
         }
-        Ok(FrameHeader {
+        let header = FrameHeader {
             length,
-            frame_type: buf[3],
-            flags: buf[4],
+            frame_type: self.raw[3],
+            flags: self.raw[4],
             // The top bit is reserved and MUST be ignored (RFC 9113 §4.1).
-            stream_id: u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]) & 0x7fff_ffff,
-        })
+            stream_id: u32::from_be_bytes([self.raw[5], self.raw[6], self.raw[7], self.raw[8]])
+                & 0x7fff_ffff,
+        };
+        self.raw.drain(..9);
+        // Remember it until the payload is consumed: a cancellation in between
+        // (the caller polls this future under a timeout) must not make the
+        // payload look like the next frame header.
+        self.pending_header = Some(header);
+        Ok(header)
     }
 
     async fn read_payload(&mut self, len: u32) -> Result<Vec<u8>, ConnectIpError> {
-        let mut buf = vec![0u8; len as usize];
-        self.io
-            .read_exact(&mut buf)
-            .await
-            .map_err(ConnectIpError::Io)?;
-        Ok(buf)
+        // Only the frame whose header was just read may be consumed.
+        match self.pending_header {
+            Some(h) if h.length == len => {}
+            _ => return Err(ConnectIpError::UnexpectedFrame(0)),
+        }
+        self.fill_raw(len as usize).await?;
+        let rest = self.raw.split_off(len as usize);
+        let payload = std::mem::replace(&mut self.raw, rest);
+        self.pending_header = None;
+        Ok(payload)
     }
 
     async fn send_settings_ack(&mut self) -> Result<(), ConnectIpError> {
@@ -539,6 +598,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Tunnel<S> {
     /// Send one IP packet, wrapped in a DATAGRAM capsule.
     pub async fn send_packet(&mut self, packet: &[u8]) -> Result<(), ConnectIpError> {
         let capsule = encode_capsule(packet);
+        if crate::connectip::trace::enabled() {
+            crate::connectip::trace::emit(format_args!(
+                "h2.send_packet len={} stream={} window(stream_sent={} conn={})",
+                packet.len(),
+                self.stream_id,
+                self.stream_sent,
+                self.connection_window
+            ));
+        }
         self.send_capsule_bytes(&capsule).await
     }
 
@@ -638,6 +706,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Tunnel<S> {
             // Try whatever is already buffered before touching the socket: a
             // single DATA frame can carry several capsules.
             if let Some(packet) = self.take_datagram()? {
+                if crate::connectip::trace::enabled() {
+                    crate::connectip::trace::emit(format_args!(
+                        "h2.recv_packet(buffered) len={}",
+                        packet.len()
+                    ));
+                }
                 return Ok(packet);
             }
             let header = self.read_frame_header().await?;
@@ -1137,6 +1211,7 @@ pub async fn handshake<S: AsyncWrite + Unpin>(io: &mut S) -> Result<(), ConnectI
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn preface_is_the_rfc_string() {
@@ -1360,5 +1435,100 @@ mod tests {
             }
             other => panic!("expected GoAway, got {other:?}"),
         }
+    }
+
+    // ------------------------------------------------- cancel-safety
+
+    /// A tunnel for tests, without a live HTTP/2 handshake.
+    fn test_tunnel<S>(io: S) -> Tunnel<S> {
+        Tunnel {
+            io,
+            stream_id: 1,
+            ready: true,
+            peer_initial_window: DEFAULT_INITIAL_WINDOW_SIZE,
+            stream_sent: 0,
+            connection_sent: 0,
+            connection_window: CONNECTION_WINDOW,
+            peer_max_frame: DEFAULT_MAX_FRAME_SIZE,
+            recv_buf: Vec::new(),
+            raw: Vec::new(),
+            pending_header: None,
+            peer_enable_connect_protocol: false,
+        }
+    }
+
+    /// `recv_packet()` must survive being cancelled mid-frame.
+    ///
+    /// This is the "500 tunnels die after a while" bug. The stack's reader task
+    /// calls `timeout(20ms, recv_packet())`; when the peer's DATA frame arrives
+    /// in pieces the timeout fires between two reads. The old code used
+    /// `read_exact`, which is not cancel-safe: the bytes already consumed were
+    /// lost, the next call parsed the middle of a payload as a frame header,
+    /// the bogus length tripped the SETTINGS_MAX_FRAME_SIZE check, and the
+    /// reader task exited — dropping the only handle on the TLS stream, so the
+    /// TCP connection disappeared from `ss` while the instance still reported
+    /// "connect-ip ok, stack up".
+    #[tokio::test]
+    async fn recv_packet_survives_cancellation_mid_payload() {
+        let (client, mut peer) = tokio::io::duplex(64 * 1024);
+        let mut t = test_tunnel(client);
+        let packet: Vec<u8> = (0..40u8).map(|i| i.wrapping_add(0x40)).collect();
+        let f = frame(FRAME_DATA, 0, 1, &encode_capsule(&packet));
+
+        // Header only, then the poll is cancelled.
+        peer.write_all(&f[..9]).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), t.recv_packet())
+                .await
+                .is_err(),
+            "a partial frame must make the poll wait, not fail"
+        );
+
+        // Payload arrives later: the packet must still decode intact.
+        peer.write_all(&f[9..]).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), t.recv_packet())
+            .await
+            .expect("must not hang")
+            .expect("must not error");
+        assert_eq!(got, packet, "a cancelled poll must not lose frame bytes");
+    }
+
+    /// The same, cancelled *inside* the 9-byte frame header.
+    #[tokio::test]
+    async fn recv_packet_survives_cancellation_mid_header() {
+        let (client, mut peer) = tokio::io::duplex(64 * 1024);
+        let mut t = test_tunnel(client);
+        let packet = vec![0x60u8; 100];
+        let f = frame(FRAME_DATA, 0, 1, &encode_capsule(&packet));
+
+        peer.write_all(&f[..5]).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), t.recv_packet())
+                .await
+                .is_err()
+        );
+        peer.write_all(&f[5..]).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), t.recv_packet())
+            .await
+            .expect("must not hang")
+            .expect("must not error");
+        assert_eq!(got, packet);
+    }
+
+    /// Two capsules in one DATA frame: the second must not be lost.
+    #[tokio::test]
+    async fn buffered_capsules_are_drained_one_at_a_time() {
+        let (client, mut peer) = tokio::io::duplex(64 * 1024);
+        let mut t = test_tunnel(client);
+        let a = vec![0x45u8; 20];
+        let b = vec![0x45u8; 30];
+        let mut body = encode_capsule(&a);
+        body.extend_from_slice(&encode_capsule(&b));
+        peer.write_all(&frame(FRAME_DATA, 0, 1, &body)).await.unwrap();
+
+        let first = t.recv_packet().await.unwrap();
+        let second = t.recv_packet().await.unwrap();
+        assert_eq!(first, a);
+        assert_eq!(second, b);
     }
 }

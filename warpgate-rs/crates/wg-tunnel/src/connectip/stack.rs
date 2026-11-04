@@ -42,6 +42,7 @@ use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp;
 use crate::connectip::h2::Tunnel;
+use crate::connectip::trace;
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpListenEndpoint};
 use tokio::sync::Mutex;
@@ -72,6 +73,11 @@ impl Device for TunnelDevice {
         // blocking. A miss just means "no packet yet", which is legal.
         let mut q = self.queue.try_lock().ok()?;
         let pkt = q.inbound.pop_front()?;
+        trace::emit(format_args!(
+            "device.receive len={} inbound_left={}",
+            pkt.len(),
+            q.inbound.len()
+        ));
         Some((RxBuf { buf: pkt }, TxBuf { queue: self.queue.clone() }))
     }
 
@@ -112,6 +118,11 @@ impl TxToken for TxBuf {
         let mut buf = vec![0u8; len];
         let out = f(&mut buf);
         if let Ok(mut q) = self.queue.try_lock() {
+            trace::emit(format_args!(
+                "device.transmit len={} outbound_queued={}",
+                buf.len(),
+                q.outbound.len() + 1
+            ));
             q.outbound.push(buf);
         }
         out
@@ -274,7 +285,23 @@ impl UserspaceStack {
 
         // Wait for the handshake before handing the stream back, so the caller
         // sees a connect failure instead of a stream that never carries bytes.
+        //
+        // `is_active()` is NOT the right test: smoltcp's `TcpSocket::is_active`
+        // is `!matches!(state, Closed | TimeWait | Listen)`, so it is already
+        // true in `SynSent` — i.e. immediately after `connect()`, before a
+        // single byte of the three-way handshake has been exchanged. Returning
+        // there handed the SOCKS relay a socket where `can_send()`/`can_recv()`
+        // are both false; the relay's first `poll_read` saw `may_recv()==false`
+        // and turned that into EOF, closing the client before it ever wrote.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        if trace::enabled() {
+            trace::emit(format_args!(
+                "connect: begin handle={:?} local_port={} remote={remote}:{port}",
+                handle, local_port
+            ));
+        }
+        let mut last_state: Option<String> = None;
+        let mut waited = 0u32;
         loop {
             if tokio::time::Instant::now() > deadline {
                 self.sockets.lock().await.remove(handle);
@@ -283,10 +310,46 @@ impl UserspaceStack {
             {
                 let mut set = self.sockets.lock().await;
                 let sock = set.get_mut::<tcp::Socket>(handle);
-                if sock.is_active() {
+                let state = sock.state();
+                let state_name = format!("{state:?}");
+                // Every iteration, not just on transitions: a state that never
+                // moves (SynSent forever) is exactly the failure being hunted.
+                trace::emit(format_args!(
+                    "connect: iter={} state={} is_active={} can_send={} can_recv={} may_send={} may_recv={} txq={} rxq={}",
+                    waited,
+                    state_name,
+                    sock.is_active(),
+                    sock.can_send(),
+                    sock.can_recv(),
+                    sock.may_send(),
+                    sock.may_recv(),
+                    sock.send_queue(),
+                    sock.recv_queue(),
+                ));
+                if last_state.as_deref() != Some(state_name.as_str()) {
+                    trace::emit(format_args!(
+                        "connect: STATE TRANSITION {} -> {} after {} polls",
+                        last_state.as_deref().unwrap_or("<new>"),
+                        state_name,
+                        waited,
+                    ));
+                    last_state = Some(state_name.clone());
+                }
+                // The handshake is done once the state has left the SYN
+                // states. `Established` is the normal case; `CloseWait` et al.
+                // are accepted because the peer may have closed between two
+                // polls — that is a live connection with a readable FIN, not a
+                // connect failure.
+                if handshake_done(state) {
+                    trace::emit(format_args!(
+                        "connect: returning with state={} can_send={} can_recv={}",
+                        state_name,
+                        sock.can_send(),
+                        sock.can_recv(),
+                    ));
                     break;
                 }
-                if sock.state() == tcp::State::Closed {
+                if state == tcp::State::Closed {
                     drop(set);
                     self.sockets.lock().await.remove(handle);
                     return Err(io::Error::new(
@@ -296,6 +359,7 @@ impl UserspaceStack {
                 }
             }
             self.pump_once().await;
+            waited += 1;
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
 
@@ -340,9 +404,18 @@ impl UserspaceStack {
                     if !batch.is_empty() {
                         let mut t = shared.lock().await;
                         for pkt in batch {
-                            if t.send_packet(&pkt).await.is_err() {
+                            if let Err(e) = t.send_packet(&pkt).await {
+                                // Losing the tunnel is not routine: log it, the
+                                // stack is now deaf in both directions and every
+                                // dial through this instance will fail.
+                                tracing::warn!(
+                                    error = %e,
+                                    len = pkt.len(),
+                                    "connect-ip send_packet failed; reader task exits"
+                                );
                                 return;
                             }
+                            trace::note_tx(pkt.len());
                         }
                     }
                 }
@@ -359,16 +432,33 @@ impl UserspaceStack {
                 };
                 match recv {
                     Ok(pkt) if !pkt.is_empty() => {
+                        trace::note_rx(pkt.len());
+                        trace::emit(format_args!(
+                            "tunnel.recv_packet len={} proto=0x{:02x}",
+                            pkt.len(),
+                            pkt.first().copied().unwrap_or(0)
+                        ));
                         let mut q = queue_rx.lock().await;
                         // Bound the backlog: a stalled stack must not grow
                         // without limit. Dropping packets is correct here —
                         // TCP retransmits.
                         if q.inbound.len() < 512 {
                             q.inbound.push_back(pkt);
+                        } else {
+                            trace::bump(&trace::RX_DROPPED, 1);
                         }
                     }
                     Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(1)).await,
-                    Err(_) => break,
+                    Err(e) => {
+                        // Same reasoning as for the write half: this is the
+                        // tunnel dying, and it otherwise looks like a silent
+                        // "0 bytes" from the SOCKS5 side.
+                        tracing::warn!(
+                            error = %e,
+                            "connect-ip recv_packet failed; reader task exits"
+                        );
+                        break;
+                    }
                 }
             }
         });
@@ -397,6 +487,7 @@ impl UserspaceStack {
     /// Process one round of the stack: move packets both ways.
     async fn pump_once(&self) {
         let now = SmolInstant::now();
+        trace::bump(&trace::PUMPS, 1);
         // Do NOT hold the queue lock across `poll`. `TunnelDevice::receive`
         // takes it (non-blocking) to pop an inbound packet, so holding it here
         // makes every `receive` return `None` and the stack never sees a
@@ -407,7 +498,44 @@ impl UserspaceStack {
         };
         let mut iface = self.iface.lock().await;
         let mut set = self.sockets.lock().await;
+        // Snapshot the queue depths and socket states around the poll: an
+        // inbound packet that is never consumed shows up as a non-zero
+        // `inbound` that does not move.
+        let (in_before, out_before) = match self.queue.try_lock() {
+            Ok(q) => (q.inbound.len(), q.outbound.len()),
+            Err(_) => (usize::MAX, usize::MAX),
+        };
+        let sockets_before: Vec<String> = if trace::enabled() {
+            set.iter()
+                .map(|(h, s)| match s {
+                    smoltcp::socket::Socket::Tcp(t) => format!(
+                        "h{:?}= {:?} txq={} rxq={}",
+                        h,
+                        t.state(),
+                        t.send_queue(),
+                        t.recv_queue()
+                    ),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let _ = iface.poll(now, &mut dev, &mut set);
+        let (in_after, out_after) = match self.queue.try_lock() {
+            Ok(q) => (q.inbound.len(), q.outbound.len()),
+            Err(_) => (usize::MAX, usize::MAX),
+        };
+        if trace::enabled() {
+            trace::emit(format_args!(
+                "pump#{} inbound {}->{} outbound {}->{} sockets=[{}]",
+                trace::PUMPS.load(std::sync::atomic::Ordering::Relaxed),
+                in_before,
+                in_after,
+                out_before,
+                out_after,
+                sockets_before.join(", ")
+            ));
+        }
 
         // Reclaim sockets whose stream was dropped. The pump already holds
         // the lock, so Drop never has to win a race for it.
@@ -506,6 +634,42 @@ struct StackStream {
     _queue: Arc<Mutex<PacketQueue>>,
 }
 
+/// Whether a `connect()` in progress has finished its three-way handshake.
+///
+/// `is_active()` cannot be used for this: smoltcp defines it as
+/// `!matches!(state, Closed | TimeWait | Listen)`, so `SynSent` — the state
+/// `TcpSocket::connect` sets synchronously — already counts as "active".
+fn handshake_done(state: tcp::State) -> bool {
+    matches!(
+        state,
+        tcp::State::Established
+            | tcp::State::FinWait1
+            | tcp::State::FinWait2
+            | tcp::State::CloseWait
+            | tcp::State::Closing
+            | tcp::State::LastAck
+    )
+}
+
+/// Whether `may_recv() == false` in this state really means "the peer closed".
+///
+/// `may_recv()` is false in `SynSent`/`SynRecv` too, where nothing has been
+/// received yet. Reporting EOF there is what let the SOCKS relay close a
+/// brand-new connection with 0 bytes: `copy_bidirectional` treats `Ok(0)` as a
+/// clean endpoint and stops, so the client saw EOF instead of an error.
+fn recv_finished(state: tcp::State) -> bool {
+    matches!(
+        state,
+        tcp::State::Closed
+            | tcp::State::CloseWait
+            | tcp::State::LastAck
+            | tcp::State::TimeWait
+            | tcp::State::Closing
+            | tcp::State::FinWait1
+            | tcp::State::FinWait2
+    )
+}
+
 impl AsyncRead for StackStream {
     fn poll_read(
         self: std::pin::Pin<&mut Self>,
@@ -521,6 +685,15 @@ impl AsyncRead for StackStream {
             }
         };
         let sock = set.get_mut::<tcp::Socket>(this.handle);
+        trace::emit(format_args!(
+            "poll_read: ENTER handle={:?} state={:?} can_recv={} may_recv={} rxq={} want={}",
+            this.handle,
+            sock.state(),
+            sock.can_recv(),
+            sock.may_recv(),
+            sock.recv_queue(),
+            buf.remaining(),
+        ));
         if !sock.can_recv() {
             // `may_recv()` is the correct EOF test. It goes false once the
             // peer's FIN has arrived *and* the receive buffer is drained —
@@ -530,25 +703,57 @@ impl AsyncRead for StackStream {
             // hung until its own timeout even though all bytes had already
             // been delivered.
             if !sock.may_recv() {
-                // Mirror the peer's FIN so our half closes too, letting the
-                // socket leave CLOSE-WAIT instead of lingering.
-                if sock.state() != tcp::State::Closed {
-                    sock.close();
+                // `may_recv()` also goes false in `SynSent`/`SynRecv`, where
+                // there is nothing to read yet — turning that into `Ok(0)`
+                // told the relay "clean EOF" on a connection that had not even
+                // finished its handshake. Only report EOF once the socket is
+                // really finished; otherwise wait for the pump.
+                if recv_finished(sock.state()) {
+                    trace::bump(&trace::READ_EOFS, 1);
+                    trace::emit(format_args!(
+                        "poll_read: EOF at handle={:?} state={:?} may_recv={} rxq={}",
+                        this.handle,
+                        sock.state(),
+                        sock.may_recv(),
+                        sock.recv_queue()
+                    ));
+                    // Mirror the peer's FIN so our half closes too, letting the
+                    // socket leave CLOSE-WAIT instead of lingering.
+                    if sock.state() != tcp::State::Closed {
+                        sock.close();
+                    }
+                    return std::task::Poll::Ready(Ok(()));
                 }
-                return std::task::Poll::Ready(Ok(()));
+                trace::bump(&trace::READ_WAITS, 1);
+                trace::emit(format_args!(
+                    "poll_read: waiting for handshake handle={:?} state={:?} rxq={}",
+                    this.handle,
+                    sock.state(),
+                    sock.recv_queue()
+                ));
+                this.shared.register(cx.waker());
+                return std::task::Poll::Pending;
             }
             if sock.state() == tcp::State::Closed {
                 return std::task::Poll::Ready(Ok(()));
             }
+            trace::bump(&trace::READ_WAITS, 1);
             this.shared.register(cx.waker());
             return std::task::Poll::Pending;
         }
         match sock.recv_slice(buf.initialize_unfilled()) {
             Ok(n) => {
+                trace::note_recv(n);
+                trace::emit(format_args!(
+                    "poll_read: recv_slice -> Ok({n}) state={:?} rxq_left={}",
+                    sock.state(),
+                    sock.recv_queue()
+                ));
                 buf.advance(n);
                 std::task::Poll::Ready(Ok(()))
             }
-            Err(_) => {
+            Err(e) => {
+                trace::emit(format_args!("poll_read: recv_slice err={e:?}"));
                 this.shared.register(cx.waker());
                 std::task::Poll::Pending
             }
@@ -584,19 +789,57 @@ impl AsyncWrite for StackStream {
             }
         };
         let sock = set.get_mut::<tcp::Socket>(this.handle);
+        trace::emit(format_args!(
+            "poll_write: ENTER handle={:?} state={:?} want={} can_send={} may_send={} txq={} txspace={}",
+            this.handle,
+            sock.state(),
+            buf.len(),
+            sock.can_send(),
+            sock.may_send(),
+            sock.send_queue(),
+            sock.send_capacity().saturating_sub(sock.send_queue()),
+        ));
         if !sock.can_send() {
             if sock.state() == tcp::State::Closed {
+                trace::emit(format_args!(
+                    "poll_write: state=Closed -> BrokenPipe ({} bytes discarded)",
+                    buf.len()
+                ));
                 return std::task::Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "closed",
                 )));
             }
+            trace::bump(&trace::WRITE_WAITS, 1);
+            trace::emit(format_args!(
+                "poll_write: not sendable handle={:?} state={:?} may_send={} txq={} can_send={}",
+                this.handle,
+                sock.state(),
+                sock.may_send(),
+                sock.send_queue(),
+                sock.can_send()
+            ));
             this.shared.register(cx.waker());
             return std::task::Poll::Pending;
         }
         match sock.send_slice(buf) {
-            Ok(n) => std::task::Poll::Ready(Ok(n)),
-            Err(_) => {
+            Ok(n) => {
+                trace::note_send(n);
+                // `Ok(n)` only means "copied into the socket's tx buffer"; the
+                // packet is emitted on a later `Interface::poll`.
+                trace::emit(format_args!(
+                    "poll_write: send_slice({}) -> Ok({n}) state={:?} txq={} (buffered)",
+                    buf.len(),
+                    sock.state(),
+                    sock.send_queue()
+                ));
+                std::task::Poll::Ready(Ok(n))
+            }
+            Err(e) => {
+                trace::emit(format_args!(
+                    "poll_write: send_slice({}) -> Err({e:?}) -> Pending",
+                    buf.len()
+                ));
                 this.shared.register(cx.waker());
                 std::task::Poll::Pending
             }
@@ -723,6 +966,58 @@ mod tests {
         // `close()` must be safe to call from a non-established state: the fix
         // mirrors the peer's FIN so the socket can leave CLOSE-WAIT.
         sock.close();
+    }
+
+    /// `is_active()` is true in `SynSent`, so it cannot gate "handshake done".
+    ///
+    /// This is the regression that made every SOCKS5 request return 0 bytes:
+    /// `connect()` broke out of its wait loop immediately (state `SynSent`),
+    /// `poll_read` then saw `may_recv() == false` and reported EOF, and the
+    /// relay closed the client before a single byte was written.
+    #[tokio::test]
+    async fn syn_sent_is_active_but_not_connected() {
+        let stack = UserspaceStack::new(IpAddress::v4(172, 16, 0, 2));
+        let handle = {
+            let mut iface = stack.iface.lock().await;
+            let mut set = stack.sockets.lock().await;
+            let rx = tcp::SocketBuffer::new(vec![0u8; 1024]);
+            let tx = tcp::SocketBuffer::new(vec![0u8; 1024]);
+            let mut sock = tcp::Socket::new(rx, tx);
+            sock.connect(
+                iface.context(),
+                smoltcp::wire::IpEndpoint::new(IpAddress::v4(1, 2, 3, 4), 80),
+                IpListenEndpoint { addr: None, port: 40000 },
+            )
+            .unwrap();
+            assert_eq!(sock.state(), tcp::State::SynSent);
+            // The trap, asserted explicitly: the old predicate is already true.
+            assert!(sock.is_active(), "is_active() is true in SynSent");
+            // ...but the connection is not usable, which is why the predicate
+            // below had to change.
+            assert!(!sock.can_send());
+            assert!(!sock.can_recv());
+            assert!(!handshake_done(sock.state()), "SynSent is not a handshake");
+            assert!(!recv_finished(sock.state()), "SynSent is not EOF");
+            set.add(sock)
+        };
+        stack.sockets.lock().await.remove(handle);
+    }
+
+    #[test]
+    fn handshake_predicate_covers_the_real_states() {
+        assert!(handshake_done(tcp::State::Established));
+        // A peer that closed while we waited still gave us a usable stream.
+        assert!(handshake_done(tcp::State::CloseWait));
+        for not_yet in [tcp::State::Closed, tcp::State::SynSent, tcp::State::SynReceived, tcp::State::Listen] {
+            assert!(!handshake_done(not_yet), "{not_yet:?} must not count as connected");
+        }
+        // EOF is only real once the peer's FIN (or a reset) has been seen.
+        for not_eof in [tcp::State::SynSent, tcp::State::SynReceived, tcp::State::Established, tcp::State::Listen] {
+            assert!(!recv_finished(not_eof), "{not_eof:?} must not be reported as EOF");
+        }
+        for eof in [tcp::State::CloseWait, tcp::State::Closed, tcp::State::TimeWait, tcp::State::LastAck] {
+            assert!(recv_finished(eof), "{eof:?} is a finished receive half");
+        }
     }
 }
 
