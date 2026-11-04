@@ -63,7 +63,36 @@ async fn sample(tag: &str, n: usize, socks: usize) {
 }
 
 /// One request over one dial. Returns (ok, bytes, http_status, error, phase).
+///
+/// `req_timeout` bounds the WHOLE request, including the write. Production code
+/// has no such bound (`copy_bidirectional` writes without a deadline), which is
+/// exactly why a stuck `poll_write` wedges a task forever; the harness needs the
+/// relief valve to be able to run a 500-dial sweep at all.
 async fn one_request(
+    dial: &wg_tunnel::DialFn,
+    target: &str,
+    body: &[u8],
+    dial_timeout: Duration,
+    io_timeout: Duration,
+    req_timeout: Option<Duration>,
+) -> (bool, usize, String, String, &'static str) {
+    let fut = one_request_inner(dial, target, body, dial_timeout, io_timeout);
+    match req_timeout {
+        Some(t) => match tokio::time::timeout(t, fut).await {
+            Ok(v) => v,
+            Err(_) => (
+                false,
+                0,
+                String::new(),
+                format!("req_timeout_{}s", t.as_secs()),
+                "req",
+            ),
+        },
+        None => fut.await,
+    }
+}
+
+async fn one_request_inner(
     dial: &wg_tunnel::DialFn,
     target: &str,
     body: &[u8],
@@ -165,6 +194,10 @@ async fn main() {
             .and_then(|v| v.parse().ok())
             .unwrap_or(20u64),
     );
+    let req_timeout = arg(&args, "--req-timeout")
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .map(Duration::from_secs);
 
     let raw = std::fs::read_to_string(&config_path).expect("read usque.json");
     let v: serde_json::Value = serde_json::from_str(&raw).expect("json");
@@ -266,7 +299,7 @@ async fn main() {
                 let dial = dials[idx % dials.len()].clone();
                 let t = Instant::now();
                 let (ok, bytes, status, err, phase) =
-                    one_request(&dial, &target, &body, dial_timeout, io_timeout).await;
+                    one_request(&dial, &target, &body, dial_timeout, io_timeout, req_timeout).await;
                 let ms = t.elapsed().as_millis();
                 inflight.fetch_sub(1, Ordering::Relaxed);
                 if ok {
