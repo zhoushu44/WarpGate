@@ -112,6 +112,8 @@ pub struct Tunnel {
     /// Holding it here ties its lifetime to the instance: `stop()` drops it,
     /// which closes the HTTP/2 stream and the userspace stack's sockets.
     native: std::sync::Mutex<Option<std::sync::Arc<crate::connectip::NativeTunnel>>>,
+    /// The self-healing native tunnel, when that path is in use.
+    resilient: std::sync::Mutex<Option<std::sync::Arc<crate::connectip::ResilientTunnel>>>,
 }
 
 // Status as a u8 so it can live in an atomic.
@@ -149,6 +151,7 @@ impl Tunnel {
             status: std::sync::atomic::AtomicU8::new(S_STARTING),
             started_at: std::sync::Mutex::new(None),
             native: std::sync::Mutex::new(None),
+            resilient: std::sync::Mutex::new(None),
         }
     }
 
@@ -156,6 +159,11 @@ impl Tunnel {
         &self.cfg
     }
 
+
+    /// Take ownership of the resilient tunnel for this instance.
+    pub fn set_resilient(&self, t: std::sync::Arc<crate::connectip::ResilientTunnel>) {
+        *self.resilient.lock().unwrap_or_else(|e| e.into_inner()) = Some(t);
+    }
 
     /// Take ownership of the native tunnel for this instance.
     ///

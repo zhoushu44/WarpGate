@@ -15,12 +15,14 @@
 
 pub mod h2;
 pub mod native;
+pub mod resilient;
 pub mod stack;
 pub mod probe;
 pub mod trace;
 pub use h2::Tunnel as H2Tunnel;
 pub use h2::handshake as h2_handshake;
 pub use native::NativeTunnel;
+pub use resilient::ResilientTunnel;
 pub use probe::probe as probe_connect_ip;
 
 /// SNI for the HTTP/2 CONNECT-IP endpoint (usque `ConnectSNI`).

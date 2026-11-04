@@ -200,6 +200,19 @@ impl NativeTunnel {
     }
 
     /// The dial function for the SOCKS5 layer.
+    /// Open one TCP connection through this tunnel.
+    ///
+    /// Exposed so a wrapper (the resilient tunnel) can retry a single dial after
+    /// rebuilding, instead of going through `dial_fn` and losing the error type.
+    pub async fn stack_connect(&self, host: &str, port: u16) -> std::io::Result<crate::AnyStream> {
+        self.stack.connect(host, port).await
+    }
+
+    /// True once the underlying HTTP/2 stream has been reset by the server.
+    pub fn is_dead(&self) -> bool {
+        self.stack.is_dead()
+    }
+
     pub fn dial_fn(self: &Arc<Self>) -> crate::DialFn {
         let stack = self.stack.clone();
         Arc::new(move |target: String| {

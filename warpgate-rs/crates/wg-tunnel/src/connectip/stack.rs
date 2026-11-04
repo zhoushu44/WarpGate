@@ -153,6 +153,11 @@ pub struct UserspaceStack {
 }
 
 impl UserspaceStack {
+    /// Whether the underlying tunnel has failed.
+    pub fn is_dead(&self) -> bool {
+        self.shared.is_dead()
+    }
+
     /// Build a stack over `tunnel`, using `local` as our address.
     ///
     /// `local` is the address Cloudflare assigned to the account
@@ -391,6 +396,11 @@ impl UserspaceStack {
         let shared = Arc::new(Mutex::new(tunnel));
         let queue_rx = self.queue.clone();
 
+        // The reader owns the only signal that the tunnel died, so it needs the
+        // shared flag. Without this the stack keeps handing out a DialFn that
+        // can never carry bytes: the resilient wrapper never learns to rebuild.
+        let shared_state = self.shared.clone();
+
         let reader = tokio::spawn(async move {
             loop {
                 // Flush anything the stack produced. This has to happen in the
@@ -413,6 +423,7 @@ impl UserspaceStack {
                                     len = pkt.len(),
                                     "connect-ip send_packet failed; reader task exits"
                                 );
+                                shared_state.mark_dead();
                                 return;
                             }
                             trace::note_tx(pkt.len());
@@ -457,6 +468,7 @@ impl UserspaceStack {
                             error = %e,
                             "connect-ip recv_packet failed; reader task exits"
                         );
+                        shared_state.mark_dead();
                         break;
                     }
                 }
@@ -589,12 +601,27 @@ pub struct StackPump {
 #[derive(Default)]
 pub struct StackShared {
     /// Handles whose `StackStream` has been dropped. Drained by the pump.
+    /// Set once the tunnel is gone. Every dial then fails fast with a clear
+    /// reason instead of hanging or returning a fake EOF.
+    pub dead: std::sync::atomic::AtomicBool,
+    /// Handles whose `StackStream` has been dropped. Drained by the pump.
     pub pending_removal: std::sync::Mutex<Vec<SocketHandle>>,
     /// Tasks blocked in `poll_read`/`poll_write`, woken after each pump.
     pub wakers: std::sync::Mutex<Vec<std::task::Waker>>,
 }
 
 impl StackShared {
+    /// Record that the tunnel is unusable.
+    pub fn mark_dead(&self) {
+        self.dead.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.wake_all();
+    }
+
+    /// Whether the tunnel is unusable.
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Queue a handle for removal. Never blocks, never fails.
     pub fn queue_removal(&self, h: SocketHandle) {
         if let Ok(mut q) = self.pending_removal.lock() {

@@ -697,7 +697,10 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
         let mode = std::env::var("WARP_NATIVE").unwrap_or_else(|_| "h2".to_string());
         if mode != "quic" {
             let ucfg = inst.tunnel.config().clone();
-            let native = wg_tunnel::connectip::NativeTunnel::connect(
+            // Resilient wrapper: Cloudflare resets CONNECT-IP streams when many
+            // tunnels share one source IP, and the raw tunnel has no recovery
+            // path. This one rebuilds on failure and keeps the same DialFn.
+            let tunnel = wg_tunnel::connectip::ResilientTunnel::connect(
                 &ucfg.endpoint_v4,
                 &ucfg.endpoint_pub_key,
                 &ucfg.private_key,
@@ -709,11 +712,9 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
             .map_err(|e| {
                 PoolError::Tunnel(format!("warp-{} 原生 CONNECT-IP 失败: {}", idx, e))
             })?;
-            let native = std::sync::Arc::new(native);
-            let dial = native.dial_fn();
-            // Park the tunnel on the instance so it lives as long as the
-            // listeners do; dropping it would tear down the HTTP/2 stream.
-            inst.tunnel.set_native(native);
+            let tunnel = std::sync::Arc::new(tunnel);
+            let dial = tunnel.dial_fn();
+            inst.tunnel.set_resilient(tunnel);
             return self.attach_dial(idx, dial).await;
         }
 
