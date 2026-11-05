@@ -100,8 +100,12 @@ impl Instance {
     }
 
     pub fn is_healthy_now(&self) -> bool {
+        // `status_now` already returns a single status string, so comparing it
+        // against both RUNNING and UNHEALTHY was tautological: whenever the
+        // first test passed the second was trivially true. What actually
+        // matters is "running and not demoted by the probe loop".
         let s = self.status_now();
-        s == status::RUNNING && s != status::UNHEALTHY
+        s == status::RUNNING
     }
 
     pub async fn dedicated(&self) -> bool {
@@ -173,6 +177,9 @@ pub struct Manager {
     sem: Arc<tokio::sync::Semaphore>,
     /// Injectable create action, so tests can avoid the network.
     create_fn: RwLock<Option<CreateFn>>,
+    /// Rotating start offset for the health sweep, so a large pool is covered
+    /// evenly instead of always probing the lowest indexes.
+    probe_cursor: std::sync::atomic::AtomicUsize,
 }
 
 /// A create action: build an instance at `idx` without touching Cloudflare.
@@ -226,6 +233,7 @@ impl Manager {
             usage: RwLock::new(HashMap::new()),
             sem: Arc::new(tokio::sync::Semaphore::new(permits)),
             create_fn: RwLock::new(None),
+            probe_cursor: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -1056,14 +1064,29 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
         Ok(())
     }
 
-    /// Probe one instance's exit addresses, if it has a live tunnel.
-    async fn probe_one(&self, idx: i64) {
+    /// Probe one instance and act on the result.
+    ///
+    /// This used to write the exit address on success and do nothing at all on
+    /// failure. A tunnel whose engine had died therefore kept
+    /// `status == running` forever: the console reported 998 healthy instances
+    /// while only 32 distinct exit addresses actually existed, and clients got
+    /// SOCKS5 CONNECT requests that never received an ack.
+    ///
+    /// A failed probe now bumps the streak and demotes the instance, which is
+    /// what the scheduler and the repair loop look at.
+    ///
+    /// Returns true when the instance answered.
+    async fn probe_one(&self, idx: i64) -> bool {
         let Some(inst) = self.get(idx).await else {
-            return;
+            return false;
         };
+
+        // No dial means no tunnel at all: that is a failure, not a no-op.
         let Some(dial) = inst.dial_now() else {
-            return;
+            Self::mark_probe_failed(&inst).await;
+            return false;
         };
+
         let timeout = std::time::Duration::from_secs(12);
         let v6 = {
             let url = self.cfg.ip_check_url_v6.trim();
@@ -1081,11 +1104,46 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
                 wg_tunnel::probe_exit(&dial, url, timeout).await.1
             }
         };
+
+        // Either address answering proves the tunnel carries traffic: v6 is the
+        // per-account identity, v4 is the shared NAT pool.
+        if v6.is_empty() && v4.is_empty() {
+            Self::mark_probe_failed(&inst).await;
+            return false;
+        }
+
         if !v6.is_empty() {
             *inst.last_exit_ipv6.write().await = v6;
         }
         if !v4.is_empty() {
             *inst.last_exit_ipv4.write().await = v4;
+        }
+
+        inst.fail_streak.store(0, std::sync::atomic::Ordering::Relaxed);
+        inst.conn_fail_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        {
+            let mut m = inst.meta.write().await;
+            if m.status != status::RUNNING {
+                m.status = status::RUNNING.to_string();
+            }
+        }
+        true
+    }
+
+    /// Record a failed probe: bump the streak and demote the instance.
+    ///
+    /// Two consecutive misses are required before demoting, so one slow probe
+    /// against a temporarily busy endpoint does not take the instance out of
+    /// rotation.
+    async fn mark_probe_failed(inst: &Arc<Instance>) {
+        let n = inst
+            .fail_streak
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if n >= 2 {
+            let mut m = inst.meta.write().await;
+            m.status = status::UNHEALTHY.to_string();
         }
     }
 
@@ -1228,8 +1286,100 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
     /// Takes `Arc<Self>` because the loop needs a `'static` handle and the
     /// manager is deliberately not `Clone` (see the note below).
     pub fn start_loops(self: &Arc<Self>, cancel: tokio_util::sync::CancellationToken) {
-        let m = self.clone();
-        tokio::spawn(async move { m.cleanup_loop(cancel).await });
+        {
+            let m = self.clone();
+            let c = cancel.clone();
+            tokio::spawn(async move { m.cleanup_loop(c).await });
+        }
+        {
+            let m = self.clone();
+            let c = cancel.clone();
+            tokio::spawn(async move { m.health_loop(c).await });
+        }
+    }
+
+    /// Sweep the pool: probe every instance, and restart the engines of those
+    /// that stopped answering.
+    ///
+    /// Without this the pool had no way back from a dead tunnel. `usque` keeps
+    /// its SOCKS listener open after the MASQUE stream dies, so the port still
+    /// accepts TCP and then never acks CONNECT — clients hang until their own
+    /// timeout, while `status` stays `running`. Observed in production: 507
+    /// engines, 13,692 connections to Cloudflare, 9 of 10 sampled ports dead.
+    ///
+    /// `fail_streak` already existed but was never read; this loop is what gives
+    /// it meaning.
+    pub async fn health_loop(self: &Arc<Self>, cancel: tokio_util::sync::CancellationToken) {
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(self.cfg.health_check_interval.max(30) as u64));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        // Stagger probes so a 500-instance sweep does not open 500 tunnels to
+        // Cloudflare at the same instant.
+        let per_tick = self.cfg.health_probe_batch.max(1) as usize;
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = interval.tick() => {
+                    let idxs: Vec<i64> = {
+                        let map = self.instances.read().await;
+                        let mut v: Vec<i64> = map.keys().copied().collect();
+                        v.sort_unstable();
+                        v
+                    };
+                    if idxs.is_empty() {
+                        continue;
+                    }
+
+                    // Rotate the starting point each round so a large pool is
+                    // swept evenly instead of always probing the first N.
+                    let start = self.probe_cursor.fetch_add(per_tick, std::sync::atomic::Ordering::Relaxed)
+                        % idxs.len();
+
+                    let mut restarted = 0usize;
+                    for k in 0..per_tick.min(idxs.len()) {
+                        if cancel.is_cancelled() {
+                            return;
+                        }
+                        let idx = idxs[(start + k) % idxs.len()];
+                        let ok = self.probe_one(idx).await;
+                        if ok {
+                            continue;
+                        }
+
+                        let Some(inst) = self.get(idx).await else { continue };
+                        let streak = inst.fail_streak.load(std::sync::atomic::Ordering::Relaxed);
+
+                        // Restart after two consecutive misses: one miss is
+                        // routinely just an anycast node rotation.
+                        if streak >= 2 {
+                            tracing::warn!(
+                                index = idx,
+                                streak,
+                                "实例连续探测失败，重启引擎"
+                            );
+                            match self.restart_engine(idx).await {
+                                Ok(()) => {
+                                    restarted += 1;
+                                    inst.fail_streak
+                                        .store(0, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                Err(e) => tracing::warn!(
+                                    index = idx,
+                                    error = %e,
+                                    "重启引擎失败"
+                                ),
+                            }
+                        }
+                    }
+
+                    if restarted > 0 {
+                        tracing::info!(restarted, "健康巡检：本轮重启了实例引擎");
+                    }
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------- usage
@@ -1793,6 +1943,63 @@ mod tests {
         assert!(
             left <= Duration::from_secs(3 * 60) && left > Duration::from_secs(2 * 60),
             "expected the 3-minute default, got {left:?}"
+        );
+    }
+
+    /// A failed probe must demote the instance, not silently succeed.
+    ///
+    /// Regression: probe_one used to write the exit address on success and do
+    /// nothing on failure, so dead tunnels stayed `running` forever and the
+    /// console reported 998 healthy while only 32 exit addresses existed.
+    #[tokio::test]
+    async fn failed_probe_demotes_and_counts() {
+        let (m, _t) = pool_with(1).await;
+        let inst = m.get(0).await.unwrap();
+
+        // No dial installed: this is the "engine never came up" case.
+        assert!(!m.probe_one(0).await, "probe must report failure");
+        assert_eq!(
+            inst.fail_streak.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the streak must advance so the repair loop can see it"
+        );
+        assert_eq!(
+            inst.status_now(),
+            status::RUNNING,
+            "one miss is not enough to demote (anycast node rotation)"
+        );
+
+        // Second consecutive miss demotes.
+        assert!(!m.probe_one(0).await);
+        assert_eq!(
+            inst.status_now(),
+            status::UNHEALTHY,
+            "two consecutive misses must take the instance out of rotation"
+        );
+    }
+
+    /// `is_healthy_now` must not treat UNHEALTHY as healthy.
+    #[tokio::test]
+    async fn unhealthy_is_not_healthy() {
+        let (m, _t) = pool_with(1).await;
+        let inst = m.get(0).await.unwrap();
+        inst.set_status(status::UNHEALTHY).await;
+        assert!(!inst.is_healthy_now(), "UNHEALTHY must not count as healthy");
+        inst.set_status(status::RUNNING).await;
+        assert!(inst.is_healthy_now(), "RUNNING must count as healthy");
+    }
+
+    /// The health loop must be wired, or nothing ever reads fail_streak.
+    #[test]
+    fn health_loop_is_wired_into_start_loops() {
+        let src = include_str!("lib.rs");
+        let start = src.find("pub fn start_loops").expect("start_loops present");
+        let tail = &src[start..];
+        let end = tail.find("\n    }").unwrap_or(tail.len());
+        let body = &tail[..end];
+        assert!(
+            body.contains("health_loop"),
+            "start_loops must spawn health_loop, otherwise failed probes are never repaired"
         );
     }
 }

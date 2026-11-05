@@ -16,6 +16,10 @@ pub struct Config {
     pub sticky_minutes: i64,
     pub auto_rebuild_on_unhealthy: bool,
     pub health_check_interval: i64,
+    /// Instances probed per health-loop tick. Keeps a 500-instance sweep from
+    /// opening every tunnel at the same moment.
+    #[serde(default = "default_health_probe_batch")]
+    pub health_probe_batch: i64,
     pub bind_address: String,
     pub mode: String,
     pub base_port: i64,
@@ -131,6 +135,7 @@ impl Default for Config {
             sticky_minutes: 10,
             auto_rebuild_on_unhealthy: true,
             health_check_interval: 600,
+            health_probe_batch: 8,
             bind_address: "0.0.0.0".into(),
             mode: "resident".into(),
             base_port: 10010,
@@ -391,4 +396,8 @@ mod tests {
         let back: Config = serde_json::from_str(&json).unwrap();
         assert_eq!(c, back, "every key must survive a round trip");
     }
+}
+
+fn default_health_probe_batch() -> i64 {
+    8
 }
