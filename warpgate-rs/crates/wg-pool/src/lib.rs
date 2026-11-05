@@ -248,7 +248,19 @@ impl Manager {
     ///
     /// Copied from Go `Acquire` (manager.go L423-460), including the part that
     /// only `StatusRunning` instances are eligible.
-    pub async fn acquire(&self, sticky: bool, session_id: &str) -> Result<Arc<Instance>> {
+    /// Pick an instance for a session.
+    ///
+    /// `minutes` overrides the configured `sticky_minutes` for this one
+    /// session. The API has always documented that parameter and echoed it
+    /// back to callers, but it was never applied: a request asking for ten
+    /// minutes silently got the default three, so the address was reclaimed
+    /// while the caller was still using it.
+    pub async fn acquire(
+        &self,
+        sticky: bool,
+        session_id: &str,
+        minutes: Option<u32>,
+    ) -> Result<Arc<Instance>> {
         // Sticky hit: the same instance, if it is still running.
         if sticky && !session_id.is_empty() {
             let hit = {
@@ -291,8 +303,11 @@ impl Manager {
         drop(rr);
 
         if sticky && !session_id.is_empty() {
-            let expires = Instant::now()
-                + Duration::from_secs((self.cfg.sticky_minutes.max(0) as u64) * 60);
+            let mins = minutes
+                .map(|m| m as i64)
+                .unwrap_or(self.cfg.sticky_minutes)
+                .max(0) as u64;
+            let expires = Instant::now() + Duration::from_secs(mins * 60);
             self.sticky
                 .write()
                 .await
@@ -1437,10 +1452,10 @@ mod tests {
     #[tokio::test]
     async fn acquire_rotates_in_index_order() {
         let (m, _t) = pool_with(3).await;
-        let a = m.acquire(false, "").await.unwrap();
-        let b = m.acquire(false, "").await.unwrap();
-        let c = m.acquire(false, "").await.unwrap();
-        let d = m.acquire(false, "").await.unwrap();
+        let a = m.acquire(false, "", None).await.unwrap();
+        let b = m.acquire(false, "", None).await.unwrap();
+        let c = m.acquire(false, "", None).await.unwrap();
+        let d = m.acquire(false, "", None).await.unwrap();
         assert_eq!(
             (a.index, b.index, c.index, d.index),
             (0, 1, 2, 0),
@@ -1470,7 +1485,7 @@ mod tests {
         let picked: Vec<i64> = {
             let mut v = Vec::new();
             for _ in 0..6 {
-                v.push(m.acquire(false, "").await.unwrap().index);
+                v.push(m.acquire(false, "", None).await.unwrap().index);
             }
             v
         };
@@ -1485,16 +1500,16 @@ mod tests {
     async fn no_running_instance_is_an_error() {
         let tmp = tempfile::tempdir().unwrap();
         let m = Manager::new(cfg(), tmp.path().to_path_buf());
-        let err = m.acquire(false, "").await.unwrap_err();
+        let err = m.acquire(false, "", None).await.unwrap_err();
         assert!(matches!(err, PoolError::NoAvailableProxy));
     }
 
     #[tokio::test]
     async fn sticky_binds_one_session_to_one_instance() {
         let (m, _t) = pool_with(3).await;
-        let a = m.acquire(true, "sess-1").await.unwrap();
-        let b = m.acquire(true, "sess-1").await.unwrap();
-        let c = m.acquire(true, "sess-1").await.unwrap();
+        let a = m.acquire(true, "sess-1", None).await.unwrap();
+        let b = m.acquire(true, "sess-1", None).await.unwrap();
+        let c = m.acquire(true, "sess-1", None).await.unwrap();
         assert_eq!(a.index, b.index);
         assert_eq!(b.index, c.index, "a sticky session must not rotate");
     }
@@ -1502,15 +1517,15 @@ mod tests {
     #[tokio::test]
     async fn different_sessions_may_get_different_instances() {
         let (m, _t) = pool_with(3).await;
-        let a = m.acquire(true, "s1").await.unwrap();
-        let b = m.acquire(true, "s2").await.unwrap();
+        let a = m.acquire(true, "s1", None).await.unwrap();
+        let b = m.acquire(true, "s2", None).await.unwrap();
         assert_ne!(a.index, b.index);
     }
 
     #[tokio::test]
     async fn expired_sticky_falls_back_to_a_fresh_pick() {
         let (m, _t) = pool_with(3).await;
-        let first = m.acquire(true, "s").await.unwrap();
+        let first = m.acquire(true, "s", None).await.unwrap();
         // Force expiry.
         m.sticky.write().await.insert(
             "s".into(),
@@ -1519,7 +1534,7 @@ mod tests {
                 expires_at: Instant::now() - Duration::from_secs(1),
             },
         );
-        let second = m.acquire(true, "s").await.unwrap();
+        let second = m.acquire(true, "s", None).await.unwrap();
         assert_ne!(
             first.index, second.index,
             "an expired binding must not pin the session"
@@ -1529,16 +1544,16 @@ mod tests {
     #[tokio::test]
     async fn sticky_pointing_at_a_stopped_instance_is_ignored() {
         let (m, _t) = pool_with(3).await;
-        let first = m.acquire(true, "s").await.unwrap();
+        let first = m.acquire(true, "s", None).await.unwrap();
         m.stop_instance(first.index).await.unwrap();
-        let again = m.acquire(true, "s").await.unwrap();
+        let again = m.acquire(true, "s", None).await.unwrap();
         assert_ne!(first.index, again.index, "must skip the stopped instance");
     }
 
     #[tokio::test]
     async fn release_drops_the_binding() {
         let (m, _t) = pool_with(3).await;
-        m.acquire(true, "s").await.unwrap();
+        m.acquire(true, "s", None).await.unwrap();
         assert_eq!(m.sticky_active().await, 1);
         assert!(m.release("s").await);
         assert_eq!(m.sticky_active().await, 0);
@@ -1548,8 +1563,8 @@ mod tests {
     #[tokio::test]
     async fn cleanup_sweeps_expired_sessions() {
         let (m, _t) = pool_with(3).await;
-        m.acquire(true, "live").await.unwrap();
-        m.acquire(true, "dead").await.unwrap();
+        m.acquire(true, "live", None).await.unwrap();
+        m.acquire(true, "dead", None).await.unwrap();
         m.sticky.write().await.insert(
             "dead".into(),
             StickyEntry {
@@ -1682,7 +1697,7 @@ mod tests {
             "a failed QUIC handshake must mark the instance unhealthy"
         );
         // And an unhealthy instance is not schedulable.
-        assert!(m.acquire(false, "").await.is_err());
+        assert!(m.acquire(false, "", None).await.is_err());
     }
 
     #[tokio::test]
@@ -1743,6 +1758,39 @@ mod tests {
         let (m, _t) = pool_with(3).await;
         let all = m.all().await;
         assert_eq!(all.iter().map(|i| i.index).collect::<Vec<_>>(), vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn explicit_minutes_override_the_default_ttl() {
+        let (m, _tmp) = pool_with(1).await;
+        // Ask for 10 minutes while the default is 3.
+        m.acquire(true, "long", Some(10)).await.unwrap();
+        let map = m.sticky.read().await;
+        let left = map
+            .get("long")
+            .unwrap()
+            .expires_at
+            .saturating_duration_since(std::time::Instant::now());
+        assert!(
+            left > Duration::from_secs(9 * 60),
+            "asked for 10 minutes, got {left:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn omitted_minutes_falls_back_to_the_configured_ttl() {
+        let (m, _tmp) = pool_with(1).await;
+        m.acquire(true, "short", None).await.unwrap();
+        let map = m.sticky.read().await;
+        let left = map
+            .get("short")
+            .unwrap()
+            .expires_at
+            .saturating_duration_since(std::time::Instant::now());
+        assert!(
+            left <= Duration::from_secs(3 * 60) && left > Duration::from_secs(2 * 60),
+            "expected the 3-minute default, got {left:?}"
+        );
     }
 }
 

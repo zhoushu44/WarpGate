@@ -582,7 +582,7 @@ async fn handle_proxies(
     let mut picked = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for _ in 0..n {
-        match st.mgr.acquire(sticky, &q.sid).await {
+        match st.mgr.acquire(sticky, &q.sid, q.time).await {
             Ok(inst) => {
                 let meta = inst.meta().await;
                 // `ip4` mode dedups by exit IPv4; the embedded pool only tracks
@@ -675,7 +675,7 @@ async fn handle_acquire(
     Query(q): Query<AcquireQuery>,
 ) -> axum::response::Response {
     let sticky = !q.session_id.is_empty();
-    let r = st.mgr.acquire(sticky, &q.session_id).await;
+    let r = st.mgr.acquire(sticky, &q.session_id, q.time).await;
     if r.is_ok() {
         st.mgr.bump_usage(if sticky { "sticky" } else { "acquires" }).await;
     }
