@@ -97,6 +97,15 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
         tracing::info!(target: "BOOT", "数据面: usque 外部引擎 ({})，http2={}", engine_binary, cfg.masque_http2);
+        // Kill engines left behind by a previous run.
+        //
+        // systemd stops the main process, but usque runs with
+        // --always-reconnect and keeps reconnecting on its own. A restarted
+        // warpgate then finds the ports taken and starts a second copy, so each
+        // instance ends up with two engines. Seen in production: 500 orphans
+        // had accumulated 24,543 TCP connections to Cloudflare and the whole
+        // pool stopped forwarding.
+        reap_orphan_engines(&engine_binary);
     } else {
         if native_h2 {
             tracing::info!(target: "BOOT", "数据面: Rust 原生 CONNECT-IP（HTTP/2 over TCP 443）");
@@ -214,4 +223,68 @@ async fn main() -> ExitCode {
         "已退出（实例账号目录保留，重启后暖恢复）"
     );
     ExitCode::SUCCESS
+}
+/// Terminate engine processes that no warpgate is supervising.
+///
+/// Only processes reparented to init (PPid 1) are touched: those are left over
+/// from a previous run. Engines belonging to a live warpgate still have a
+/// parent, so two concurrent instances of this binary do not fight.
+fn reap_orphan_engines(engine_binary: &str) {
+    let name = std::path::Path::new(engine_binary)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("usque");
+
+    let Ok(rd) = std::fs::read_dir("/proc") else {
+        return;
+    };
+
+    let mut killed = 0usize;
+    for entry in rd.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == std::process::id() {
+            continue;
+        }
+
+        let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        let cmd = String::from_utf8_lossy(&cmdline).replace('\0', " ");
+        if !cmd.contains(name) || cmd.contains("warpgate") {
+            continue;
+        }
+
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+            continue;
+        };
+        let ppid = status
+            .lines()
+            .find_map(|l| l.strip_prefix("PPid:"))
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(0);
+        if ppid != 1 {
+            continue;
+        }
+
+        // SIGKILL: usque ignores SIGTERM while it is reconnecting.
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+        // Not reachable in practice: the engine only runs on Linux.
+        #[cfg(not(unix))]
+        let _ = pid;
+        killed += 1;
+    }
+
+    if killed > 0 {
+        tracing::warn!(killed, "清理了上一轮遗留的引擎进程");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
 }
