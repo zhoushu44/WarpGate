@@ -13,7 +13,9 @@
 # 构建上下文 = 仓库根目录（warpgate-rs/ 是 Cargo workspace）。
 
 # ---------- builder ----------
-FROM rust:1.83-bookworm AS builder
+# 跟随最新稳定版：Cargo.lock 里的 block-buffer 0.12 需要 edition2024，
+# 固定 1.83 会报 "feature edition2024 is required" 而构建失败。
+FROM rust:1-bookworm AS builder
 
 WORKDIR /src
 
