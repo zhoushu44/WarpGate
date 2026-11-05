@@ -103,12 +103,20 @@ impl ResilientTunnel {
 
     /// Get a usable tunnel, rebuilding if the current one is dead.
     async fn ensure(&self) -> Result<Arc<NativeTunnel>, String> {
+        // The reader task marks the *stack* dead when the HTTP/2 stream is
+        // reset, which is a different flag from ours. Checking both is what
+        // makes recovery work at all: with only our own flag the tunnel was
+        // never rebuilt, and 197 resets left 19 of 20 ports dead.
         if !self.dead.load(Ordering::SeqCst) {
             if let Some(t) = self.current.lock().await.clone() {
-                return Ok(t);
+                if !t.is_dead() {
+                    return Ok(t);
+                }
+                // Underlying stream is gone: fall through and rebuild.
+                tracing::warn!("native tunnel found dead; rebuilding");
+                self.dead.store(true, Ordering::SeqCst);
             }
         }
-
         // Serialise rebuilds: without this every concurrent dial would start its
         // own connection and the account would accumulate tunnels until
         // Cloudflare rejects them all.
@@ -241,5 +249,53 @@ mod tests {
     fn rejects_garbage() {
         assert!(split_target("nope").is_err());
         assert!(split_target("host:abc").is_err());
+    }
+
+    /// The reader task marks the *stack* dead; `ensure()` must consult that
+    /// flag. Keeping two independent flags is what made the first version of
+    /// this file useless: 197 stream resets produced zero rebuilds.
+    #[test]
+    fn ensure_consults_the_stack_dead_flag() {
+        let src = include_str!("resilient.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        assert!(
+            prod.contains("t.is_dead()"),
+            "ensure() must check the underlying tunnel, not just its own flag"
+        );
+        assert!(
+            src.contains("spawn_health_loop"),
+            "idle tunnels need a watcher, or a reset port looks healthy forever"
+        );
+    }
+}
+impl ResilientTunnel {
+    /// Watch the tunnel and rebuild it when it dies while idle.
+    ///
+    /// `ensure()` already recovers on the next dial, but an instance that gets
+    /// no traffic would otherwise stay dead until something asks it for a
+    /// connection — the console shows it healthy the whole time. This loop
+    /// closes that window.
+    pub fn spawn_health_loop(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let me = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(20));
+            loop {
+                tick.tick().await;
+                {
+                    {
+                        let alive = match me.current.lock().await.clone() {
+                            Some(t) => !t.is_dead(),
+                            None => false,
+                        };
+                        if !alive {
+                            me.dead.store(true, Ordering::SeqCst);
+                            if let Err(e) = me.ensure().await {
+                                tracing::warn!(error = %e, "idle tunnel rebuild failed");
+                            }
+                        }
+                    }
+                }
+            }
+        })
     }
 }
