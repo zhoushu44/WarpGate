@@ -1,32 +1,38 @@
-# WARP 代理池 - Docker 化镜像
-# 构建上下文 = /root/warp（含 server.js、logger.js、public、package*.json 等）
-# 镜像自包含 sing-box/wgcf，可 docker save/load 迁移到任意 x86_64 Linux 机器
-FROM node:20-slim
+# WarpGate — Rust 原生 MASQUE 实现的 WARP 代理池
+#
+# 多阶段构建：Rust 编译 → 精简运行镜像。
+#
+# 设计要点：
+#   * 运行时不需要 Node、npm、sing-box。数据面是 Rust 原生 CONNECT-IP
+#     （crates/wg-tunnel）。
+#   * 保留 usque：UDP 443 到 Cloudflare 在多数机房被封，原生 QUIC 无法
+#     握手，WARP_NATIVE=quic 时必须走 usque 子进程。
+#   * 基于 debian:bookworm-slim 而非 distroless：需要扫 /proc 清理孤儿
+#     引擎进程（v0.10.0 的修复）和 shell 做健康检查。
+#
+# 构建上下文 = 仓库根目录（warpgate-rs/ 是 Cargo workspace）。
 
-# 基础工具：健康检查/注册 API/风控检测均依赖 curl；unzip 用于解压 usque 发布包
+# ---------- builder ----------
+FROM rust:1.83-bookworm AS builder
+
+WORKDIR /src
+
+# 先拷清单再拷源码，让依赖层单独缓存：改业务代码不必重下 crates。
+COPY warpgate-rs/Cargo.toml warpgate-rs/Cargo.lock ./
+COPY warpgate-rs/crates ./crates
+RUN cargo build --release --bin warpgate \
+ && strip target/release/warpgate
+
+# ---------- runtime ----------
+FROM debian:bookworm-slim
+
 RUN apt-get update \
- && apt-get install -y --no-install-recommends curl ca-certificates unzip \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates curl unzip tini \
  && rm -rf /var/lib/apt/lists/*
 
-# sing-box（与宿主机生产版本 1.14.0-beta.3 保持一致；换版本改此 ARG 并重新构建）
-ARG SINGBOX_TAG=v1.14.0-beta.3
-RUN set -eux; \
-    curl -fsSL -o /tmp/sb.tar.gz \
-      "https://github.com/SagerNet/sing-box/releases/download/${SINGBOX_TAG}/sing-box-${SINGBOX_TAG#v}-linux-amd64.tar.gz"; \
-    tar -xzf /tmp/sb.tar.gz -C /tmp; \
-    mv "/tmp/sing-box-${SINGBOX_TAG#v}-linux-amd64/sing-box" /usr/local/bin/sing-box; \
-    chmod +x /usr/local/bin/sing-box; \
-    rm -rf /tmp/sb.tar.gz /tmp/sing-box-*; \
-    sing-box version | head -1
-
-# wgcf（WARP 账号注册回退路径，v2.2.32 单文件二进制）
-ARG WGCF_TAG=v2.2.32
-RUN set -eux; \
-    curl -fsSL -o /usr/local/bin/wgcf \
-      "https://github.com/ViRb3/wgcf/releases/download/${WGCF_TAG}/wgcf_${WGCF_TAG#v}_linux_amd64"; \
-    chmod +x /usr/local/bin/wgcf
-
-# usque（MASQUE 引擎，warp_transport=masque 时每个实例用它建 MASQUE 隧道）
+# usque：MASQUE 引擎，warp_transport=masque + WARP_NATIVE=quic 时每个实例用。
+# 版本与宿主机生产一致。
 ARG USQUE_TAG=v4.2.1
 RUN set -eux; \
     curl -fsSL -o /tmp/usque.zip \
@@ -36,16 +42,16 @@ RUN set -eux; \
     rm -rf /tmp/usque.zip /tmp/usque; \
     usque version | head -2
 
-# 应用代码
 WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm install --omit=dev && npm cache clean --force
-COPY server.js logger.js config.json ./
+COPY --from=builder /src/target/release/warpgate /usr/local/bin/warpgate
 COPY public ./public
 
-# 实例数据目录（运行期挂载宿主机 /root/warp-instances）
-VOLUME ["/root/warp-instances"]
+# 实例数据与配置运行期挂载（见 docker-compose.yml）。
+VOLUME ["/root/warpgate-rs/instances"]
 
-# 声明性 EXPOSE（host 网络下不生效，仅作说明）：实例端口段 = base_port ~ base_port+resident_count-1
-EXPOSE 4433 10010-10109
-CMD ["node", "server.js"]
+# 管理台 4433；实例端口段 = base_port ~ base_port+resident_count-1
+EXPOSE 4433
+
+# tini 回收 usque 子进程，避免僵尸堆积。
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["warpgate", "--config", "/app/config.json", "--instances", "/root/warpgate-rs/instances"]

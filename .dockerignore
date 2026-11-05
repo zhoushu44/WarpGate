@@ -6,9 +6,31 @@ test
 README.md
 REQUIREMENTS.md
 .trae
+.zcode
 *.ps1
 *.sh
 Dockerfile
 docker-compose.yml
 .dockerignore
 .env
+
+# Rust 构建产物与本地缓存：镜像里由 builder 阶段自己生成，
+# 从宿主机拷进去会撑爆上下文（target/ 有 4.6 GB）。
+warpgate-rs/target
+warpgate-rs/.cargo
+**/*.rs.bk
+
+# 本地测试留下的临时目录与脚本
+warpgate-rs/instances
+warpgate-rs/*.log
+warpgate-go
+soak_results
+__pycache__
+*.pyc
+
+# 老 Node 版的源码，Rust 镜像不需要
+server.js
+logger.js
+package.json
+package-lock.json
+public/__old__

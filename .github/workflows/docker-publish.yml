@@ -1,24 +1,68 @@
-# WARP 代理池 - Docker 镜像构建与推送
-# 触发：push 到 main 或 master 分支
-# 效果：构建同一个镜像并同时打 11.1 与 latest 两个标签推送到 Docker Hub
-# 前置：仓库 Settings → Secrets and variables → Actions 配置两个 Secret：
+# WarpGate — Docker 镜像构建与推送
+#
+# 触发：push 到 main/master，或手动 workflow_dispatch。
+#
+# 镜像标签规则：
+#   <version>  从 warpgate-rs/Cargo.toml 读出的版本号，例如 0.11.0
+#   latest     始终指向最新构建
+#   11.1       兼容旧部署脚本的固定标签（老 Node 版用过的名字，
+#              现在指向 Rust 版，方便原地替换）
+#
+# 前置：仓库 Settings → Secrets and variables → Actions
 #   DOCKER_HUB_USERNAME = Docker Hub 用户名
-#   DOCKER_HUB_TOKEN    = Docker Hub Access Token（需已创建，勾选 Read/Write/Delete）
+#   DOCKER_HUB_TOKEN    = Docker Hub Access Token（Read/Write/Delete）
 name: Build and Push Docker Image
 
 on:
   push:
     branches: [main, master]
-  workflow_dispatch: {} # 支持手动触发重跑
+    paths:
+      # 只在会改变镜像内容时构建，避免纯文档提交也跑一遍。
+      - 'warpgate-rs/crates/**'
+      - 'warpgate-rs/Cargo.toml'
+      - 'warpgate-rs/Cargo.lock'
+      - 'warpgate-rs/public/**'
+      - 'Dockerfile'
+      - '.github/workflows/docker-publish.yml'
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
+  # 先跑测试再发镜像：镜像一旦推到 Docker Hub，别人 pull 到的就是它。
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: warpgate-rs
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: warpgate-rs
+
+      - name: cargo test
+        run: cargo test --workspace --all-targets
+
   build-push:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Read version from Cargo.toml
+        id: ver
+        run: |
+          v=$(grep -m1 '^version' warpgate-rs/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "building $v"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -29,15 +73,30 @@ jobs:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
           password: ${{ secrets.DOCKER_HUB_TOKEN }}
 
-      - name: Build and Push (11.1 + latest)
+      # 缓存只挂在 Builder 阶段（crates.io 依赖），运行阶段仍然全量重建。
+      # 历史上出现过 gha 命中旧 COPY 层导致镜像不含最新代码，所以
+      # 业务代码那一层不参与缓存。
+      - name: Build and Push
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
           push: true
           tags: |
-            ${{ secrets.DOCKER_HUB_USERNAME }}/warp-pool:11.1
+            ${{ secrets.DOCKER_HUB_USERNAME }}/warp-pool:${{ steps.ver.outputs.version }}
             ${{ secrets.DOCKER_HUB_USERNAME }}/warp-pool:latest
-          # 注意：曾出现 gha 缓存命中旧 COPY 层导致推送镜像不含最新代码，
-          # 因此禁用构建缓存，每次强制全量重建（构建仅约 1-2 分钟，可接受）
-          no-cache: true
+            ${{ secrets.DOCKER_HUB_USERNAME }}/warp-pool:11.1
+          cache-from: type=gha,scope=builder
+          cache-to: type=gha,mode=max,scope=builder
+
+      - name: Summary
+        run: |
+          {
+            echo "### 镜像已推送"
+            echo ""
+            echo "| 标签 | 值 |"
+            echo "|---|---|"
+            echo "| 版本 | \`${{ steps.ver.outputs.version }}\` |"
+            echo "| latest | 已更新 |"
+            echo "| 11.1 | 已更新（兼容旧部署） |"
+          } >> "$GITHUB_STEP_SUMMARY"
