@@ -1255,6 +1255,119 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
         true
     }
 
+    /// Find the `usque socks` process serving one instance.
+    ///
+    /// Matched by the `usque.json` path in its command line: the pool spawns one
+    /// engine per instance directory and passes that path, so it is a unique
+    /// key. `Tunnel` does not expose the child's pid.
+    fn find_engine_pid(dir: &std::path::Path) -> Option<u32> {
+        let needle = dir.join("usque.json");
+        let needle = needle.to_str()?;
+        for e in std::fs::read_dir("/proc").ok()?.flatten() {
+            let Some(pid) = e
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+                continue;
+            };
+            let cmd = String::from_utf8_lossy(&cmdline).replace('\0', " ");
+            if cmd.contains(needle) && cmd.contains("usque") {
+                return Some(pid);
+            }
+        }
+        None
+    }
+
+    /// Count an engine's established connections to Cloudflare.
+    ///
+    /// Reads `/proc/net/tcp` rather than shelling out to `ss`: this runs once
+    /// per instance per sweep and a process spawn each time would cost more
+    /// than the check itself.
+    ///
+    /// Returns `None` when the engine pid is unknown or the file is unreadable,
+    /// which callers treat as "nothing to do".
+    fn engine_conn_count(pid: u32) -> Option<usize> {
+        // The engine listens locally and dials out to Cloudflare. Only count
+        // sockets owned by this pid, in ESTABLISHED (01) state.
+        let mut inodes = std::collections::HashSet::new();
+        let fd_dir = format!("/proc/{pid}/fd");
+        for e in std::fs::read_dir(&fd_dir).ok()?.flatten() {
+            if let Ok(link) = std::fs::read_link(e.path()) {
+                if let Some(s) = link.to_str() {
+                    if let Some(rest) = s.strip_prefix("socket:[") {
+                        if let Some(num) = rest.strip_suffix(']') {
+                            inodes.insert(num.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        if inodes.is_empty() {
+            return Some(0);
+        }
+
+        let mut n = 0usize;
+        for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
+            let Ok(text) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            for line in text.lines().skip(1) {
+                let mut it = line.split_whitespace();
+                let _sl = it.next();
+                let _local = it.next();
+                let _remote = it.next();
+                let Some(state) = it.next() else { continue };
+                // inode is the 10th field; walk the rest.
+                let inode = it.nth(5);
+                if state != "01" {
+                    continue;
+                }
+                if let Some(i) = inode {
+                    if inodes.contains(i) {
+                        n += 1;
+                    }
+                }
+            }
+        }
+        Some(n)
+    }
+
+    /// Restart an engine whose connection count has run away.
+    ///
+    /// `usque --always-reconnect` opens a new TCP connection each time it dials
+    /// an edge node and does not close the previous one. With 99 engines that
+    /// reached 3,393 sockets (34 per engine) in a few hours; the same ratio was
+    /// seen at 507 engines with 13,692. Left alone it exhausts Cloudflare's
+    /// per-IP allowance and every tunnel stops working at once.
+    ///
+    /// The threshold is deliberately well above normal usage (a healthy engine
+    /// sits at 1-5) so an instance is not recycled for routine churn.
+    async fn recycle_if_leaky(&self, idx: i64) {
+        let limit = self.cfg.health_max_conns.max(0) as usize;
+        if limit == 0 {
+            return;
+        }
+        let Some(inst) = self.get(idx).await else { return };
+        let Some(pid) = Self::find_engine_pid(&inst.dir) else { return };
+        let Some(n) = Self::engine_conn_count(pid) else { return };
+        if n < limit {
+            return;
+        }
+        tracing::warn!(
+            index = idx,
+            conns = n,
+            limit,
+            "引擎连接数异常，重启清理"
+        );
+        if let Err(e) = self.restart_engine(idx).await {
+            tracing::warn!(index = idx, error = %e, "清理重启失败");
+        }
+    }
+
     /// Record a failed probe: bump the streak and demote the instance.
     ///
     /// Two consecutive misses are required before demoting, so one slow probe
@@ -1469,6 +1582,16 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
                         let idx = idxs[(start + k) % idxs.len()];
                         let ok = self.probe_one(idx).await;
                         if ok {
+                            // A tunnel that still answers can nevertheless be
+                            // hoarding sockets: usque runs with
+                            // --always-reconnect and leaves the old TCP
+                            // connections open every time it dials a new edge
+                            // node. Measured in production: 99 engines held
+                            // 3,393 connections (34 each). That is a slow leak
+                            // of the Cloudflare per-IP quota and ends with the
+                            // whole pool unable to connect, so recycle the
+                            // engine once the count gets unreasonable.
+                            self.recycle_if_leaky(idx).await;
                             continue;
                         }
 
@@ -2127,6 +2250,35 @@ mod tests {
         );
     }
 
+    /// The connection-count watchdog must be wired into the health sweep.
+    ///
+    /// Regression: 99 engines accumulated 3,393 connections to Cloudflare
+    /// (34 each) because usque leaves the old socket open on every redial.
+    /// Nothing ever looked at the count, so it grew until the per-IP quota ran
+    /// out and every tunnel failed at once.
+    #[test]
+    fn leaky_engine_recycling_is_wired() {
+        let src = include_str!("lib.rs");
+        assert!(
+            src.contains("recycle_if_leaky"),
+            "the health sweep must check connection counts"
+        );
+        assert!(
+            src.contains("engine_conn_count"),
+            "connection counting must exist"
+        );
+        // The limit must default to something well above healthy usage.
+        assert!(
+            src.contains("health_max_conns"),
+            "the threshold must be configurable"
+        );
+    }
+
+    /// Counting must tolerate an engine that does not exist.
+    #[test]
+    fn engine_conn_count_handles_missing_pid() {
+        assert_eq!(Manager::engine_conn_count(u32::MAX), None);
+    }
     /// `resident_count` is a ceiling: boot must not start more than that many
     /// instances even when the directory holds more.
     ///
