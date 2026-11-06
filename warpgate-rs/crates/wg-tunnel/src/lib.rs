@@ -341,6 +341,22 @@ impl ExternalEngine {
         // one rejects unknown flags and exits immediately, which shows up as a
         // port that never binds. The Node version passes it because it ships an
         // older usque — verify the target binary's flags before adding any.
+        //
+        // No `--always-reconnect` either, and that is the important part:
+        //
+        // Cloudflare rotates its edge certificates, so `EndpointPubKey` pinning
+        // fails for a while (`x509: no valid chains built: remote endpoint has a
+        // different public key`). With `--always-reconnect` usque retries that
+        // failure once per second and opens a fresh TCP connection every time
+        // without closing the old one. Measured in production: 99 engines
+        // accumulated 4,076 sockets, and the pool lost usable IPs as
+        // Cloudflare's per-IP allowance ran out.
+        //
+        // Without the flag usque logs `Tunnel idle. Waiting for outbound
+        // activity before reconnecting` and simply waits, so a failed tunnel
+        // costs one socket instead of one per second. The trade-off is that a
+        // dropped tunnel is rebuilt on the next request rather than eagerly,
+        // which the health probe (and any real traffic) triggers anyway.
         cmd.arg("socks")
             .arg("-c")
             .arg(cfg_path)
@@ -348,7 +364,9 @@ impl ExternalEngine {
             .arg("127.0.0.1")
             .arg("-p")
             .arg(engine_port.to_string())
-            .arg("--always-reconnect");
+            // Backstop in case a future build starts reconnecting on its own.
+            .arg("--reconnect-delay")
+            .arg("30s");
         if http2 {
             cmd.arg("--http2");
         }
@@ -792,5 +810,30 @@ mod probe_tests {
         let out =
             probe_exit_ipv6(&dial, "https://api6.ipify.org", Duration::from_millis(200)).await;
         assert_eq!(out, "");
+    }
+}
+#[cfg(test)]
+mod engine_flag_tests {
+    /// `--always-reconnect` must not come back.
+    ///
+    /// It makes usque retry a failed tunnel once per second, and each retry
+    /// opens a fresh TCP connection without closing the previous one. When
+    /// Cloudflare rotated its edge certificate the pinning check failed for
+    /// minutes at a time, so 99 engines accumulated 4,076 sockets and the pool
+    /// ran out of Cloudflare's per-IP allowance.
+    #[test]
+    fn engine_drops_always_reconnect() {
+        let src = include_str!("lib.rs");
+        // Only the production half; the comment above explains why the flag is
+        // absent and would otherwise trip a naive search.
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        assert!(
+            !prod.contains(r#".arg("--always-reconnect")"#),
+            "always-reconnect leaks a socket per retry; it must stay removed"
+        );
+        assert!(
+            prod.contains("--reconnect-delay"),
+            "a slow retry backstop should be passed instead"
+        );
     }
 }

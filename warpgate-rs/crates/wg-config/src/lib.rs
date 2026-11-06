@@ -22,8 +22,11 @@ pub struct Config {
     pub health_probe_batch: i64,
     /// Recycle an engine once it holds this many established connections.
     ///
-    /// `usque --always-reconnect` leaks one socket per redial; a healthy engine
-    /// sits at 1-5, while a leaky one reaches 30+. 0 disables the check.
+    /// `usque --always-reconnect` leaks one socket per redial and Cloudflare
+    /// drops the tunnel roughly every 5 minutes, so the count climbs ~10/hour.
+    /// A healthy engine needs exactly one connection (HTTP/2 multiplexes every
+    /// SOCKS request over it), so 3 catches a leak almost immediately while
+    /// still leaving room for a transient redial. 0 disables the check.
     #[serde(default = "default_health_max_conns")]
     pub health_max_conns: i64,
     pub bind_address: String,
@@ -142,7 +145,7 @@ impl Default for Config {
             auto_rebuild_on_unhealthy: true,
             health_check_interval: 600,
             health_probe_batch: 8,
-            health_max_conns: 60,
+            health_max_conns: 3,
             bind_address: "0.0.0.0".into(),
             mode: "resident".into(),
             base_port: 10010,
@@ -410,5 +413,5 @@ fn default_health_probe_batch() -> i64 {
 }
 
 fn default_health_max_conns() -> i64 {
-    60
+    3
 }
