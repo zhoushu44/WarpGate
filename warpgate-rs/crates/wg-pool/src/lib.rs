@@ -180,7 +180,14 @@ pub struct Manager {
     /// Rotating start offset for the health sweep, so a large pool is covered
     /// evenly instead of always probing the lowest indexes.
     probe_cursor: std::sync::atomic::AtomicUsize,
+    /// Live `resident_count`. Kept separate from the immutable `cfg` so the API
+    /// can change it without rebuilding the Manager; `RESIDENT_UNSET` means
+    /// "fall back to cfg.resident_count".
+    resident_override: std::sync::atomic::AtomicI64,
 }
+
+/// Sentinel for "not overridden".
+const RESIDENT_UNSET: i64 = i64::MIN;
 
 /// A create action: build an instance at `idx` without touching Cloudflare.
 pub type CreateFn = Arc<
@@ -234,11 +241,38 @@ impl Manager {
             sem: Arc::new(tokio::sync::Semaphore::new(permits)),
             create_fn: RwLock::new(None),
             probe_cursor: std::sync::atomic::AtomicUsize::new(0),
+            resident_override: std::sync::atomic::AtomicI64::new(RESIDENT_UNSET),
         }
     }
 
     pub fn config(&self) -> &Config {
         &self.cfg
+    }
+
+    /// The effective `resident_count`, honouring a runtime override.
+    pub fn resident(&self) -> i64 {
+        let v = self
+            .resident_override
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if v == RESIDENT_UNSET {
+            self.cfg.resident_count
+        } else {
+            v
+        }
+    }
+
+    /// Change `resident_count` at runtime and reconcile the pool.
+    ///
+    /// Only this field is overridable: everything else in `Config` is read when
+    /// listeners are built, so applying it live would leave half-applied state.
+    /// Returns how many instances were started or stopped.
+    pub async fn set_resident(&self, n: i64) -> Result<usize> {
+        if n < 0 {
+            return Err(PoolError::Config("resident_count 不能为负".into()));
+        }
+        self.resident_override
+            .store(n, std::sync::atomic::Ordering::Relaxed);
+        self.reconcile_resident().await
     }
 
     pub fn base(&self) -> &std::path::Path {
@@ -395,6 +429,26 @@ impl Manager {
         }
         idxs.sort_unstable();
 
+        // `resident_count` is a ceiling, not just a target to top up to.
+        //
+        // This loop used to warm-start every directory it found and only then
+        // compare against `resident_count`, which could never shrink anything:
+        // 999 directories on disk meant 999 running engines even with
+        // resident_count = 300, i.e. ~10.3 GB of RAM and ~10k threads on a
+        // 16 GB box. The cap is applied here so a shrink actually takes effect
+        // on the next start.
+        let cap = self.cfg.max_instances.max(self.resident()).max(0) as usize;
+        let limit = (self.resident().max(0) as usize).min(cap);
+        if limit > 0 && idxs.len() > limit {
+            tracing::warn!(
+                found = idxs.len(),
+                resident_count = self.resident(),
+                "实例目录多于常驻上限，只启动前 {} 个（其余保留在磁盘，未删除）",
+                limit
+            );
+            idxs.truncate(limit);
+        }
+
         for i in &idxs {
             if cancel.is_cancelled() {
                 return;
@@ -405,7 +459,7 @@ impl Manager {
         }
 
         let have = self.instances.read().await.len() as i64;
-        let need = self.cfg.resident_count - have;
+        let need = self.resident() - have;
         for _ in 0..need.max(0) {
             if cancel.is_cancelled() {
                 return;
@@ -1062,6 +1116,76 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
         meta.status = status::STOPPED.to_string();
         meta.write(&dir)?;
         Ok(())
+    }
+
+    /// Bring the running count in line with `resident_count`.
+    ///
+    /// Stopping from the highest index keeps the low, long-lived instances (and
+    /// their IPs) stable, which is what the console shows first. Directories are
+    /// kept on disk: shrinking is a pause, not a delete, so growing again reuses
+    /// the same accounts instead of registering new ones.
+    ///
+    /// Returns how many instances were stopped or started.
+    pub async fn reconcile_resident(&self) -> Result<usize> {
+        let target = self.resident().max(0);
+        let mut running: Vec<i64> = {
+            let map = self.instances.read().await;
+            map.keys().copied().collect()
+        };
+        running.sort_unstable();
+
+        let mut changed = 0usize;
+
+        // Shrink: stop the tail.
+        if running.len() as i64 > target {
+            let excess = running.len() as i64 - target;
+            for idx in running.iter().rev().take(excess as usize) {
+                if let Err(e) = self.stop_instance(*idx).await {
+                    tracing::warn!(index = idx, error = %e, "缩容停止实例失败");
+                } else {
+                    changed += 1;
+                }
+            }
+            tracing::info!(stopped = changed, target, "缩容完成");
+            return Ok(changed);
+        }
+
+        // Grow: warm-start existing directories first (no re-registration),
+        // then create fresh accounts if the disk has nothing left to reuse.
+        let mut idle_dirs: Vec<i64> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&self.base) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                let Some(rest) = name.strip_prefix("warp-") else {
+                    continue;
+                };
+                let Ok(i) = rest.parse::<i64>() else { continue };
+                if !running.contains(&i) {
+                    idle_dirs.push(i);
+                }
+            }
+        }
+        idle_dirs.sort_unstable();
+
+        for idx in idle_dirs {
+            if self.instances.read().await.len() as i64 >= target {
+                break;
+            }
+            match self.start_existing(idx).await {
+                Ok(()) => changed += 1,
+                Err(e) => tracing::warn!(index = idx, error = %e, "扩容暖启动失败"),
+            }
+        }
+
+        while (self.instances.read().await.len() as i64) < target {
+            let idx = self.next_free_index().await;
+            if self.create(idx).await.is_err() {
+                break;
+            }
+            changed += 1;
+        }
+
+        Ok(changed)
     }
 
     /// Probe one instance and act on the result.
@@ -2001,6 +2125,55 @@ mod tests {
             body.contains("health_loop"),
             "start_loops must spawn health_loop, otherwise failed probes are never repaired"
         );
+    }
+
+    /// `resident_count` is a ceiling: boot must not start more than that many
+    /// instances even when the directory holds more.
+    ///
+    /// Regression: boot warm-started every directory and only then compared
+    /// against resident_count, so 999 directories meant 999 engines on a 16 GB
+    /// box with resident_count = 300 (~10.3 GB RAM, ~10k threads).
+    #[tokio::test]
+    async fn boot_respects_resident_count_as_a_ceiling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut c = Config::default();
+        c.resident_count = 2;
+        c.max_instances = 10;
+        c.session_cleanup_interval = 30;
+        let m = Manager::new(Arc::new(c), tmp.path().to_path_buf());
+
+        // Five directories with valid configs would previously all start.
+        for i in 0..5i64 {
+            let dir = wg_store::dir(tmp.path(), i);
+            std::fs::create_dir_all(&dir).unwrap();
+            fake_usque(i)
+                .save(&wg_store::paths::usque_conf_path(&dir))
+                .unwrap();
+        }
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        // create_fn stubbed out: the test must not touch the network.
+        m.set_create_fn(Arc::new(|_idx| {
+            Box::pin(async { Err::<(), String>("stubbed".into()) })
+        }))
+        .await;
+
+        m.boot(&cancel).await;
+        assert_eq!(
+            m.count().await,
+            2,
+            "boot must cap at resident_count, not start every directory"
+        );
+    }
+
+    /// The runtime override must win over the immutable config.
+    #[tokio::test]
+    async fn resident_override_takes_effect() {
+        let (m, _t) = pool_with(1).await;
+        assert_eq!(m.resident(), 4, "default comes from cfg");
+        m.resident_override
+            .store(7, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(m.resident(), 7, "override must win");
     }
 }
 

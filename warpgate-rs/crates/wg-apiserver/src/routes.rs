@@ -206,7 +206,33 @@ async fn handle_set_config(
     if let Err(e) = parsed.validate() {
         return bad_request(format!("配置无效: {}", e));
     }
-    ok(json!({ "saved": true }))
+
+    // This handler used to stop here and answer `saved: true`, having saved
+    // nothing and applied nothing: the console's "实例数" field appeared to work
+    // while the pool never changed size.
+    //
+    // Persist first, then apply, so a crash between the two leaves the file as
+    // the source of truth rather than a half-applied runtime.
+    let path = std::path::Path::new("config.json");
+    if let Err(e) = serde_json::to_string_pretty(&parsed)
+        .map_err(|e| e.to_string())
+        .and_then(|s| std::fs::write(path, s).map_err(|e| e.to_string()))
+    {
+        return internal(format!("保存配置失败: {e}"));
+    }
+
+    // `resident_count` is the one field that can be reconciled live.
+    let changed = match st.mgr.set_resident(parsed.resident_count).await {
+        Ok(n) => n,
+        Err(e) => return internal(format!("应用配置失败: {e}")),
+    };
+
+    ok(json!({
+        "saved": true,
+        "applied": true,
+        "resident_count": parsed.resident_count,
+        "changed": changed,
+    }))
 }
 
 /// `GET /api/stats`
