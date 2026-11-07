@@ -120,7 +120,13 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let mgr = Arc::new(Manager::new(cfg.clone(), base));
+    // Pass the real config path so runtime edits (whitelist, resident count)
+    // are written back to the file the service loaded, not to ./config.json.
+    let mgr = Arc::new(Manager::with_config_path(
+        cfg.clone(),
+        base,
+        std::path::PathBuf::from(&args.config),
+    ));
 
     let cancel = CancellationToken::new();
 

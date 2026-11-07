@@ -184,6 +184,10 @@ pub struct Manager {
     /// can change it without rebuilding the Manager; `RESIDENT_UNSET` means
     /// "fall back to cfg.resident_count".
     resident_override: std::sync::atomic::AtomicI64,
+    /// Where this Manager was loaded from, so config edits can be written back.
+    /// A relative path would resolve against the process CWD, which is not
+    /// where the service file points.
+    config_path: std::path::PathBuf,
 }
 
 /// Sentinel for "not overridden".
@@ -230,6 +234,18 @@ pub type Result<T> = std::result::Result<T, PoolError>;
 impl Manager {
     /// A pool rooted at `base` with the given config.
     pub fn new(cfg: Arc<Config>, base: std::path::PathBuf) -> Self {
+        Self::with_config_path(cfg, base, std::path::PathBuf::from("config.json"))
+    }
+
+    /// Construct a Manager that knows where its config file lives.
+    ///
+    /// Needed so runtime edits (whitelist, resident count) are written back to
+    /// the file the service actually loaded rather than to `./config.json`.
+    pub fn with_config_path(
+        cfg: Arc<Config>,
+        base: std::path::PathBuf,
+        config_path: std::path::PathBuf,
+    ) -> Self {
         let permits = cfg.max_concurrent_create.max(1) as usize;
         Self {
             cfg,
@@ -242,6 +258,7 @@ impl Manager {
             create_fn: RwLock::new(None),
             probe_cursor: std::sync::atomic::AtomicUsize::new(0),
             resident_override: std::sync::atomic::AtomicI64::new(RESIDENT_UNSET),
+            config_path,
         }
     }
 
@@ -1509,12 +1526,34 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
     }
 
     /// Apply a new whitelist, reopening the whitelist listeners.
+    /// Apply a new whitelist: validate and persist it.
+    ///
+    /// This used to parse the entries and then throw them away, so
+    /// `POST /api/whitelist` answered success while changing nothing. The
+    /// whitelist ports kept enforcing the list captured when their listener was
+    /// built, and a restart lost the edit entirely because only memory had been
+    /// touched — a freshly added IP saw `Unable to receive initial SOCKS5
+    /// response` on every whitelist port.
+    ///
+    /// The new list takes effect on the next instance (re)start; live listener
+    /// rebuilding would need a per-listener shutdown handle, which the SOCKS
+    /// server does not expose yet. Callers that need it immediately can hit
+    /// `/api/pool/rotate` or restart the service.
     pub async fn set_whitelist(&self, entries: &[String]) -> Result<()> {
-        let nets = wg_socks::parse_whitelist(entries)
-            .map_err(|e| PoolError::Config(e))?;
-        // Listeners are (re)created per instance by the engine layer; here we
-        // only validate, so a bad entry fails before anything is reopened.
-        let _ = nets;
+        // Validate before writing, so a typo cannot brick the file.
+        wg_socks::parse_whitelist(entries).map_err(|e| PoolError::Config(e))?;
+
+        let mut cfg = (*self.cfg).clone();
+        cfg.ip_whitelist = entries.to_vec();
+        let text = serde_json::to_string_pretty(&cfg)
+            .map_err(|e| PoolError::Config(e.to_string()))?;
+        std::fs::write(&self.config_path, text)
+            .map_err(|e| PoolError::Config(format!("保存白名单失败: {e}")))?;
+
+        tracing::info!(
+            count = entries.len(),
+            "白名单已保存（新实例生效；已有实例需重启）"
+        );
         Ok(())
     }
 
