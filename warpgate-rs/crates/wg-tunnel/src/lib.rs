@@ -364,9 +364,7 @@ impl ExternalEngine {
             .arg("127.0.0.1")
             .arg("-p")
             .arg(engine_port.to_string())
-            // Backstop in case a future build starts reconnecting on its own.
-            .arg("--reconnect-delay")
-            .arg("30s");
+            .arg("--always-reconnect");
         if http2 {
             cmd.arg("--http2");
         }
@@ -814,26 +812,23 @@ mod probe_tests {
 }
 #[cfg(test)]
 mod engine_flag_tests {
-    /// `--always-reconnect` must not come back.
+    /// The engine must be launched exactly like the Node version did.
     ///
-    /// It makes usque retry a failed tunnel once per second, and each retry
-    /// opens a fresh TCP connection without closing the previous one. When
-    /// Cloudflare rotated its edge certificate the pinning check failed for
-    /// minutes at a time, so 99 engines accumulated 4,076 sockets and the pool
-    /// ran out of Cloudflare's per-IP allowance.
+    /// `--always-reconnect` keeps the tunnel warm: without it the first client
+    /// request has to establish the tunnel and takes 3-25s, which callers see
+    /// as a timeout. `--idle-timeout` is deliberately absent because usque
+    /// v4.2.1 rejects it and exits ("unknown flag"), leaving a dead port.
     #[test]
-    fn engine_drops_always_reconnect() {
+    fn engine_flags_match_the_node_version() {
         let src = include_str!("lib.rs");
-        // Only the production half; the comment above explains why the flag is
-        // absent and would otherwise trip a naive search.
         let prod = src.split("#[cfg(test)]").next().unwrap_or("");
         assert!(
-            !prod.contains(r#".arg("--always-reconnect")"#),
-            "always-reconnect leaks a socket per retry; it must stay removed"
+            prod.contains(r#".arg("--always-reconnect")"#),
+            "the warm tunnel depends on --always-reconnect; dropping it makes the first request take seconds"
         );
         assert!(
-            prod.contains("--reconnect-delay"),
-            "a slow retry backstop should be passed instead"
+            !prod.contains(r#".arg("--idle-timeout")"#),
+            "usque v4.2.1 rejects --idle-timeout and exits immediately"
         );
     }
 }
