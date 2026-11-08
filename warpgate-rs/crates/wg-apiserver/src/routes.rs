@@ -636,11 +636,35 @@ async fn handle_proxies(
                     "exit_ip": meta.ipv6,
                     "username": if whitelist_active { Value::Null } else { json!(st.cfg.proxy_username) },
                     "password": if whitelist_active { Value::Null } else { json!(st.cfg.proxy_password) },
-                    "proxy": format!("socks5://{}:{}", public_ip, port),
+                    // The whitelist port needs no credentials but DOES need the
+                    // client to leave name resolution to the proxy: the
+                    // listener only answers ATYP=0x03. Chromium resolves SOCKS
+                    // names locally, so a plain `socks5://` here produced
+                    // ERR_CONNECTION_CLOSED; `socks5h://` makes callers either
+                    // resolve remotely or route through their own bridge.
+                    "proxy": if whitelist_active {
+                        format!("socks5h://{}:{}", public_ip, port)
+                    } else {
+                        format!(
+                            "socks5://{}:{}@{}:{}",
+                            st.cfg.proxy_username, st.cfg.proxy_password, public_ip, port
+                        )
+                    },
+                    // Credential-free URL, always remote-resolving.
                     "proxy_whitelist": if whitelist_active {
-                        json!(format!("socks5://{}:{}", public_ip, inst.whitelist_port))
+                        json!(format!("socks5h://{}:{}", public_ip, inst.whitelist_port))
                     } else {
                         Value::Null
+                    },
+                    // Explicit auth form, so a caller that ignores `proxy` still
+                    // has a ready-to-use URL.
+                    "proxy_auth": if whitelist_active {
+                        Value::Null
+                    } else {
+                        json!(format!(
+                            "socks5://{}:{}@{}:{}",
+                            st.cfg.proxy_username, st.cfg.proxy_password, public_ip, inst.port
+                        ))
                     },
                     "whitelist_mode": whitelist_active,
                     "session_id": if sticky { json!(q.sid) } else { Value::Null },
@@ -712,8 +736,49 @@ async fn handle_acquire(
         Ok(inst) => {
             let public_ip = st.mgr.public_ip().await;
             let meta = inst.meta().await;
+            // The port an instance exposes needs SOCKS5 username/password auth
+            // unless it is the whitelist port. Returning a bare
+            // `socks5://host:port` therefore handed callers something they
+            // could not use: the handshake came back 0xFF "no acceptable auth
+            // method" and every request died with ERR_SOCKS_CONNECTION_FAILED.
+            //
+            // `proxy_auth` carries the credentials inline so a caller that just
+            // wants a working URL can use it directly, while `proxy` keeps the
+            // old shape for callers that inject auth themselves.
+            let whitelist_active = !st.cfg.ip_whitelist.is_empty();
+            let port = if whitelist_active {
+                inst.whitelist_port
+            } else {
+                inst.port
+            };
+            let (user, pass) = if whitelist_active {
+                (Value::Null, Value::Null)
+            } else {
+                (
+                    json!(st.cfg.proxy_username),
+                    json!(st.cfg.proxy_password),
+                )
+            };
+            let proxy = format!("socks5://{}:{}", public_ip, port);
+            let proxy_auth = if whitelist_active {
+                // No credentials needed, but the scheme matters: the server
+                // resolves names (ATYP=0x03). Chromium resolves SOCKS names
+                // locally, which breaks on a whitelist port that refuses
+                // remote-DNS-less requests. `socks5h://` tells clients to let
+                // the proxy resolve, matching what this listener expects.
+                format!("socks5h://{}:{}", public_ip, port)
+            } else {
+                format!(
+                    "socks5://{}:{}@{}:{}",
+                    st.cfg.proxy_username, st.cfg.proxy_password, public_ip, port
+                )
+            };
             ok(json!({
-                "proxy": format!("socks5://{}:{}", public_ip, inst.port),
+                "proxy": proxy,
+                "proxy_auth": proxy_auth,
+                "username": user,
+                "password": pass,
+                "whitelist_mode": whitelist_active,
                 "name": wg_store::name(inst.index),
                 "session_id": if sticky { Some(&q.session_id) } else { None },
                 "ip": meta.ipv6,
