@@ -287,7 +287,10 @@ async fn handle_stats(State(st): State<AppState>) -> axum::response::Response {
         "dedicated": dedicated,
         "sessions": sessions,
         // API vocabulary
-        "resident_count": st.cfg.resident_count,
+        // `mgr.resident()` honours a runtime override; `cfg.resident_count` is
+        // the value loaded at start-up, so after POST /api/config the console
+        // kept reporting the old number while the pool had already resized.
+        "resident_count": st.mgr.resident(),
         "instance_count": total,
         "healthy_count": st.mgr.healthy_count().await,
         "sticky_sessions": sessions,
