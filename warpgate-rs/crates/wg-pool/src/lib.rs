@@ -1183,8 +1183,14 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
     /// Abort an instance's SOCKS listeners, which releases its ports.
     async fn close_listeners(inst: &Instance) {
         let mut handles = inst.listeners.lock().await;
-        for h in handles.drain(..) {
+        let drained: Vec<_> = handles.drain(..).collect();
+        for h in &drained {
             h.abort();
+        }
+        // Same reason as `close_whitelist_listener`: abort is asynchronous, and
+        // the caller is about to bind these ports again (stop/start, delete).
+        for h in drained {
+            let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
         }
     }
 
@@ -1193,6 +1199,14 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
     /// The whitelist is enforced per listener (`Server.whitelist`), so an edit
     /// only needs this one rebound. Aborting the credential port too would drop
     /// live connections for every caller that authenticates with a password.
+    ///
+    /// Waits for the port to actually become free. `JoinHandle::abort` only
+    /// *schedules* cancellation: the task stops at its next await point, and
+    /// until it drops the `TcpListener` the socket stays bound. Rebinding
+    /// immediately raced against that and produced
+    /// `Address already in use (os error 98)` on ~2/3 of instances, which left
+    /// those ports serving the *old* whitelist — the edit looked applied
+    /// because the API answered success.
     async fn close_whitelist_listener(inst: &Instance) {
         let mut handles = inst.listeners.lock().await;
         // Listeners are pushed credential-first, whitelist-second, and a
@@ -1200,6 +1214,8 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
         if handles.len() > 1 {
             if let Some(h) = handles.pop() {
                 h.abort();
+                // Bounded wait: the task only has to fall out of `accept()`.
+                let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
             }
         }
     }
@@ -1768,14 +1784,31 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
             if nets.is_empty() {
                 continue;
             }
-            match self.open_whitelist_listener(&inst, nets.clone()).await {
-                Ok(()) => rebound += 1,
-                Err(e) => tracing::warn!(
+            // A single retry, because the OS can still hold the port for a
+            // moment after the task exits. Losing the bind means this instance
+            // keeps enforcing the previous list, which is indistinguishable
+            // from "the edit did nothing" for whoever just added their IP.
+            let mut last_err = None;
+            for attempt in 0..3 {
+                if attempt > 0 {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+                match self.open_whitelist_listener(&inst, nets.clone()).await {
+                    Ok(()) => {
+                        rebound += 1;
+                        last_err = None;
+                        break;
+                    }
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            if let Some(e) = last_err {
+                tracing::warn!(
                     "warp-{} 白名单端口 {} 重建失败: {}",
                     inst.index,
                     inst.whitelist_port,
                     e
-                ),
+                );
             }
         }
 
