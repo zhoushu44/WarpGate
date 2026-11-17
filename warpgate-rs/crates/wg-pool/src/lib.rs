@@ -1624,9 +1624,16 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
         };
         #[cfg(unix)]
         {
-            // SAFETY: kill() with a pid we just read from /proc.
+            // SAFETY: `kill` with a pid we just read from /proc. A pid can be
+            // recycled between the read and the signal, but the window here is
+            // microseconds and the worst case is signalling an unrelated
+            // process — the alternative (leaving the engine alive) is strictly
+            // worse, since it keeps every Cloudflare socket open.
+            extern "C" {
+                fn kill(pid: i32, sig: i32) -> i32;
+            }
             unsafe {
-                libc_kill(pid as i32, 9);
+                kill(pid as i32, 9);
             }
         }
         // Give the kernel a moment to tear the sockets down. The engine holds
