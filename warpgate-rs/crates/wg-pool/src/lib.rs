@@ -208,6 +208,12 @@ pub struct Manager {
     /// would rebuild their listeners from the boot-time list and silently
     /// reject the IPs the operator just added.
     live_whitelist: RwLock<Option<Vec<String>>>,
+    /// Parsed whitelist, shared with every SOCKS listener.
+    ///
+    /// A single `Arc` for the whole pool: each listener holds a clone and reads
+    /// it per connection, so an edit is visible to every port at once without
+    /// touching a socket.
+    nets: Arc<std::sync::RwLock<Vec<ipnet::IpNet>>>,
 }
 
 /// Sentinel for "not overridden".
@@ -267,6 +273,9 @@ impl Manager {
         config_path: std::path::PathBuf,
     ) -> Self {
         let permits = cfg.max_concurrent_create.max(1) as usize;
+        // Parse the boot list once; `set_whitelist` swaps the contents in place
+        // so every listener sees the change without rebinding.
+        let nets = wg_socks::parse_whitelist(&cfg.ip_whitelist).unwrap_or_default();
         Self {
             cfg,
             base,
@@ -280,6 +289,7 @@ impl Manager {
             resident_override: std::sync::atomic::AtomicI64::new(RESIDENT_UNSET),
             config_path,
             live_whitelist: RwLock::new(None),
+            nets: Arc::new(std::sync::RwLock::new(nets)),
         }
     }
 
@@ -289,6 +299,16 @@ impl Manager {
             Some(v) => v.clone(),
             None => self.cfg.ip_whitelist.clone(),
         }
+    }
+
+    /// The parsed whitelist, shared with every listener.
+    ///
+    /// One lock for the whole pool: the SOCKS server reads it per connection,
+    /// so `/api/whitelist` can swap the networks in place. Rebuilding the
+    /// listeners instead lost the bind race on half the pool (see
+    /// `Server::whitelist`).
+    fn whitelist_nets(&self) -> Arc<std::sync::RwLock<Vec<ipnet::IpNet>>> {
+        self.nets.clone()
     }
 
     pub fn config(&self) -> &Config {
@@ -1087,9 +1107,7 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
 
         let whitelist = self.whitelist().await;
         if !whitelist.is_empty() {
-            let nets = wg_socks::parse_whitelist(&whitelist)
-                .map_err(|e| PoolError::Config(e))?;
-            if let Err(e) = self.open_whitelist_listener(&inst, nets).await {
+            if let Err(e) = self.open_whitelist_listener(&inst).await {
                 tracing::warn!("warp-{} 白名单端口 {} 监听失败: {}", idx, inst.whitelist_port, e);
             } else {
                 opened += 1;
@@ -1105,7 +1123,8 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
             require_auth: self.cfg.proxy_auth_enabled,
             username: self.cfg.proxy_username.clone(),
             password: self.cfg.proxy_password.clone(),
-            whitelist: Vec::new(),
+            // Credential mode: no source-IP filter, so an empty shared list.
+            whitelist: Arc::new(std::sync::RwLock::new(Vec::new())),
             // Resolved per connection, not captured once: a data-plane restart
             // replaces `inst.dial`, and a listener holding the old dial would
             // keep forwarding into a dead tunnel forever.
@@ -1123,11 +1142,7 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
         Ok(())
     }
 
-    async fn open_whitelist_listener(
-        &self,
-        inst: &Arc<Instance>,
-        nets: Vec<ipnet::IpNet>,
-    ) -> std::io::Result<()> {
+    async fn open_whitelist_listener(&self, inst: &Arc<Instance>) -> std::io::Result<()> {
         let listener =
             tokio::net::TcpListener::bind(format!("0.0.0.0:{}", inst.whitelist_port)).await?;
         let server = Arc::new(wg_socks::Server {
@@ -1136,7 +1151,9 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
             require_auth: false,
             username: String::new(),
             password: String::new(),
-            whitelist: nets,
+            // The pool-wide shared list, not a snapshot: this is what lets
+            // `/api/whitelist` take effect without rebinding anything.
+            whitelist: self.whitelist_nets(),
             dial: Self::live_dial(inst),
             dial_timeout: std::time::Duration::from_secs(20),
             idle_timeout: std::time::Duration::from_secs(
@@ -1191,32 +1208,6 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
         // the caller is about to bind these ports again (stop/start, delete).
         for h in drained {
             let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
-        }
-    }
-
-    /// Abort only the whitelist listener, leaving the credential port serving.
-    ///
-    /// The whitelist is enforced per listener (`Server.whitelist`), so an edit
-    /// only needs this one rebound. Aborting the credential port too would drop
-    /// live connections for every caller that authenticates with a password.
-    ///
-    /// Waits for the port to actually become free. `JoinHandle::abort` only
-    /// *schedules* cancellation: the task stops at its next await point, and
-    /// until it drops the `TcpListener` the socket stays bound. Rebinding
-    /// immediately raced against that and produced
-    /// `Address already in use (os error 98)` on ~2/3 of instances, which left
-    /// those ports serving the *old* whitelist — the edit looked applied
-    /// because the API answered success.
-    async fn close_whitelist_listener(inst: &Instance) {
-        let mut handles = inst.listeners.lock().await;
-        // Listeners are pushed credential-first, whitelist-second, and a
-        // whitelist listener only exists when the list was non-empty.
-        if handles.len() > 1 {
-            if let Some(h) = handles.pop() {
-                h.abort();
-                // Bounded wait: the task only has to fall out of `accept()`.
-                let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
-            }
         }
     }
 
@@ -1766,53 +1757,32 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
         std::fs::write(&self.config_path, text)
             .map_err(|e| PoolError::Config(format!("保存白名单失败: {e}")))?;
 
-        // The running config is an `Arc` cloned at construction; replace it so
-        // later listener builds (including the ones just below) see the new
-        // list instead of the one loaded at boot.
+        // Publish to every reader at once. The parsed list lives in one
+        // `Arc<RwLock<_>>` shared by every listener, so this is the whole
+        // update: no socket is touched, no port is bound twice, and a
+        // connection arriving a microsecond later already sees the new list.
+        //
+        // Rebuilding the listeners instead (abort + rebind) was tried and does
+        // not work: `abort()` is asynchronous, the old task keeps the port
+        // bound until it next yields, and the replacement lost the bind with
+        // `EADDRINUSE` on roughly half the pool. Those instances kept enforcing
+        // the previous list while the API answered success.
         *self.live_whitelist.write().await = Some(entries.to_vec());
-
-        // Rebind every whitelist listener with the new networks.
-        let insts: Vec<Arc<Instance>> = self.instances.read().await.values().cloned().collect();
-        let mut rebound = 0usize;
-        for inst in insts {
-            if inst.status_now() == status::STOPPED {
-                continue;
-            }
-            // Only the whitelist listener is being replaced; the credential
-            // listener keeps running untouched.
-            Self::close_whitelist_listener(&inst).await;
-            if nets.is_empty() {
-                continue;
-            }
-            // A single retry, because the OS can still hold the port for a
-            // moment after the task exits. Losing the bind means this instance
-            // keeps enforcing the previous list, which is indistinguishable
-            // from "the edit did nothing" for whoever just added their IP.
-            let mut last_err = None;
-            for attempt in 0..3 {
-                if attempt > 0 {
-                    tokio::time::sleep(Duration::from_millis(150)).await;
-                }
-                match self.open_whitelist_listener(&inst, nets.clone()).await {
-                    Ok(()) => {
-                        rebound += 1;
-                        last_err = None;
-                        break;
-                    }
-                    Err(e) => last_err = Some(e),
-                }
-            }
-            if let Some(e) = last_err {
-                tracing::warn!(
-                    "warp-{} 白名单端口 {} 重建失败: {}",
-                    inst.index,
-                    inst.whitelist_port,
-                    e
-                );
-            }
+        {
+            // Scope the `std::sync` guard: it is not `Send`, and holding it
+            // across an `.await` makes the whole handler future non-`Send`,
+            // which axum rejects at compile time.
+            let mut g = self.nets.write().unwrap_or_else(|e| e.into_inner());
+            *g = nets;
         }
 
-        tracing::info!(count = entries.len(), rebound, "白名单已保存并热更新");
+        // Compute the count *before* the macro. `tracing::info!` builds a
+        // `format_args!` temporary that borrows its arguments; putting an
+        // `.await` inside the macro keeps that non-`Send` value alive across
+        // the await point, and the whole handler then fails to implement
+        // `axum::Handler` with a completely unrelated-looking error.
+        let ports = self.instances.read().await.len();
+        tracing::info!(count = entries.len(), ports, "白名单已保存并热更新");
         Ok(())
     }
 
@@ -2594,14 +2564,18 @@ mod tests {
             body.contains("live_whitelist"),
             "the live list must replace the boot-time snapshot"
         );
+        // The list is shared with every listener and swapped in place. The
+        // obvious alternative — abort the listener and rebind — loses the bind
+        // race with our own socket (`EADDRINUSE`), which left half the pool
+        // enforcing the previous list while the API reported success.
         assert!(
-            body.contains("close_whitelist_listener"),
-            "existing whitelist listeners must be rebound, otherwise the edit is \
-             invisible to every running instance"
+            body.contains("self.nets.write()"),
+            "the parsed list must be published to the shared handle, not \
+             rebuilt per listener"
         );
         assert!(
-            body.contains("open_whitelist_listener"),
-            "the listener must be reopened with the new networks"
+            include_str!("../../wg-socks/src/lib.rs").contains("Arc<std::sync::RwLock<Vec<ipnet::IpNet>>>"),
+            "the SOCKS server must read the whitelist under a lock so edits apply live"
         );
 
         // Every reader must consult the Manager, not the immutable config.

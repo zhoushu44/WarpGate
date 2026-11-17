@@ -65,7 +65,7 @@ async fn spawn_server(
         require_auth: false,
         username: "u".into(),
         password: "p".into(),
-        whitelist: Vec::new(),
+        whitelist: Arc::new(std::sync::RwLock::new(Vec::new())),
         dial: dial_echo(echo_addr),
         dial_timeout: Duration::from_secs(5),
         idle_timeout: Duration::ZERO,
@@ -217,7 +217,7 @@ async fn dial_failure_is_reported_as_a_socks_error() {
         require_auth: false,
         username: String::new(),
         password: String::new(),
-        whitelist: Vec::new(),
+        whitelist: Arc::new(std::sync::RwLock::new(Vec::new())),
         dial: dial_fail(),
         dial_timeout: Duration::from_secs(5),
         idle_timeout: Duration::ZERO,
@@ -249,7 +249,7 @@ async fn dial_failure_is_reported_as_a_socks_error() {
 async fn empty_whitelist_allows_every_source() {
     let (_s, addr, _e) = spawn_server(|s| {
         s.require_auth = false;
-        s.whitelist = Vec::new();
+        s.whitelist = Arc::new(std::sync::RwLock::new(Vec::new()));
     })
     .await;
     let mut c = TcpStream::connect(addr).await.unwrap();

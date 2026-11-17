@@ -50,7 +50,14 @@ pub struct Server {
     pub username: String,
     pub password: String,
     /// Source IPs allowed to connect. Empty = allow all (credential mode).
-    pub whitelist: Vec<ipnet::IpNet>,
+    ///
+    /// Behind a lock so an edit takes effect on the next connection without
+    /// rebinding the listener. Rebuilding the listener to change this was the
+    /// obvious approach and it does not work: `abort()` on the serving task is
+    /// asynchronous, so the port stays bound for an unpredictable moment and
+    /// the replacement loses the bind with `EADDRINUSE`. Roughly half the pool
+    /// kept enforcing the previous list while the API reported success.
+    pub whitelist: Arc<std::sync::RwLock<Vec<ipnet::IpNet>>>,
     pub dial: DialFn,
     pub dial_timeout: Duration,
     pub idle_timeout: Duration,
@@ -110,7 +117,13 @@ async fn handle_conn(
     peer: SocketAddr,
 ) -> std::io::Result<()> {
     // Whitelist mode: the source IP must match before anything else happens.
-    if !s.whitelist.is_empty() && !ip_allowed(peer.ip(), &s.whitelist) {
+    // Read under the lock each connection so a runtime edit lands immediately.
+    let nets = s
+        .whitelist
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if !nets.is_empty() && !ip_allowed(peer.ip(), &nets) {
         tracing::debug!("拒绝来源 {}（不在白名单）", peer.ip());
         return Ok(());
     }
