@@ -38,8 +38,15 @@ pub async fn require_auth(
     }
 
     // 1. Source IP bypass.
+    //
+    // Read through the Manager, not `st.cfg`: the whitelist is edited at
+    // runtime and `cfg` is the immutable copy loaded at boot. Consulting it
+    // here meant an IP added through `/api/whitelist` still got 401 until the
+    // service was restarted.
     let ip = super::routes::client_ip_of(&req);
-    if super::routes::is_loopback(&ip) || super::routes::is_whitelisted(&ip, &st.cfg.ip_whitelist) {
+    if super::routes::is_loopback(&ip)
+        || super::routes::is_whitelisted(&ip, &st.mgr.whitelist().await)
+    {
         return next.run(req).await;
     }
 

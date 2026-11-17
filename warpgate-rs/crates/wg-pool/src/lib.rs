@@ -200,6 +200,14 @@ pub struct Manager {
     /// A relative path would resolve against the process CWD, which is not
     /// where the service file points.
     config_path: std::path::PathBuf,
+    /// The live whitelist, when it differs from the one in `cfg`.
+    ///
+    /// `cfg` is an immutable `Arc<Config>` cloned at construction, but the
+    /// whitelist is edited at runtime through `/api/whitelist`. Without this
+    /// slot, instances attached *after* an edit (a restart, a new instance)
+    /// would rebuild their listeners from the boot-time list and silently
+    /// reject the IPs the operator just added.
+    live_whitelist: RwLock<Option<Vec<String>>>,
 }
 
 /// Sentinel for "not overridden".
@@ -271,6 +279,15 @@ impl Manager {
             probe_cursor: std::sync::atomic::AtomicUsize::new(0),
             resident_override: std::sync::atomic::AtomicI64::new(RESIDENT_UNSET),
             config_path,
+            live_whitelist: RwLock::new(None),
+        }
+    }
+
+    /// The whitelist in force right now (runtime edit wins over the boot copy).
+    pub async fn whitelist(&self) -> Vec<String> {
+        match self.live_whitelist.read().await.as_ref() {
+            Some(v) => v.clone(),
+            None => self.cfg.ip_whitelist.clone(),
         }
     }
 
@@ -1068,8 +1085,9 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
             opened += 1;
         }
 
-        if !self.cfg.ip_whitelist.is_empty() {
-            let nets = wg_socks::parse_whitelist(&self.cfg.ip_whitelist)
+        let whitelist = self.whitelist().await;
+        if !whitelist.is_empty() {
+            let nets = wg_socks::parse_whitelist(&whitelist)
                 .map_err(|e| PoolError::Config(e))?;
             if let Err(e) = self.open_whitelist_listener(&inst, nets).await {
                 tracing::warn!("warp-{} 白名单端口 {} 监听失败: {}", idx, inst.whitelist_port, e);
@@ -1167,6 +1185,22 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
         let mut handles = inst.listeners.lock().await;
         for h in handles.drain(..) {
             h.abort();
+        }
+    }
+
+    /// Abort only the whitelist listener, leaving the credential port serving.
+    ///
+    /// The whitelist is enforced per listener (`Server.whitelist`), so an edit
+    /// only needs this one rebound. Aborting the credential port too would drop
+    /// live connections for every caller that authenticates with a password.
+    async fn close_whitelist_listener(inst: &Instance) {
+        let mut handles = inst.listeners.lock().await;
+        // Listeners are pushed credential-first, whitelist-second, and a
+        // whitelist listener only exists when the list was non-empty.
+        if handles.len() > 1 {
+            if let Some(h) = handles.pop() {
+                h.abort();
+            }
         }
     }
 
@@ -1696,13 +1730,18 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
     /// touched — a freshly added IP saw `Unable to receive initial SOCKS5
     /// response` on every whitelist port.
     ///
-    /// The new list takes effect on the next instance (re)start; live listener
-    /// rebuilding would need a per-listener shutdown handle, which the SOCKS
-    /// server does not expose yet. Callers that need it immediately can hit
-    /// `/api/pool/rotate` or restart the service.
+    /// The whitelist is enforced by each instance's SOCKS listener, which
+    /// captures the parsed networks when it is bound. Changing the config
+    /// therefore has to rebuild those listeners, or a freshly added IP keeps
+    /// getting `Unable to receive initial SOCKS5 response` while the API says
+    /// success — which is exactly what happened before this was wired up.
+    ///
+    /// Rebuilding is safe now: `close_listeners` aborts the tasks (releasing
+    /// their ports) and the new listener resolves the tunnel dial per
+    /// connection, so no tunnel is disturbed.
     pub async fn set_whitelist(&self, entries: &[String]) -> Result<()> {
         // Validate before writing, so a typo cannot brick the file.
-        wg_socks::parse_whitelist(entries).map_err(|e| PoolError::Config(e))?;
+        let nets = wg_socks::parse_whitelist(entries).map_err(|e| PoolError::Config(e))?;
 
         let mut cfg = (*self.cfg).clone();
         cfg.ip_whitelist = entries.to_vec();
@@ -1711,10 +1750,36 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
         std::fs::write(&self.config_path, text)
             .map_err(|e| PoolError::Config(format!("保存白名单失败: {e}")))?;
 
-        tracing::info!(
-            count = entries.len(),
-            "白名单已保存（新实例生效；已有实例需重启）"
-        );
+        // The running config is an `Arc` cloned at construction; replace it so
+        // later listener builds (including the ones just below) see the new
+        // list instead of the one loaded at boot.
+        *self.live_whitelist.write().await = Some(entries.to_vec());
+
+        // Rebind every whitelist listener with the new networks.
+        let insts: Vec<Arc<Instance>> = self.instances.read().await.values().cloned().collect();
+        let mut rebound = 0usize;
+        for inst in insts {
+            if inst.status_now() == status::STOPPED {
+                continue;
+            }
+            // Only the whitelist listener is being replaced; the credential
+            // listener keeps running untouched.
+            Self::close_whitelist_listener(&inst).await;
+            if nets.is_empty() {
+                continue;
+            }
+            match self.open_whitelist_listener(&inst, nets.clone()).await {
+                Ok(()) => rebound += 1,
+                Err(e) => tracing::warn!(
+                    "warp-{} 白名单端口 {} 重建失败: {}",
+                    inst.index,
+                    inst.whitelist_port,
+                    e
+                ),
+            }
+        }
+
+        tracing::info!(count = entries.len(), rebound, "白名单已保存并热更新");
         Ok(())
     }
 
@@ -2472,6 +2537,50 @@ mod tests {
         assert!(
             src.contains("health_max_conns"),
             "the threshold must be configurable"
+        );
+    }
+
+    /// Editing the whitelist must take effect without a restart.
+    ///
+    /// Regression: `set_whitelist` only wrote the file and logged "新实例生效；
+    /// 已有实例需重启". The whitelist is enforced inside each SOCKS listener,
+    /// which captured the networks at bind time, so a freshly added IP kept
+    /// getting "Unable to receive initial SOCKS5 response" while the API
+    /// answered success. Worse, `/api/pool/acquire` and the auth middleware
+    /// both read `st.cfg` — the boot-time snapshot — so even the API kept
+    /// rejecting the new IP.
+    #[test]
+    fn whitelist_edits_apply_live() {
+        let src = include_str!("lib.rs");
+        let body = src
+            .split("pub async fn set_whitelist")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("set_whitelist must exist");
+        assert!(
+            body.contains("live_whitelist"),
+            "the live list must replace the boot-time snapshot"
+        );
+        assert!(
+            body.contains("close_whitelist_listener"),
+            "existing whitelist listeners must be rebound, otherwise the edit is \
+             invisible to every running instance"
+        );
+        assert!(
+            body.contains("open_whitelist_listener"),
+            "the listener must be reopened with the new networks"
+        );
+
+        // Every reader must consult the Manager, not the immutable config.
+        let api = include_str!("../../wg-apiserver/src/routes.rs");
+        assert!(
+            !api.contains("!st.cfg.ip_whitelist.is_empty()"),
+            "API handlers must read the live whitelist, not the boot snapshot"
+        );
+        let mw = include_str!("../../wg-apiserver/src/middleware.rs");
+        assert!(
+            mw.contains("st.mgr.whitelist().await"),
+            "auth must honour a whitelist entry added after boot"
         );
     }
 

@@ -493,8 +493,10 @@ async fn handle_job(Path(id): Path<String>) -> axum::response::Response {
 }
 
 async fn handle_get_whitelist(State(st): State<AppState>) -> axum::response::Response {
-    let list = st.cfg.ip_whitelist.clone();
-    ok(json!({ "ips": list, "whitelist": st.cfg.ip_whitelist, "client_ip": Value::Null }))
+    // Live list from the Manager, not `st.cfg`: the latter is the boot-time
+    // snapshot, so after an edit the console would show the old list.
+    let list = st.mgr.whitelist().await;
+    ok(json!({ "ips": list, "whitelist": list, "client_ip": Value::Null }))
 }
 
 /// `POST /api/whitelist`
@@ -518,7 +520,7 @@ async fn handle_set_whitelist(
     State(st): State<AppState>,
     Json(req): Json<WhitelistRequest>,
 ) -> axum::response::Response {
-    let mut list = st.cfg.ip_whitelist.clone();
+    let mut list = st.mgr.whitelist().await;
 
     if !req.add.trim().is_empty() {
         let v = req.add.trim().to_string();
@@ -605,7 +607,7 @@ async fn handle_proxies(
     // callers are other containers whose source IP is already allowed, so the
     // credential-free port is what they can actually use. Returning the
     // credential port here made every caller fail SOCKS5 auth.
-    let whitelist_active = !st.cfg.ip_whitelist.is_empty();
+    let whitelist_active = !st.mgr.whitelist().await.is_empty();
     let sep = if q.format == "rn" { "\r\n" } else { "\n" };
 
     let mut picked = Vec::new();
@@ -745,7 +747,7 @@ async fn handle_acquire(
             // `proxy_auth` carries the credentials inline so a caller that just
             // wants a working URL can use it directly, while `proxy` keeps the
             // old shape for callers that inject auth themselves.
-            let whitelist_active = !st.cfg.ip_whitelist.is_empty();
+            let whitelist_active = !st.mgr.whitelist().await.is_empty();
             let port = if whitelist_active {
                 inst.whitelist_port
             } else {
