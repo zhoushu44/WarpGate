@@ -342,29 +342,29 @@ impl ExternalEngine {
         // port that never binds. The Node version passes it because it ships an
         // older usque — verify the target binary's flags before adding any.
         //
-        // No `--always-reconnect` either, and that is the important part:
+        // No `--always-reconnect`. That is the single most important line here.
         //
         // Cloudflare rotates its edge certificates, so `EndpointPubKey` pinning
         // fails for a while (`x509: no valid chains built: remote endpoint has a
-        // different public key`). With `--always-reconnect` usque retries that
-        // failure once per second and opens a fresh TCP connection every time
-        // without closing the old one. Measured in production: 99 engines
-        // accumulated 4,076 sockets, and the pool lost usable IPs as
-        // Cloudflare's per-IP allowance ran out.
+        // different public key`), and anycast hands out non-MASQUE backends that
+        // fail the same way. With `--always-reconnect` usque retries once per
+        // second and opens a fresh TCP connection every time without closing the
+        // previous one. Measured in production at 99 instances: 8,674 sockets
+        // (87 per engine). The per-IP allowance then runs out and *every*
+        // tunnel fails at once, which looks exactly like "WARP is broken".
         //
         // Without the flag usque logs `Tunnel idle. Waiting for outbound
         // activity before reconnecting` and simply waits, so a failed tunnel
-        // costs one socket instead of one per second. The trade-off is that a
-        // dropped tunnel is rebuilt on the next request rather than eagerly,
-        // which the health probe (and any real traffic) triggers anyway.
+        // costs one socket instead of one per second. A dropped tunnel is
+        // rebuilt on the next request, which the health probe (and any real
+        // traffic) triggers anyway.
         cmd.arg("socks")
             .arg("-c")
             .arg(cfg_path)
             .arg("-b")
             .arg("127.0.0.1")
             .arg("-p")
-            .arg(engine_port.to_string())
-            .arg("--always-reconnect");
+            .arg(engine_port.to_string());
         if http2 {
             cmd.arg("--http2");
         }
@@ -812,19 +812,26 @@ mod probe_tests {
 }
 #[cfg(test)]
 mod engine_flag_tests {
-    /// The engine must be launched exactly like the Node version did.
+    /// The engine must be launched the way the Node version did, minus one flag.
     ///
-    /// `--always-reconnect` keeps the tunnel warm: without it the first client
-    /// request has to establish the tunnel and takes 3-25s, which callers see
-    /// as a timeout. `--idle-timeout` is deliberately absent because usque
-    /// v4.2.1 rejects it and exits ("unknown flag"), leaving a dead port.
+    /// `--always-reconnect` is the flag that a previous "restore old behaviour"
+    /// change put back, and it is what killed the pool: usque opened a new TCP
+    /// connection to Cloudflare on every retry without closing the old one.
+    /// 99 engines reached 8,674 sockets (87 each); the per-IP allowance ran out
+    /// and *every* tunnel stopped forwarding while the console still said
+    /// healthy. Do not put it back. A dropped tunnel is rebuilt by the health
+    /// probe on demand, which costs one socket instead of one per second.
+    ///
+    /// `--idle-timeout` is deliberately absent because usque v4.2.1 rejects it
+    /// and exits ("unknown flag"), leaving a dead port.
     #[test]
     fn engine_flags_match_the_node_version() {
         let src = include_str!("lib.rs");
         let prod = src.split("#[cfg(test)]").next().unwrap_or("");
         assert!(
-            prod.contains(r#".arg("--always-reconnect")"#),
-            "the warm tunnel depends on --always-reconnect; dropping it makes the first request take seconds"
+            !prod.contains(r#".arg("--always-reconnect")"#),
+            "--always-reconnect leaks one Cloudflare socket per retry per engine; \
+             it exhausted the per-IP allowance and killed the whole pool"
         );
         assert!(
             !prod.contains(r#".arg("--idle-timeout")"#),

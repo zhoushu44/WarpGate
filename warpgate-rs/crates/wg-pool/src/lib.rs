@@ -54,7 +54,19 @@ pub struct Instance {
     /// The last HTTP status a client reported for this exit.
     pub cf_last_code: RwLock<i64>,
     /// The outbound dial for this instance's SOCKS5 listeners.
+    ///
+    /// Listeners read this slot per connection (see [`Manager::live_dial`]),
+    /// so replacing it takes effect on the next request without rebinding.
     dial: RwLock<Option<wg_tunnel::DialFn>>,
+    /// The running SOCKS5 listener tasks.
+    ///
+    /// Bound once per instance and kept across data-plane restarts: the
+    /// listener reads `dial` per connection, so rebuilding the tunnel does not
+    /// need to rebind (which would fail with `EADDRINUSE` against our own
+    /// socket). Aborting these on stop/delete is what actually frees the port —
+    /// dropping the `Instance` alone never did, so a stopped instance kept
+    /// accepting TCP with no tunnel behind it.
+    listeners: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for Instance {
@@ -762,6 +774,7 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
             cf_last_code: RwLock::new(0),
             // The outbound dial for this instance's SOCKS5 listeners.
             dial: RwLock::new(None),
+            listeners: tokio::sync::Mutex::new(Vec::new()),
         });
         self.instances.write().await.insert(idx, inst.clone());
         Ok(inst)
@@ -1040,6 +1053,14 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
         // covers both the API-side probe and the SOCKS5 outbound.
         inst.tunnel.start(dial)?;
 
+        // Listeners are bound once per instance and resolve `dial` per
+        // connection, so a rebuild only swaps the tunnel underneath. Binding
+        // again here would hit `EADDRINUSE` on our own listener; when the list
+        // is empty this is the first attach and the ports are still free.
+        if !inst.listeners.lock().await.is_empty() {
+            return Ok(0);
+        }
+
         let mut opened = 0;
         if let Err(e) = self.open_credential_listener(&inst).await {
             tracing::warn!("warp-{} 账密端口 {} 监听失败: {}", idx, inst.port, e);
@@ -1059,46 +1080,38 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
         Ok(opened)
     }
 
-    /// Wrap a tunnel dial into the shape `wg_socks::Server` expects.
-    ///
-    /// The two dial traits differ only in arity (`socks` passes a context), so
-    /// the adapter ignores it rather than duplicating the dial logic.
-    fn socks_dial(dial: wg_tunnel::DialFn) -> wg_socks::DialFn {
-        Arc::new(move |_ctx, target| {
-            let dial = dial.clone();
-            Box::pin(async move { dial(target).await })
-        })
-    }
-    async fn open_credential_listener(&self, inst: &Instance) -> std::io::Result<()> {
+    async fn open_credential_listener(&self, inst: &Arc<Instance>) -> std::io::Result<()> {
         let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", inst.port)).await?;
-        let dial = inst.dial_now().unwrap_or_else(stub_dial);
         let server = Arc::new(wg_socks::Server {
             listener,
             require_auth: self.cfg.proxy_auth_enabled,
             username: self.cfg.proxy_username.clone(),
             password: self.cfg.proxy_password.clone(),
             whitelist: Vec::new(),
-            dial: Self::socks_dial(dial),
+            // Resolved per connection, not captured once: a data-plane restart
+            // replaces `inst.dial`, and a listener holding the old dial would
+            // keep forwarding into a dead tunnel forever.
+            dial: Self::live_dial(inst),
             dial_timeout: std::time::Duration::from_secs(20),
             idle_timeout: std::time::Duration::from_secs(
                 self.cfg.socks_tcp_timeout_seconds.max(0) as u64,
             ),
             resolve: None,
         });
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let _ = wg_socks::serve(server).await;
         });
+        inst.listeners.lock().await.push(handle);
         Ok(())
     }
 
     async fn open_whitelist_listener(
         &self,
-        inst: &Instance,
+        inst: &Arc<Instance>,
         nets: Vec<ipnet::IpNet>,
     ) -> std::io::Result<()> {
         let listener =
             tokio::net::TcpListener::bind(format!("0.0.0.0:{}", inst.whitelist_port)).await?;
-        let dial = inst.dial_now().unwrap_or_else(stub_dial);
         let server = Arc::new(wg_socks::Server {
             listener,
             // Whitelist mode: no credential, source IP decides.
@@ -1106,17 +1119,55 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
             username: String::new(),
             password: String::new(),
             whitelist: nets,
-            dial: Self::socks_dial(dial),
+            dial: Self::live_dial(inst),
             dial_timeout: std::time::Duration::from_secs(20),
             idle_timeout: std::time::Duration::from_secs(
                 self.cfg.socks_tcp_timeout_seconds.max(0) as u64,
             ),
             resolve: None,
         });
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let _ = wg_socks::serve(server).await;
         });
+        inst.listeners.lock().await.push(handle);
         Ok(())
+    }
+
+    /// Build a SOCKS dial that looks up the instance's current tunnel dial.
+    ///
+    /// The listener outlives the tunnel it was created for: `restart_engine`
+    /// swaps `inst.dial` to a freshly built tunnel while the port stays bound.
+    /// Capturing a `DialFn` at bind time would pin every later connection to
+    /// the old (dead) tunnel — that is the "port listens but nothing forwards"
+    /// symptom that made a rebuild look like a no-op.
+    fn live_dial(inst: &Arc<Instance>) -> wg_socks::DialFn {
+        let weak = Arc::downgrade(inst);
+        Arc::new(move |_ctx, target| {
+            let weak = weak.clone();
+            Box::pin(async move {
+                let Some(inst) = weak.upgrade() else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "实例已移除",
+                    ));
+                };
+                let Some(dial) = inst.dial_now() else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "隧道未启动",
+                    ));
+                };
+                dial(target).await
+            })
+        })
+    }
+
+    /// Abort an instance's SOCKS listeners, which releases its ports.
+    async fn close_listeners(inst: &Instance) {
+        let mut handles = inst.listeners.lock().await;
+        for h in handles.drain(..) {
+            h.abort();
+        }
     }
 
     /// Stop an instance: close the tunnel and listeners, keep the account.
@@ -1128,6 +1179,11 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
             .remove(&idx)
             .ok_or(PoolError::NotFound(idx))?;
         inst.tunnel.stop();
+        // Dropping the `Instance` is not enough: the listener tasks hold their
+        // own `Arc<wg_socks::Server>` and keep the port bound forever, so a
+        // "stopped" instance still accepted TCP and then failed every CONNECT.
+        Self::close_listeners(&inst).await;
+        Self::kill_engine(&inst.dir).await;
         let dir = inst.dir.clone();
         let mut meta = inst.meta().await;
         meta.status = status::STOPPED.to_string();
@@ -1406,8 +1462,13 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
     /// Probes right after start: otherwise a restarted instance keeps its
     /// stale (often empty) exit address and looks unhealthy forever, which
     /// made `start` appear to do nothing.
+    ///
+    /// `start_existing` only rebuilds the `Instance` bookkeeping; it installs
+    /// no data plane, so the port would be bound with no tunnel behind it and
+    /// every request would fail. Attach the engine too, exactly like boot.
     pub async fn start_instance(&self, idx: i64) -> Result<()> {
         self.start_existing(idx).await?;
+        self.attach_data_plane(idx).await;
         self.probe_one(idx).await;
         Ok(())
     }
@@ -1416,6 +1477,8 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
     pub async fn delete_instance(&self, idx: i64) -> Result<()> {
         if let Some(inst) = self.instances.write().await.remove(&idx) {
             inst.tunnel.stop();
+            Self::close_listeners(&inst).await;
+            Self::kill_engine(&inst.dir).await;
         }
         wg_store::remove(&wg_store::dir(&self.base, idx))?;
         Ok(())
@@ -1471,6 +1534,21 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
     /// again from the same `usque.json`. No re-registration, so the exit IP is
     /// unchanged — this is the recovery path for a wedged tunnel, and it must
     /// never delete anything.
+    ///
+    /// This has to do three things, and for a long time it did only the first:
+    ///
+    /// 1. `tunnel.stop()` — drop the dial so new requests fail fast.
+    /// 2. **Kill the engine process.** `usque` ignores SIGTERM while it is
+    ///    reconnecting and, being `kill_on_drop(false)`, outlives us. Without
+    ///    this the old process keeps its Cloudflare sockets and its port, and
+    ///    the replacement either loses the bind race or doubles the connection
+    ///    count.
+    /// 3. **Reattach the data plane.** The old `start_with_config` call built a
+    ///    brand-new `Instance` with `dial: None` and a closed socket; every
+    ///    "restart" therefore replaced a working port with an empty shell that
+    ///    could never pass the next probe. Production logged 43,647 restarts
+    ///    in nine days and recovered zero instances — the sweep was restarting
+    ///    the same corpse forever.
     pub async fn restart_engine(&self, idx: i64) -> Result<()> {
         let inst = self
             .instances
@@ -1480,10 +1558,86 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
             .cloned()
             .ok_or(PoolError::NotFound(idx))?;
         inst.tunnel.stop();
-        let Some(ucfg) = wg_store::UsqueConfig::read(&inst.dir)? else {
+
+        // Step 2: kill the process that owns the sockets, and wait for the
+        // kernel to release them before the replacement tries to bind.
+        Self::kill_engine(&inst.dir).await;
+
+        // Fail before spawning anything if the account is gone: the engine
+        // would only log a confusing "no such file" otherwise.
+        if wg_store::UsqueConfig::read(&inst.dir)?.is_none() {
             return Err(PoolError::InstanceError(idx, "缺少 usque.json".into()));
+        }
+
+        // Step 3: rebuild the data plane on the *same* `Instance`, so the
+        // listeners and their ports survive.
+        self.attach_data_plane(idx).await;
+        Ok(())
+    }
+
+    /// Attach whichever data plane this deployment is configured for.
+    ///
+    /// Mirrors the boot-time decision in `wg-bin`, so a runtime restart never
+    /// contradicts how the process came up: `WARP_NATIVE=h2` means the native
+    /// CONNECT-IP path, `quic` means the `usque` subprocess (the flag names the
+    /// transport shape, and UDP 443 is blocked on these hosts, so it selects
+    /// the engine), and unset falls back to the historical `masque_http2`.
+    ///
+    /// A failure is logged and the instance is demoted, not propagated: the
+    /// caller asked to start the instance, and a running-but-unhealthy one is
+    /// more useful than an error that leaves it half-started.
+    pub async fn attach_data_plane(&self, idx: i64) {
+        let mode = std::env::var("WARP_NATIVE").unwrap_or_default();
+        let use_engine = match mode.as_str() {
+            "h2" => false,
+            "quic" => true,
+            _ => self.cfg.masque_http2 || std::env::var("WARP_FORCE_ENGINE").is_ok(),
         };
-        self.start_with_config(idx, ucfg, false).await.map(|_| ())
+        let res = if use_engine {
+            self.attach_engine(idx, &self.engine_binary(), self.cfg.masque_http2)
+                .await
+                .map(|_| ())
+        } else {
+            self.attach_masque(idx).await.map(|_| ())
+        };
+        if let Err(e) = res {
+            tracing::warn!("warp-{} 数据面启动失败: {}", idx, e);
+            if let Some(inst) = self.get(idx).await {
+                inst.set_status(wg_core::status::UNHEALTHY).await;
+            }
+        }
+    }
+
+    /// The `usque` binary this Manager starts engines from.
+    fn engine_binary(&self) -> String {
+        std::env::var("WARP_USQUE_BIN").unwrap_or_else(|_| "/usr/local/bin/usque".to_string())
+    }
+
+    /// SIGKILL the engine serving `dir` and wait for its sockets to go away.
+    ///
+    /// `usque` ignores SIGTERM while reconnecting, so SIGKILL is the only
+    /// signal that reliably lands. Waiting matters: the port is only free after
+    /// the process is reaped, and the caller is about to bind it again.
+    async fn kill_engine(dir: &std::path::Path) {
+        let Some(pid) = Self::find_engine_pid(dir) else {
+            return;
+        };
+        #[cfg(unix)]
+        {
+            // SAFETY: kill() with a pid we just read from /proc.
+            unsafe {
+                libc_kill(pid as i32, 9);
+            }
+        }
+        // Give the kernel a moment to tear the sockets down. The engine holds
+        // dozens of Cloudflare connections; releasing them is not instant.
+        for _ in 0..40 {
+            if !wg_tunnel::process_alive(pid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     // ---------------------------------------------------------------- queries
@@ -2068,7 +2222,8 @@ mod tests {
         // over the network and runs for minutes.
         m.set_create_fn(Arc::new(|_idx| {
             Box::pin(async { Err("offline test: no registration".to_string()) })
-        }));
+        }))
+        .await;
         let cancel = tokio_util::sync::CancellationToken::new();
         m.boot(&cancel).await;
 
@@ -2317,6 +2472,97 @@ mod tests {
     #[test]
     fn engine_conn_count_handles_missing_pid() {
         assert_eq!(Manager::engine_conn_count(u32::MAX), None);
+    }
+
+    /// A data-plane restart must kill the old process and rebuild the tunnel.
+    ///
+    /// Regression, and the worse of the two bugs: `restart_engine` used to call
+    /// `tunnel.stop()` and then `start_with_config`, which builds a *new*
+    /// `Instance` with no dial and no listeners. The port went dead, the next
+    /// probe failed, the sweep restarted again — 43,647 restarts in nine days
+    /// and not one recovery. Meanwhile the old `usque` kept running with all
+    /// its Cloudflare sockets, because nothing ever signalled it.
+    ///
+    /// A source-level assertion is the honest test here: the failure mode is
+    /// "someone deletes a step from this function", and exercising it needs a
+    /// real usque binary and a real Cloudflare account.
+    #[test]
+    fn restart_engine_kills_the_engine_and_reattaches() {
+        let src = include_str!("lib.rs");
+        let body = src
+            .split("pub async fn restart_engine")
+            .nth(1)
+            .and_then(|s| s.split("fn engine_binary").next())
+            .expect("restart_engine must exist");
+        assert!(
+            body.contains("kill_engine"),
+            "restart must SIGKILL the old usque: it ignores SIGTERM while reconnecting \
+             and keeps its Cloudflare sockets, so skipping this doubles the leak"
+        );
+        assert!(
+            body.contains("attach_data_plane"),
+            "restart must reattach the data plane: building a fresh Instance without a \
+             dial leaves a bound port with no tunnel, which no probe can ever pass"
+        );
+        assert!(
+            !body.contains("start_with_config"),
+            "restart must not go through start_with_config: it replaces the Instance and \
+             discards the SOCKS listeners, which is exactly what made the old restart a no-op"
+        );
+    }
+
+    /// Stop/delete must actually free the port.
+    ///
+    /// Dropping the `Instance` never stopped `wg_socks::serve`: the spawned
+    /// task owns its own `Arc<Server>` and keeps the listener bound. A
+    /// "stopped" instance therefore still accepted TCP and failed every
+    /// CONNECT, and a later start could not rebind (`EADDRINUSE`).
+    #[test]
+    fn stopping_an_instance_closes_its_listeners() {
+        let src = include_str!("lib.rs");
+        for f in ["pub async fn stop_instance", "pub async fn delete_instance"] {
+            let body = src
+                .split(f)
+                .nth(1)
+                .and_then(|s| s.split("\n    }").next())
+                .unwrap_or_default();
+            assert!(
+                body.contains("close_listeners"),
+                "{f} must abort its listener tasks, otherwise the port stays bound"
+            );
+        }
+    }
+
+    /// The listener must resolve the dial per connection.
+    ///
+    /// Capturing the `DialFn` at bind time pins the listener to the tunnel that
+    /// existed then. After a rebuild it keeps forwarding into the dead one, so
+    /// the port looks open and never works again.
+    #[test]
+    fn listeners_resolve_the_dial_per_connection() {
+        let src = include_str!("lib.rs");
+        assert!(
+            src.contains("fn live_dial"),
+            "listeners need a per-connection dial lookup"
+        );
+        for f in [
+            "async fn open_credential_listener",
+            "async fn open_whitelist_listener",
+        ] {
+            let body = src
+                .split(f)
+                .nth(1)
+                .and_then(|s| s.split("\n    }").next())
+                .unwrap_or_default();
+            assert!(
+                body.contains("live_dial"),
+                "{f} must use live_dial, not a captured dial"
+            );
+            assert!(
+                !body.contains("dial_now().unwrap_or_else(stub_dial)"),
+                "{f} must not capture the dial once at bind time"
+            );
+        }
     }
     /// `resident_count` is a ceiling: boot must not start more than that many
     /// instances even when the directory holds more.
