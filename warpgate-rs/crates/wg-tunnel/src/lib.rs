@@ -165,6 +165,17 @@ impl Tunnel {
         *self.resilient.lock().unwrap_or_else(|e| e.into_inner()) = Some(t);
     }
 
+    /// The resilient tunnel installed for this instance, if any.
+    ///
+    /// Lets callers observe rebuild state (see `ResilientTunnel::is_reconnecting`)
+    /// without owning the tunnel.
+    pub fn resilient(&self) -> Option<std::sync::Arc<crate::connectip::ResilientTunnel>> {
+        self.resilient
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// Take ownership of the native tunnel for this instance.
     ///
     /// Parking it here ties its lifetime to `stop()`: dropping the instance

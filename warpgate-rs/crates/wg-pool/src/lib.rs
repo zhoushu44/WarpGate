@@ -1380,6 +1380,20 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
             return false;
         };
 
+        // A tunnel that is being rebuilt right now is neither healthy nor
+        // dead. At 184 instances a reset lands every few seconds somewhere in
+        // the pool, so the sweep always catches a few instances mid-rebuild;
+        // counting those as failures made `unhealthy` oscillate 3-4 on a pool
+        // where every port answered (2026-11-19). The rebuild finishes in
+        // ~200 ms normally; the next sweep will see the live tunnel.
+        if inst
+            .tunnel
+            .resilient()
+            .is_some_and(|t| t.is_reconnecting())
+        {
+            return true;
+        }
+
         let timeout = std::time::Duration::from_secs(12);
         let v6_url = self.cfg.ip_check_url_v6.trim().to_string();
         let v4_url = self.cfg.ip_check_url.trim().to_string();
@@ -2727,6 +2741,34 @@ mod tests {
                 && prod.contains("CF_ENDPOINT_V4"),
             "the untrusted node must be replaced with a known-good one"
         );
+    }
+
+    /// A probe that lands mid-rebuild must not count as a failure.
+    ///
+    /// At 184 instances Cloudflare resets a stream every few seconds somewhere
+    /// in the pool, so the sweep always catches a few tunnels mid-rebuild.
+    /// Counting those as failures made `unhealthy` oscillate 3-4 on a pool
+    /// where all 184 ports answered requests normally (2026-11-19 01:47).
+    ///
+    /// This is the third instance of the same mistake: "unknown" is not
+    /// "broken" (see the empty-URL skip and the pending bucket).
+    #[test]
+    fn probing_a_rebuilding_tunnel_is_a_skip_not_a_failure() {
+        let src = include_str!("lib.rs");
+        let body = src
+            .split("async fn probe_one")
+            .nth(1)
+            .and_then(|s| s.split("async fn probe_batch").next())
+            .expect("probe_one must exist");
+        assert!(
+            body.contains("is_reconnecting()"),
+            "probe_one must skip a tunnel that is being rebuilt"
+        );
+        // The skip has to happen before the probe dials, otherwise it burns the
+        // 12 s probe timeout waiting for the rebuild it should have skipped.
+        let skip = body.find("is_reconnecting()").unwrap();
+        let dial = body.find("wg_tunnel::probe_exit").unwrap();
+        assert!(skip < dial, "the skip must precede the dial");
     }
 
     /// `create` and `rebuild` must attach the data plane, not just register.

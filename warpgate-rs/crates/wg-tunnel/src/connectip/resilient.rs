@@ -119,6 +119,17 @@ impl ResilientTunnel {
         self.reconnects.load(Ordering::Relaxed)
     }
 
+    /// Whether a rebuild is in flight right now.
+    ///
+    /// The health sweep uses this to tell "being replaced" from "dead": with
+    /// 184 instances Cloudflare resets a stream every few seconds somewhere in
+    /// the pool, so at any instant a few tunnels are mid-rebuild. Probing one
+    /// of those used to count as a failure, and `unhealthy` oscillated 3-4 on
+    /// a pool where every port answered.
+    pub fn is_reconnecting(&self) -> bool {
+        self.reconnecting.load(Ordering::SeqCst)
+    }
+
     /// Mark the current tunnel dead so the next dial rebuilds it.
     ///
     /// Called by the stack's reader task when the HTTP/2 stream is reset; there
