@@ -1326,21 +1326,34 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
         };
 
         let timeout = std::time::Duration::from_secs(12);
-        let v6 = {
-            let url = self.cfg.ip_check_url_v6.trim();
-            if url.is_empty() {
-                String::new()
-            } else {
-                wg_tunnel::probe_exit(&dial, url, timeout).await.0
+        let v6_url = self.cfg.ip_check_url_v6.trim().to_string();
+        let v4_url = self.cfg.ip_check_url.trim().to_string();
+
+        // Both probe URLs disabled: there is nothing to check against, so treat
+        // the tunnel as up if a dial can be installed. Returning a failure here
+        // would mean "turning off the IP probe turns off health checking",
+        // which showed up as a pool reporting `available: 0, unhealthy: 10`
+        // while 9 of its 10 ports were serving requests fine.
+        if v6_url.is_empty() && v4_url.is_empty() {
+            inst.fail_streak.store(0, std::sync::atomic::Ordering::Relaxed);
+            {
+                let mut m = inst.meta.write().await;
+                if m.status != status::RUNNING {
+                    m.status = status::RUNNING.to_string();
+                }
             }
+            return true;
+        }
+
+        let v6 = if v6_url.is_empty() {
+            String::new()
+        } else {
+            wg_tunnel::probe_exit(&dial, &v6_url, timeout).await.0
         };
-        let v4 = {
-            let url = self.cfg.ip_check_url.trim();
-            if url.is_empty() {
-                String::new()
-            } else {
-                wg_tunnel::probe_exit(&dial, url, timeout).await.1
-            }
+        let v4 = if v4_url.is_empty() {
+            String::new()
+        } else {
+            wg_tunnel::probe_exit(&dial, &v4_url, timeout).await.1
         };
 
         // Either address answering proves the tunnel carries traffic: v6 is the
@@ -2595,6 +2608,43 @@ mod tests {
     #[test]
     fn engine_conn_count_handles_missing_pid() {
         assert_eq!(Manager::engine_conn_count(u32::MAX), None);
+    }
+
+    /// Disabling the IP probe must not disable health checking.
+    ///
+    /// Regression: with both `ip_check_url` and `ip_check_url_v6` empty,
+    /// `probe_one` produced two empty strings and fell through to
+    /// `mark_probe_failed` — so an operator who turned the probe off (or a
+    /// deployment that leaves the keys blank) watched the whole pool report
+    /// `available: 0, unhealthy: N` while every port still served traffic.
+    /// Measured on the h2 pool: 9 of 10 ports answered 200, console said 0.
+    #[test]
+    fn empty_probe_urls_mean_skip_not_fail() {
+        let src = include_str!("lib.rs");
+        let body = src
+            .split("async fn probe_one")
+            .nth(1)
+            .and_then(|s| s.split("/// Find the `usque socks` process").next())
+            .expect("probe_one must exist");
+        assert!(
+            body.contains("if v6_url.is_empty() && v4_url.is_empty()"),
+            "probe_one must short-circuit when no probe URL is configured"
+        );
+        // The short-circuit has to come before the "both empty => failed"
+        // branch, otherwise it is dead code. Search past the `No dial means no
+        // tunnel` guard, which legitimately fails earlier.
+        let after_dial = body
+            .find("let timeout = std::time::Duration::from_secs(12)")
+            .expect("probe_one must set a timeout after the dial guard");
+        let skip = body.find("v6_url.is_empty() && v4_url.is_empty()").unwrap();
+        let fail_after = body[after_dial..]
+            .find("mark_probe_failed")
+            .map(|p| p + after_dial)
+            .expect("the empty-result failure branch must exist");
+        assert!(
+            skip < fail_after,
+            "the skip must be evaluated before the empty-result failure branch"
+        );
     }
 
     /// A data-plane restart must kill the old process and rebuild the tunnel.
