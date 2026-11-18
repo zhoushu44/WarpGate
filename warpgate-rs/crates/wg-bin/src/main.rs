@@ -11,6 +11,20 @@ use tokio_util::sync::CancellationToken;
 use wg_config::Config;
 use wg_pool::Manager;
 
+/// Process-wide allocator.
+///
+/// glibc's malloc keeps freed memory in per-thread arenas and does not hand it
+/// back to the kernel, so a long-running pool only ever grows. Measured on 70
+/// instances (2026-11-18): `VmRSS == VmHWM` (14,980 kB — RSS had never once
+/// decreased) and `VmSize` 1.16 GB with `VmData` at 1.15 GB, i.e. the heap had
+/// ballooned even though live data was a few MB. Tunnel churn (Cloudflare
+/// resets a stream every few minutes, each triggering a full rebuild that
+/// allocates a new smoltcp stack) makes this permanent rather than transient.
+///
+/// mimalloc returns pages to the OS and keeps fragmentation bounded.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// WarpGate: an embedded single-process WARP proxy pool.
 #[derive(Parser, Debug)]
 #[command(name = "warpgate", version, about)]
