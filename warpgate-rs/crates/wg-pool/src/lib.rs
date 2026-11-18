@@ -900,9 +900,9 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
             })?;
             let tunnel = std::sync::Arc::new(tunnel);
             let dial = tunnel.dial_fn();
-            // Rebuild even when the instance sees no traffic, so a stream reset
-            // does not leave a silently dead port in the pool.
-            tunnel.spawn_health_loop();
+            // `set_resilient` starts the idle-rebuild watcher and owns its
+            // handle; spawning it here as well would leave a second, unstoppable
+            // loop pinning the tunnel after every attach.
             inst.tunnel.set_resilient(tunnel);
             return self.attach_dial(idx, dial).await;
         }

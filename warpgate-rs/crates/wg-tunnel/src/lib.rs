@@ -114,6 +114,15 @@ pub struct Tunnel {
     native: std::sync::Mutex<Option<std::sync::Arc<crate::connectip::NativeTunnel>>>,
     /// The self-healing native tunnel, when that path is in use.
     resilient: std::sync::Mutex<Option<std::sync::Arc<crate::connectip::ResilientTunnel>>>,
+    /// The idle-rebuild task belonging to `resilient`.
+    ///
+    /// Held so it can be aborted when the tunnel is replaced. `JoinHandle::drop`
+    /// only detaches, and that loop runs forever holding an `Arc<ResilientTunnel>`
+    /// — which in turn pins the `NativeTunnel` and its whole smoltcp stack.
+    /// Every `attach_masque` call (boot, restart, scaling) started one, so the
+    /// pool leaked a full tunnel per attach: measured 2026-11-19 at 184
+    /// instances, memory rose 18 -> 49 MB over ~2.5 h in step with rebuilds.
+    resilient_health: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 // Status as a u8 so it can live in an atomic.
@@ -152,6 +161,7 @@ impl Tunnel {
             started_at: std::sync::Mutex::new(None),
             native: std::sync::Mutex::new(None),
             resilient: std::sync::Mutex::new(None),
+            resilient_health: std::sync::Mutex::new(None),
         }
     }
 
@@ -161,7 +171,25 @@ impl Tunnel {
 
 
     /// Take ownership of the resilient tunnel for this instance.
+    ///
+    /// Aborts the previous tunnel's idle-rebuild task first. That task runs
+    /// forever with its own `Arc` of the tunnel it was started for, so leaving
+    /// it running keeps the old tunnel — and every smoltcp stack under it —
+    /// alive after the swap.
     pub fn set_resilient(&self, t: std::sync::Arc<crate::connectip::ResilientTunnel>) {
+        if let Some(old) = self
+            .resilient_health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            old.abort();
+        }
+        let health = t.spawn_health_loop();
+        *self
+            .resilient_health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(health);
         *self.resilient.lock().unwrap_or_else(|e| e.into_inner()) = Some(t);
     }
 
@@ -232,6 +260,21 @@ impl Tunnel {
     /// with [`TunnelError::NotStarted`].
     pub fn stop(&self) {
         *self.dial.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // Stop the idle-rebuild watcher too: it holds an `Arc` of the tunnel,
+        // so leaving it running would keep the stack (and its buffers) alive
+        // after the instance is stopped or replaced.
+        if let Some(h) = self
+            .resilient_health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            h.abort();
+        }
+        *self
+            .resilient
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         self.status
             .store(S_STOPPED, std::sync::atomic::Ordering::SeqCst);
     }
@@ -512,6 +555,52 @@ unsafe fn libc_kill(pid: i32, sig: i32) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    /// The idle-rebuild task must be owned, not orphaned.
+    ///
+    /// `spawn_health_loop` returns a `JoinHandle`; dropping it merely detaches
+    /// the task, and that loop runs forever holding an `Arc<ResilientTunnel>`,
+    /// which pins the `NativeTunnel` and its smoltcp stack. Every
+    /// `attach_masque` started one, so the pool leaked a whole tunnel per
+    /// attach/rebuild.
+    ///
+    /// Measured 2026-11-19 at 184 instances: 18 -> 49 MB in ~2.5 h, growth
+    /// tracking `native tunnel rebuilt` exactly.
+    #[test]
+    fn the_idle_rebuild_task_is_owned_and_aborted() {
+        let src = include_str!("lib.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+
+        assert!(
+            prod.contains("resilient_health: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>"),
+            "Tunnel must hold the health-loop handle"
+        );
+        // set_resilient: abort the old task, then start and store the new one.
+        let set = prod
+            .split("pub fn set_resilient")
+            .nth(1)
+            .and_then(|s| s.split("/// Take ownership of the native tunnel").next())
+            .expect("set_resilient must exist");
+        assert!(
+            set.contains("old.abort()"),
+            "replacing a tunnel must abort the previous watcher"
+        );
+        assert!(
+            set.contains("spawn_health_loop()"),
+            "set_resilient is now the single owner that starts the watcher"
+        );
+        // stop(): release both the task and the tunnel.
+        let stop = prod
+            .split("pub fn stop(&self)")
+            .nth(1)
+            .and_then(|s| s.split("/// Open a TCP connection").next())
+            .expect("stop must exist");
+        assert!(stop.contains("h.abort()"), "stop must abort the watcher");
+        assert!(
+            stop.contains("*self") && stop.contains("= None"),
+            "stop must also drop the tunnel it was watching"
+        );
+    }
+
     use super::*;
 
     fn sample_cfg() -> UsqueConfig {
