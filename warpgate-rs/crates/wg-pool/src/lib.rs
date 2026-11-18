@@ -612,7 +612,15 @@ impl Manager {
             }
         };
 
-        self.start_with_config(idx, ucfg, true).await.map(|_| ())
+        // Registering is not enough. `start_with_config` only books the
+        // instance (no dial, no listeners); without the attach the pool counts
+        // it as running while its port is never bound. `/api/create` on a
+        // deleted index showed exactly that: healthy 120/120 with port 10092
+        // permanently closed (2026-11-18, warp-82 after a re-registration).
+        self.start_with_config(idx, ucfg, true).await?;
+        self.attach_data_plane(idx).await;
+        self.probe_one(idx).await;
+        Ok(())
     }
 
     /// Register a fresh anonymous WARP account.
@@ -1600,7 +1608,13 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
         std::fs::create_dir_all(&dir)
             .map_err(|e| PoolError::InstanceError(idx, e.to_string()))?;
         ucfg.save(&wg_store::paths::usque_conf_path(&dir))?;
-        self.start_with_config(idx, ucfg, false).await.map(|_| ())
+        // Same reasoning as `create`: `start_with_config` alone books the
+        // instance without a data plane, leaving its port closed while the
+        // console reports it running.
+        self.start_with_config(idx, ucfg, false).await?;
+        self.attach_data_plane(idx).await;
+        self.probe_one(idx).await;
+        Ok(())
     }
 
 
@@ -2674,6 +2688,31 @@ mod tests {
     #[test]
     fn engine_conn_count_handles_missing_pid() {
         assert_eq!(Manager::engine_conn_count(u32::MAX), None);
+    }
+
+    /// `create` and `rebuild` must attach the data plane, not just register.
+    ///
+    /// Both ended with `start_with_config(...)` which only books the instance
+    /// (no dial, no listeners). `/api/create` on a deleted index then reported
+    /// `healthy 120/120` while that port stayed closed forever — the console
+    /// counted a shell. `start_instance` already did this correctly; `create`
+    /// and `rebuild` are the same family as the reconcile bug fixed in
+    /// 0.13.11 (measured 2026-11-18 on warp-82, port 10092).
+    #[test]
+    fn create_and_rebuild_attach_the_data_plane() {
+        let src = include_str!("lib.rs");
+        for f in ["pub async fn create(", "pub async fn rebuild("] {
+            let body = src
+                .split(f)
+                .nth(1)
+                .and_then(|s| s.split("\n    pub async fn ").next())
+                .unwrap_or_else(|| panic!("{f} must exist"));
+            assert!(
+                body.contains("attach_data_plane"),
+                "{f} must attach the data plane after registering, or the port \
+                 never binds while the console reports the instance running"
+            );
+        }
     }
 
     /// A persisted `stopped` must not veto a start request.
