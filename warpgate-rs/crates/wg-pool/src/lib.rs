@@ -2657,6 +2657,49 @@ mod tests {
         assert_eq!(Manager::engine_conn_count(u32::MAX), None);
     }
 
+    /// Health checking must not start before the data plane is attached.
+    ///
+    /// Startup used to spawn the boot task and immediately call
+    /// `start_loops`, so the health sweep began probing while bring-up was
+    /// still attaching tunnels. Every instance that had not been reached yet
+    /// looked dead (no dial), collected a failure streak, and was demoted.
+    ///
+    /// Measured 2026-11-18 on 40 instances: attach was serial at 1-3 s each,
+    /// only 8 had finished inside the first 18 s, and the pool settled at
+    /// `healthy 30/40` with indices 30-39 permanently `unhealthy` — while all
+    /// 40 ports answered requests normally.
+    ///
+    /// Two invariants: attach in parallel, and start the loops only after the
+    /// attach pass is done.
+    #[test]
+    fn health_loops_start_after_the_data_plane_is_attached() {
+        let src = include_str!("../../wg-bin/src/main.rs");
+
+        let attach = src
+            .find("attach_masque(inst.index)")
+            .expect("the boot task must attach the native data plane");
+        let loops = src
+            .find("boot_mgr.start_loops")
+            .expect("the boot task must start the loops itself");
+        assert!(
+            attach < loops,
+            "start_loops must run after the attach pass; starting it first lets \
+             the sweep demote instances whose tunnel is still being built"
+        );
+        assert!(
+            !src.contains("    mgr.start_loops(cancel.clone());"),
+            "start_loops must not be called from the main flow: that races the \
+             boot task"
+        );
+        // Parallel attach: serialised bring-up for a large pool takes minutes
+        // and guarantees the race above.
+        assert!(
+            src.contains("Semaphore::new(8)"),
+            "the attach pass must run concurrently, or bring-up outlives the \
+             first health sweep"
+        );
+    }
+
     /// Disabling the IP probe must not disable health checking.
     ///
     /// Regression: with both `ip_check_url` and `ip_check_url_v6` empty,

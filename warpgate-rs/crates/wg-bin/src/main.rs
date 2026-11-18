@@ -168,13 +168,35 @@ async fn main() -> ExitCode {
             }
             tracing::info!(target: "BOOT", "数据面就绪 {}/{}（失败 {}）", ok, ok + failed, failed);
         } else {
+            // Attach concurrently. Each `attach_masque` builds a real HTTP/2
+            // CONNECT-IP tunnel and retries the non-MASQUE edge nodes it
+            // sometimes lands on, so a single instance costs 1-3 seconds.
+            // Serially that is ~2 s × resident: 40 instances took 80 s, and the
+            // health sweep (which starts immediately) demoted every instance
+            // that had not been attached yet — the pool reported
+            // `healthy 30/40` with 10 permanently `unhealthy` even though all
+            // 40 ports answered. Attaching in parallel keeps bring-up inside
+            // one sweep interval.
+            let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
+            let mut tasks = Vec::new();
             for inst in boot_mgr.all().await {
                 if boot_cancel.is_cancelled() {
                     return;
                 }
-                if let Err(e) = boot_mgr.attach_masque(inst.index).await {
-                    tracing::warn!(target: "BOOT", "warp-{} MASQUE 失败: {}", inst.index, e);
-                }
+                let m = boot_mgr.clone();
+                let permit = match sem.clone().acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                tasks.push(tokio::spawn(async move {
+                    let _permit = permit;
+                    if let Err(e) = m.attach_masque(inst.index).await {
+                        tracing::warn!(target: "BOOT", "warp-{} MASQUE 失败: {}", inst.index, e);
+                    }
+                }));
+            }
+            for t in tasks {
+                let _ = t.await;
             }
         }
 
@@ -185,9 +207,16 @@ async fn main() -> ExitCode {
             boot_mgr.config().resident_count,
             boot_start.elapsed()
         );
-    });
 
-    mgr.start_loops(cancel.clone());
+        // Only now start the background loops.
+        //
+        // The health sweep demotes any instance that misses two probes. While
+        // bring-up was still running it saw instances that simply had no data
+        // plane yet and marked them `unhealthy` — and because the sweep and
+        // the attach raced, some never recovered. Starting the loops after the
+        // data plane is in place means the first probe sees a real tunnel.
+        boot_mgr.start_loops(boot_cancel.clone());
+    });
 
     // The API.
     let auth = Arc::new(wg_apiserver::AuthState::new(&cfg.api_key));
