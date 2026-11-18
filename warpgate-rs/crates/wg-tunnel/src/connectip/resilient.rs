@@ -125,11 +125,37 @@ impl ResilientTunnel {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            // Someone else is rebuilding; wait for their result.
+            // Someone else is rebuilding; wait for *their* result.
+            //
+            // Two separate bugs used to turn this into a permanent 30-second
+            // spin. Both are about the same mistake — treating "the slot has
+            // something in it" as "the tunnel is usable":
+            //
+            //  1. `mark_dead()` only sets the flag, it does not clear
+            //     `current`. So the dead tunnel stayed in the slot and every
+            //     waiter below grabbed it as if it were fresh.
+            //  2. Even a freshly rebuilt tunnel does not help if the rebuild
+            //     itself failed; returning whatever is in `current` hides that.
+            //
+            // Production symptom (10 instances, ~45 min): 60 logs of
+            // `idle tunnel rebuild failed error=tunnel rebuild timed out`, one
+            // every 30 idle-tick — exactly the 150 × 200 ms budget below, so
+            // the wait always ran to exhaustion while the rebuild flag stayed
+            // stuck and the real rebuild never started.
             for _ in 0..150 {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 if let Some(t) = self.current.lock().await.clone() {
-                    return Ok(t);
+                    // Only accept a tunnel that is actually alive; otherwise
+                    // keep waiting for the real rebuild to publish one.
+                    if !t.is_dead() {
+                        return Ok(t);
+                    }
+                }
+                // The rebuilder gave up (flag released) without producing a
+                // tunnel. Waiting the full budget would just repeat its error
+                // 30 seconds later, so fail fast and let the caller retry.
+                if !self.reconnecting.load(Ordering::SeqCst) {
+                    return Err("tunnel rebuild failed; no live tunnel".into());
                 }
             }
             return Err("tunnel rebuild timed out".into());
@@ -167,6 +193,13 @@ impl ResilientTunnel {
                     last = e;
                 }
             }
+        }
+        // Leave the slot empty on total failure. A dead tunnel left here looks
+        // like a usable one to every waiter in `ensure()`, which is what made
+        // the idle loop spin instead of reporting a clean error.
+        {
+            let mut slot = self.current.lock().await;
+            *slot = None;
         }
         Err(last)
     }
@@ -265,6 +298,52 @@ mod tests {
         assert!(
             src.contains("spawn_health_loop"),
             "idle tunnels need a watcher, or a reset port looks healthy forever"
+        );
+    }
+
+    /// A waiter must never accept a dead tunnel out of the slot.
+    ///
+    /// Regression, seen on the h2 test pool (10 instances, ~45 min): 60 lines
+    /// of `idle tunnel rebuild failed error=tunnel rebuild timed out`, one per
+    /// 30 s idle tick. `mark_dead()` only sets a flag and leaves the dead
+    /// tunnel in `current`, so the wait loop's `if let Some(t) = current`
+    /// handed that corpse back, the caller saw it as healthy, the next tick
+    /// found it dead again, and the cycle repeated forever — using up the
+    /// whole 150 × 200 ms wait budget each time.
+    ///
+    /// Two invariants fix it: the waiter filters on `is_dead()`, and a failed
+    /// rebuild clears the slot instead of leaving a corpse in it.
+    #[test]
+    fn waiters_never_return_a_dead_tunnel() {
+        let src = include_str!("resilient.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+
+        let wait = prod
+            .split("compare_exchange")
+            .nth(1)
+            .and_then(|s| s.split("let result = self.rebuild()").next())
+            .expect("the serialised rebuild branch must exist");
+        assert!(
+            wait.contains("is_dead()"),
+            "the waiter must reject a dead tunnel from `current`; returning it \
+             makes every caller believe a reset stream is usable"
+        );
+        assert!(
+            wait.contains("reconnecting.load"),
+            "the waiter must notice that the rebuilder gave up, instead of \
+             burning the full 30 s budget on a rebuild that already failed"
+        );
+
+        // A failed rebuild must not leave the corpse behind.
+        let rebuild = prod
+            .split("async fn rebuild")
+            .nth(1)
+            .and_then(|s| s.split("Err(last)").next())
+            .expect("rebuild must exist");
+        assert!(
+            rebuild.contains("*slot = None"),
+            "a failed rebuild must clear `current`, or waiters keep finding \
+             the dead tunnel it failed to replace"
         );
     }
 }

@@ -61,17 +61,42 @@ async fn main() {
         Ok(Ok(n)) => {
             println!("tunnel: UP");
             let dial = std::sync::Arc::new(n).dial_fn();
-            match tokio::time::timeout(Duration::from_secs(20), dial("api.ipify.org:80".into())).await {
+            // Optional 2nd argument: `host:port` to fetch through the tunnel.
+            // Defaults to the IPv4 echo. Pass `api6.ipify.org:80` to see the
+            // per-account IPv6 exit, which is what makes the pool unique — the
+            // IPv4 address is Cloudflare's shared NAT and identical everywhere.
+            let target = std::env::args()
+                .nth(2)
+                .unwrap_or_else(|| "api.ipify.org:80".to_string());
+            let host = target.split(':').next().unwrap_or("api.ipify.org").to_string();
+            match tokio::time::timeout(Duration::from_secs(20), dial(target.clone())).await {
                 Ok(Ok(mut s)) => {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let _ = s
-                        .write_all(b"GET / HTTP/1.1\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n")
+                        .write_all(
+                            format!(
+                                "GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+                            )
+                            .as_bytes(),
+                        )
                         .await;
                     let mut buf = Vec::new();
                     let _ = tokio::time::timeout(Duration::from_secs(15), s.read_to_end(&mut buf)).await;
                     println!("http: {} bytes", buf.len());
                     let t = String::from_utf8_lossy(&buf);
-                    println!("body: {}", &t[..t.len().min(200)]);
+                    // Print the status line and the *body*, not the first 200
+                    // chars of the message: the headers alone are longer than
+                    // that, so the exit address (the whole point of the probe)
+                    // was being cut off.
+                    let (head, body) = match t.find("\r\n\r\n") {
+                        Some(p) => (&t[..p], &t[p + 4..]),
+                        None => (&t[..], ""),
+                    };
+                    println!(
+                        "status: {}",
+                        head.lines().next().unwrap_or("<no status line>")
+                    );
+                    println!("exit:   {}", body.trim());
                 }
                 Ok(Err(e)) => println!("dial failed: {e}"),
                 Err(_) => println!("dial timeout"),
