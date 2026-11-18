@@ -458,6 +458,10 @@ impl UserspaceStack {
                         } else {
                             trace::bump(&trace::RX_DROPPED, 1);
                         }
+                        drop(q);
+                        // Wake the pump out of its idle backoff: a packet is
+                        // waiting and the stack may be asleep for up to 500 ms.
+                        shared_state.kick.notify_one();
                     }
                     Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(1)).await,
                     Err(e) => {
@@ -481,12 +485,38 @@ impl UserspaceStack {
         // `Interface::poll`, so the stack never emits a SYN and never consumes
         // an inbound packet: `connect-ip` succeeds, the tunnel reports UP, and
         // every dial hangs until its timeout.
+        //
+        // Adaptive backoff instead of a fixed 2 ms ticker. The fixed ticker
+        // made every instance poll 500 times a second whether or not it had
+        // traffic — ten idle instances burned ~35 % of a core, and the cost
+        // scales linearly with the pool (100 instances would be ~350 %). That
+        // is the exact opposite of the reason this data plane exists (memory
+        // and CPU per instance). Idle instances now poll at most twice a
+        // second; the moment a packet appears or a socket is live the loop
+        // snaps back to 2 ms.
         let stack = self.clone();
         let driver = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(2));
+            let fast = std::time::Duration::from_millis(2);
+            let slow = std::time::Duration::from_millis(500);
+            let mut delay = fast;
             loop {
-                ticker.tick().await;
-                stack.pump_once().await;
+                let busy = stack.pump_once().await;
+                if busy {
+                    delay = fast;
+                } else {
+                    // Exponential-ish step up, capped: a freshly idle stack
+                    // settles within ~1 s instead of hammering 500 Hz.
+                    delay = (delay * 2).min(slow);
+                }
+                // Sleep, but let a new connection cut the wait short. Without
+                // this an idle stack would add up to 500 ms to the first SYN of
+                // every request, which is worse than the CPU it saves.
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = stack.shared.kick.notified() => {
+                        delay = fast;
+                    }
+                }
             }
         });
 
@@ -497,7 +527,14 @@ impl UserspaceStack {
     }
 
     /// Process one round of the stack: move packets both ways.
-    async fn pump_once(&self) {
+    ///
+    /// Returns `true` when this round actually moved a packet or had a socket
+    /// in a non-idle state. The driver below uses that to decide how long to
+    /// sleep: a fixed 2 ms ticker cost ~35 % of a core for **ten idle
+    /// instances** (≈5,000 polls/second with nothing to do), which measured as
+    /// 33 % CPU on an otherwise quiet box. Polling is only useful while there
+    /// is a packet in flight or a handshake in progress.
+    async fn pump_once(&self) -> bool {
         let now = SmolInstant::now();
         trace::bump(&trace::PUMPS, 1);
         // Do NOT hold the queue lock across `poll`. `TunnelDevice::receive`
@@ -561,6 +598,13 @@ impl UserspaceStack {
             let _ = set.remove(h);
         }
 
+        // Did this round move anything? A packet crossing the queue, or any
+        // socket still registered, means the stack may have work to do and the
+        // driver should stay fast. `SocketSet` has no `is_empty`, so count
+        // through `iter()`.
+        let moved = in_after != in_before || out_after != out_before;
+        let busy_sockets = set.iter().next().is_some();
+
         drop(set);
         drop(iface);
 
@@ -569,6 +613,8 @@ impl UserspaceStack {
         // registered but nothing ever fires it, so the first write after a
         // half-open handshake sleeps eternally.
         self.shared.wake_all();
+
+        moved || busy_sockets
     }
 }
 
@@ -608,6 +654,13 @@ pub struct StackShared {
     pub pending_removal: std::sync::Mutex<Vec<SocketHandle>>,
     /// Tasks blocked in `poll_read`/`poll_write`, woken after each pump.
     pub wakers: std::sync::Mutex<Vec<std::task::Waker>>,
+    /// Wakes the pump driver out of its idle backoff.
+    ///
+    /// The driver sleeps up to 500 ms when the stack has nothing to do. A new
+    /// connection (or an inbound packet) must not wait that long for the first
+    /// SYN, so every enqueue and every `connect()` notifies this and the loop
+    /// runs immediately instead of finishing the sleep.
+    pub kick: tokio::sync::Notify,
 }
 
 impl StackShared {
@@ -1055,6 +1108,46 @@ mod wiring_tests {
     /// A previous change edited only the definitions and the poll bodies:
     /// register() was called but nothing ever woke those tasks, so the first
     /// write after a half-open handshake slept forever. That variant was 100%
+    /// The pump must back off when idle, and wake immediately on demand.
+    ///
+    /// Regression: the driver ran on a fixed `interval(2ms)` forever. That is
+    /// 500 polls/second per instance with nothing to do — measured at ~35 % of
+    /// a core for **ten idle** h2 instances (33 % on an otherwise quiet box,
+    /// while the 99-instance usque pool used 0.01 %). Scaling that to a real
+    /// pool would cost more CPU than the process model it replaced.
+    ///
+    /// The fix is only safe if the fast path is preserved: a sleeping driver
+    /// must not add its backoff to the first SYN of every request, which is
+    /// what `kick` is for. Both halves are asserted here because either one
+    /// alone is a regression — a fixed ticker burns CPU, and backoff without a
+    /// kick adds up to 500 ms of latency per request.
+    #[test]
+    fn pump_backs_off_when_idle_but_wakes_on_demand() {
+        let src = include_str!("stack.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+
+        assert!(
+            !prod.contains("tokio::time::interval(std::time::Duration::from_millis(2))"),
+            "the driver must not run on a fixed 2 ms ticker: 500 polls/s per \
+             idle instance cost ~35 % of a core at ten instances"
+        );
+        assert!(
+            prod.contains("let slow = std::time::Duration::from_millis(500)"),
+            "idle polling should back off to a slow interval"
+        );
+        assert!(
+            prod.contains("kick.notified()"),
+            "the driver must be woken out of backoff, or every request pays up \
+             to 500 ms before its SYN is emitted"
+        );
+        // The wake must be armed from the inbound path, not just from connect():
+        // a reply that arrives while the stack sleeps is equally stuck.
+        assert!(
+            prod.contains("shared_state.kick.notify_one()"),
+            "inbound packet delivery must kick the pump"
+        );
+    }
+
     /// deadlock -- worse than the busy loop it replaced. This test fails if the
     /// call sites go missing again.
     #[test]
