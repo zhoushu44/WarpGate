@@ -253,6 +253,7 @@ async fn handle_stats(State(st): State<AppState>) -> axum::response::Response {
 
     let mut running = 0i64;
     let mut unhealthy = 0i64;
+    let mut pending = 0i64;
     let mut dedicated = 0i64;
     let mut ips = std::collections::HashSet::new();
     for inst in &all {
@@ -260,13 +261,24 @@ async fn handle_stats(State(st): State<AppState>) -> axum::response::Response {
             running += 1;
             let ip = inst.last_exit_ipv6.read().await.clone();
             if ip.is_empty() {
-                // Running but never produced an exit address: the console's
-                // "unhealthy" bucket.
-                unhealthy += 1;
+                // Running, but this instance has not produced an exit address
+                // yet. That is **not** a failure: the health sweep probes
+                // `health_probe_batch` instances per tick, so with 70 instances
+                // and a batch of 30 a full rotation takes ~700 s and the tail
+                // is always "not yet probed". Counting those as `unhealthy`
+                // made the console flap between 0 and 10 on a perfectly healthy
+                // pool (measured 2026-11-18; `healthy_count` stayed at 70 the
+                // whole time).
+                //
+                // An instance that actually failed is demoted to `unhealthy`
+                // by `mark_probe_failed`, so `is_running_now()` already covers
+                // it — the remaining case here is genuinely "unknown".
+                pending += 1;
             } else {
                 ips.insert(ip);
             }
         } else {
+            // Stopped or demoted by a failed probe: a real unhealthy.
             unhealthy += 1;
         }
         if inst.dedicated().await {
@@ -283,6 +295,9 @@ async fn handle_stats(State(st): State<AppState>) -> axum::response::Response {
         "available": running.saturating_sub(sessions),
         "in_use": sessions,
         "unhealthy": unhealthy,
+        // Running but not yet probed this rotation. Reported separately so the
+        // console can show "10 pending" instead of a false alarm.
+        "pending": pending,
         "unique_ips": ips.len() as i64,
         "dedicated": dedicated,
         "sessions": sessions,
@@ -819,13 +834,26 @@ async fn handle_release(
 }
 
 async fn handle_pool_status(State(st): State<AppState>) -> axum::response::Response {
-    let total = st.mgr.count().await as i64;
+    let all = st.mgr.all().await;
+    let total = all.len() as i64;
+    // Count the same way `/api/stats` does: `healthy_count` is "status ==
+    // running", which is not the same as "has a live exit address". Deriving
+    // `unique_ips` from it reported the instance count instead of the number of
+    // distinct exits, and `unhealthy` included instances that simply had not
+    // been probed yet.
     let healthy = st.mgr.healthy_count().await as i64;
+    let mut ips = std::collections::HashSet::new();
+    for inst in &all {
+        let ip = inst.last_exit_ipv6.read().await.clone();
+        if !ip.is_empty() && inst.is_running_now() {
+            ips.insert(ip);
+        }
+    }
     ok(json!({
         "total_instances": total,
         "available": healthy,
         "unhealthy": (total - healthy).max(0),
-        "unique_ips": healthy,
+        "unique_ips": ips.len() as i64,
         "in_use": 0,
         "dedicated": 0,
         "sticky_sessions": st.mgr.sticky_active().await,

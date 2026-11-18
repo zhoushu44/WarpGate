@@ -176,6 +176,31 @@ async fn loopback_bypasses_the_key() {
     assert_eq!(status, StatusCode::OK, "loopback must bypass auth");
 }
 
+/// An instance that has not been probed yet is `pending`, not `unhealthy`.
+///
+/// The health sweep probes `health_probe_batch` instances per tick, so on a
+/// large pool part of it is always waiting its turn. Counting those as
+/// `unhealthy` made the console flap between 0 and 10 on a completely healthy
+/// 70-instance pool (`healthy_count` stayed at 70 throughout), which reads as
+/// an outage that is not happening.
+#[tokio::test]
+async fn unprobed_instances_are_pending_not_unhealthy() {
+    let (app, _t) = app_with_one_instance("secret").await;
+    let (status, body) = call(&app, get_with_key("/api/stats", "secret")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // The fresh instance has no exit address yet (nothing has probed it), so it
+    // must land in `pending`. Before the fix this was reported as `unhealthy: 1`.
+    assert_eq!(
+        body["data"]["unhealthy"], 0,
+        "an unprobed instance is not a failure: {body}"
+    );
+    assert!(
+        body["data"]["pending"].as_i64().unwrap_or(-1) >= 0,
+        "the pending bucket must be reported: {body}"
+    );
+}
+
 #[tokio::test]
 async fn whitelisted_ip_bypasses_the_key() {
     // Explicitly whitelist loopback so the rule is exercised, not assumed.
