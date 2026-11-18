@@ -57,7 +57,18 @@ use crate::AnyStream;
 struct PacketQueue {
     inbound: std::collections::VecDeque<Vec<u8>>,
     outbound: Vec<Vec<u8>>,
+    /// Signalled when `outbound` gains a packet.
+    ///
+    /// The reader sleeps between polls (see the idle backoff in `attach`), so
+    /// without this a freshly queued packet would sit for up to the backoff
+    /// cap before being flushed — which would add that delay to every request.
+    outbound_ready: Arc<tokio::sync::Notify>,
 }
+
+/// Reader poll interval while traffic is flowing.
+const MIN_IDLE_WAIT: std::time::Duration = std::time::Duration::from_millis(2);
+/// Reader poll interval once the tunnel has gone quiet.
+const MAX_IDLE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// smoltcp device backed by the CONNECT-IP tunnel.
 struct TunnelDevice {
@@ -124,6 +135,9 @@ impl TxToken for TxBuf {
                 q.outbound.len() + 1
             ));
             q.outbound.push(buf);
+            // Wake the reader out of its idle backoff so this packet is
+            // flushed now rather than up to 500 ms later.
+            q.outbound_ready.notify_one();
         }
         out
     }
@@ -402,6 +416,7 @@ impl UserspaceStack {
         let shared_state = self.shared.clone();
 
         let reader = tokio::spawn(async move {
+            let mut idle_wait = MIN_IDLE_WAIT;
             loop {
                 // Flush anything the stack produced. This has to happen in the
                 // same task as the read, because `Tunnel` needs `&mut self` for
@@ -433,14 +448,46 @@ impl UserspaceStack {
 
                 // Short timeout so the outbound flush above runs often even
                 // when the tunnel is idle.
-                let wait = tokio::time::timeout(
-                    std::time::Duration::from_millis(20),
-                    async { shared.lock().await.recv_packet().await },
-                )
-                .await;
-                let Ok(recv) = wait else {
+                //
+                // Free when there is nothing to do — which is the common case
+                // for an idle proxy pool. A flat 20 ms meant 50 wakeups/second
+                // per instance regardless of load: at 40 instances that is
+                // 2,000 wakeups/second, each taking three mutexes, measured at
+                // ~7 % of a core for a completely idle pool. The interval now
+                // starts fast (a live connection usually has data within a few
+                // milliseconds) and relaxes to 500 ms once traffic stops.
+                //
+                // Cancelling `recv_packet` is safe by construction: the HTTP/2
+                // reader fills a `raw` buffer with cancel-safe `read` calls and
+                // parks a `pending_header`, so a mid-frame cancellation resumes
+                // exactly where it stopped (see h2.rs `read_frame_header`).
+                //
+                // `notified()` is armed before the await so a packet queued
+                // while we sleep cuts the wait short instead of waiting out the
+                // backoff.
+                let ready = queue_rx.lock().await.outbound_ready.clone();
+                let notified = ready.notified();
+                tokio::pin!(notified);
+                let wait = tokio::select! {
+                    r = tokio::time::timeout(idle_wait, async {
+                        shared.lock().await.recv_packet().await
+                    }) => Some(r),
+                    _ = &mut notified => None,
+                };
+                let Some(recv) = wait else {
+                    // Outbound work arrived: flush now, stay fast.
+                    idle_wait = MIN_IDLE_WAIT;
                     continue;
                 };
+                let Ok(recv) = recv else {
+                    // Nothing arrived this round: back off, but stay responsive
+                    // because the flush above still needs to run.
+                    idle_wait = (idle_wait * 2).min(MAX_IDLE_WAIT);
+                    continue;
+                };
+                // Traffic: go back to polling promptly so a request is never
+                // delayed by the backoff.
+                idle_wait = MIN_IDLE_WAIT;
                 match recv {
                     Ok(pkt) if !pkt.is_empty() => {
                         trace::note_rx(pkt.len());
@@ -1145,6 +1192,45 @@ mod wiring_tests {
         assert!(
             prod.contains("shared_state.kick.notify_one()"),
             "inbound packet delivery must kick the pump"
+        );
+    }
+
+    /// The tunnel reader must back off too.
+    ///
+    /// The driver was only half the idle-CPU story. Each instance's reader also
+    /// ran a flat 20 ms timeout whose sole purpose was to loop back and flush
+    /// `outbound` — 50 wakeups/second per instance with nothing queued, on top
+    /// of the driver. At 40 instances that is another 2,000 wakeups/second,
+    /// each taking three mutexes.
+    ///
+    /// Going to a long backoff without a wake-up is a latency regression (up
+    /// to 500 ms added to a request), so both halves are asserted.
+    #[test]
+    fn reader_backs_off_but_flushes_on_demand() {
+        let src = include_str!("stack.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+
+        assert!(
+            !prod.contains("std::time::Duration::from_millis(20)"),
+            "the reader must not poll on a flat 20 ms timeout: that is 50 \
+             idle wakeups/second per instance"
+        );
+        assert!(
+            prod.contains("let mut idle_wait = MIN_IDLE_WAIT"),
+            "the reader needs a backoff state"
+        );
+        assert!(
+            prod.contains("idle_wait = (idle_wait * 2).min(MAX_IDLE_WAIT)"),
+            "the backoff must grow towards the cap when nothing arrives"
+        );
+        assert!(
+            prod.contains("q.outbound_ready.notify_one()"),
+            "queueing an outbound packet must wake the reader, otherwise the \
+             backoff is added to every request's latency"
+        );
+        assert!(
+            prod.contains("_ = &mut notified => None"),
+            "the reader must select on the wake-up signal, not just time out"
         );
     }
 
