@@ -733,6 +733,21 @@ impl Manager {
                 .map(|(h, _)| h.to_string())
                 .unwrap_or(raw)
         };
+        // Normalize the endpoint to a node whose certificate our TLS config
+        // actually accepts. Registration sometimes hands out 162.159.192.x,
+        // which presents a chain we fail with `invalid peer certificate:
+        // UnknownIssuer` — deterministically, on every retry, so the instance
+        // can never come up (seen 2026-11-18 on warp-82/148/149; 11 more
+        // landmines were patched on disk). The account identity is portable
+        // across WARP edges, so any healthy node works, exactly like the
+        // pinned pub key below.
+        const CF_ENDPOINT_V4: &str = "162.159.198.2";
+        let endpoint_v4 = if endpoint_v4.starts_with("162.159.192.") {
+            tracing::warn!(idx, from = %endpoint_v4, "注册返回 192.x 节点（证书不受信），已替换");
+            CF_ENDPOINT_V4.to_string()
+        } else {
+            endpoint_v4
+        };
         // The response carries the key as base64 SPKI; usque.json wants PEM.
         // The endpoint's pinned key is Cloudflare's *server* certificate, which
         // is the same for every account. `PATCH /reg/<id>` returns it in a
@@ -2688,6 +2703,30 @@ mod tests {
     #[test]
     fn engine_conn_count_handles_missing_pid() {
         assert_eq!(Manager::engine_conn_count(u32::MAX), None);
+    }
+
+    /// Registration must not trust the endpoint it is handed.
+    ///
+    /// Cloudflare's registration API sometimes returns 162.159.192.x, whose
+    /// TLS chain we reject with `invalid peer certificate: UnknownIssuer` —
+    /// deterministically, on every retry. Three instances came up dead this
+    /// way during the 120 -> 150 scale-up (warp-82/148/149) and eleven more
+    /// dormant configs carried the same node. The account is portable across
+    /// WARP edges, so the endpoint is normalized to a known-good node, the
+    /// same way the pinned pub key is.
+    #[test]
+    fn registration_normalizes_untrusted_endpoints() {
+        let src = include_str!("lib.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        assert!(
+            prod.contains("162.159.192."),
+            "register_account must detect the untrusted endpoint range"
+        );
+        assert!(
+            prod.contains("starts_with(\"162.159.192.\")")
+                && prod.contains("CF_ENDPOINT_V4"),
+            "the untrusted node must be replaced with a known-good one"
+        );
     }
 
     /// `create` and `rebuild` must attach the data plane, not just register.
