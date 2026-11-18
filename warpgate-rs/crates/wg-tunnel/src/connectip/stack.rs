@@ -666,10 +666,29 @@ impl UserspaceStack {
 }
 
 /// Keeps the tunnel pump tasks alive; dropping it stops them.
+///
+/// `Drop` MUST abort both tasks. A `JoinHandle` does not cancel its task when
+/// it is dropped — it merely detaches, and the task keeps running until it
+/// finishes on its own. These two loops never finish: the reader waits on the
+/// tunnel forever and the driver loops forever. So every rebuild leaked a
+/// reader + driver pair, each holding a `UserspaceStack` (smoltcp interface,
+/// socket set, queues) plus its buffers.
+///
+/// Measured 2026-11-18 on 70 instances: memory grew in lockstep with tunnel
+/// rebuilds, +0.5-1.3 MB per 40 resets (≈15-30 KB each), 9.5 -> 13.9 MB in
+/// 30 minutes with zero rebuild failures. At that rate the pool would add
+/// ~250 MB/day and never give it back.
 pub struct StackPump {
     _reader: tokio::task::JoinHandle<()>,
     /// Drives `Interface::poll` so the stack makes progress.
     _driver: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for StackPump {
+    fn drop(&mut self) {
+        self._reader.abort();
+        self._driver.abort();
+    }
 }
 
 /// A TCP connection running inside the userspace stack.
@@ -1155,6 +1174,35 @@ mod wiring_tests {
     /// A previous change edited only the definitions and the poll bodies:
     /// register() was called but nothing ever woke those tasks, so the first
     /// write after a half-open handshake slept forever. That variant was 100%
+    /// Dropping the pump must abort its tasks.
+    ///
+    /// `JoinHandle::drop` detaches, it does not cancel. Both loops here run
+    /// forever, so every tunnel rebuild leaked a reader + driver pair, each
+    /// pinning a whole `UserspaceStack` (smoltcp iface, socket set, queues).
+    ///
+    /// Measured 2026-11-18 on 70 instances: memory rose in lockstep with
+    /// rebuilds — +0.5-1.3 MB per 40 resets, 9.5 -> 13.9 MB in 30 minutes with
+    /// `rebuild_fail=0`. Extrapolated that is ~250 MB/day of pure leak.
+    #[test]
+    fn dropping_the_pump_aborts_both_tasks() {
+        let src = include_str!("stack.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        let drop_impl = prod
+            .split("impl Drop for StackPump")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("StackPump must implement Drop");
+        assert!(
+            drop_impl.contains("self._reader.abort()"),
+            "the reader task must be aborted on drop, or it leaks the whole \
+             tunnel state on every rebuild"
+        );
+        assert!(
+            drop_impl.contains("self._driver.abort()"),
+            "the driver task must be aborted on drop for the same reason"
+        );
+    }
+
     /// The pump must back off when idle, and wake immediately on demand.
     ///
     /// Regression: the driver ran on a fixed `interval(2ms)` forever. That is
