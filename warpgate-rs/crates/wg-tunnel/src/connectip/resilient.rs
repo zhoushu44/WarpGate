@@ -78,14 +78,40 @@ impl ResilientTunnel {
             ipv4: ipv4.to_string(),
             pin,
         };
-        let first = account.connect().await?;
-        Ok(Self {
-            account,
-            current: Mutex::new(Some(first)),
-            dead: AtomicBool::new(false),
-            reconnecting: AtomicBool::new(false),
-            reconnects: AtomicU64::new(0),
-        })
+
+        // Retry the first connect, exactly like `rebuild()` does.
+        //
+        // `Account::connect` has its own 8-attempt loop, but that only covers
+        // the TLS-to-CONNECT-IP stage; a failure here is what the caller sees.
+        // More importantly, boot attaches several instances at once, and the
+        // anycast VIP hands back non-MASQUE nodes under load — the 1/3 to 1/10
+        // bad-node rate documented in CONNECT-IP-H2-FINDINGS. Without a retry
+        // here those instances came up with **no tunnel at all**: measured on
+        // 2026-11-18, boot reported `healthy 30/40` in 3.3 s having built only
+        // 5 tunnels, and the survivors showed up as permanently `unhealthy`
+        // while their ports happened to answer from a later rebuild.
+        let mut last = String::new();
+        for attempt in 0..4 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+            }
+            match account.connect().await {
+                Ok(t) => {
+                    return Ok(Self {
+                        account,
+                        current: Mutex::new(Some(t)),
+                        dead: AtomicBool::new(false),
+                        reconnecting: AtomicBool::new(false),
+                        reconnects: AtomicU64::new(0),
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(attempt, error = %e, "initial CONNECT-IP attempt failed");
+                    last = e;
+                }
+            }
+        }
+        Err(last)
     }
 
     /// How many times this tunnel has been rebuilt.
@@ -344,6 +370,36 @@ mod tests {
             rebuild.contains("*slot = None"),
             "a failed rebuild must clear `current`, or waiters keep finding \
              the dead tunnel it failed to replace"
+        );
+    }
+
+    /// The *first* connect must retry too, not just `rebuild()`.
+    ///
+    /// `Account::connect` retries the TLS/CONNECT-IP stages internally, but a
+    /// failure that escapes it was final: `connect()` returned `Err` with no
+    /// second chance. Boot attaches many instances at once and the anycast VIP
+    /// hands out non-MASQUE nodes under load (1/3 to 1/10 of dials, see
+    /// CONNECT-IP-H2-FINDINGS), so instances came up with no tunnel at all.
+    ///
+    /// Measured 2026-11-18: boot reported `healthy 30/40` after 3.3 s having
+    /// built only 5 tunnels; the rest stayed `unhealthy` for good.
+    #[test]
+    fn initial_connect_retries() {
+        let src = include_str!("resilient.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        let body = prod
+            .split("pub async fn connect(")
+            .nth(1)
+            .and_then(|s| s.split("/// How many times").next())
+            .expect("connect() must exist");
+        assert!(
+            body.contains("for attempt in 0..4"),
+            "the initial connect needs a retry loop; a single failed dial leaves \
+             the instance with no tunnel until some later rebuild"
+        );
+        assert!(
+            !body.contains("let first = account.connect().await?;"),
+            "a bare `?` on the first connect is the regression"
         );
     }
 }
