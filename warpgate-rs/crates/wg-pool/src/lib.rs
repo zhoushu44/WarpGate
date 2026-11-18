@@ -1285,17 +1285,30 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
             if self.instances.read().await.len() as i64 >= target {
                 break;
             }
+            // `start_existing` only rebuilds the bookkeeping (a fresh
+            // `Instance` with no dial and no listeners). The data plane has to
+            // be attached on top, exactly like `start_instance` does — without
+            // it the instance is registered as `running`, its port is never
+            // bound, and every request to it fails while the console shows a
+            // healthy pool. Measured: scaling 30 -> 40 reported `changed: 10`,
+            // ports 10040-10049 never listened, yet stats said 40/40 healthy.
             match self.start_existing(idx).await {
-                Ok(()) => changed += 1,
+                Ok(()) => {
+                    self.attach_data_plane(idx).await;
+                    changed += 1;
+                }
                 Err(e) => tracing::warn!(index = idx, error = %e, "扩容暖启动失败"),
             }
         }
 
         while (self.instances.read().await.len() as i64) < target {
             let idx = self.next_free_index().await;
+            // `create` registers the account and builds the instance, but it
+            // also stops short of the data plane.
             if self.create(idx).await.is_err() {
                 break;
             }
+            self.attach_data_plane(idx).await;
             changed += 1;
         }
 
@@ -2601,6 +2614,40 @@ mod tests {
         assert!(
             mw.contains("st.mgr.whitelist().await"),
             "auth must honour a whitelist entry added after boot"
+        );
+    }
+
+    /// Growing the pool must attach the data plane, not just register the
+    /// instance.
+    ///
+    /// Regression: `reconcile_resident` called `start_existing` (and `create`)
+    /// and stopped there. Both only build the `Instance` bookkeeping — a fresh
+    /// struct with `dial: None` and no listeners — so the instance was
+    /// registered as `running` while its SOCKS5 port was never bound.
+    ///
+    /// Measured in production on 2026-11-18: 30 -> 40 answered
+    /// `{"applied":true,"changed":10}` and `/api/stats` reported
+    /// `healthy_count: 40`, but ports 10040-10049 did not listen at all and
+    /// every request to them failed. `attach_data_plane` is what binds them.
+    #[test]
+    fn growing_the_pool_attaches_the_data_plane() {
+        let src = include_str!("lib.rs");
+        let body = src
+            .split("pub async fn reconcile_resident")
+            .nth(1)
+            .and_then(|s| s.split("/// Probe one instance").next())
+            .expect("reconcile_resident must exist");
+
+        // Both grow paths need it: warm-start from an existing directory, and
+        // cold create for a brand-new account.
+        assert!(
+            body.matches("attach_data_plane").count() >= 2,
+            "both the warm-start and the create path must attach the data \
+             plane; without it the instance is a registered shell with no port"
+        );
+        assert!(
+            !body.contains("Ok(()) => changed += 1,"),
+            "a warm start that only bumps the counter leaves the port unbound"
         );
     }
 
