@@ -546,8 +546,27 @@ impl Manager {
     }
 
     /// Warm-start an instance whose directory already exists.
+    ///
+    /// Clears a persisted `stopped` status first. Every caller of this method
+    /// wants the instance *running* — boot, `start_instance`, and pool growth —
+    /// so a leftover `stopped` in `meta.json` must not veto it.
+    ///
+    /// That veto was a real bug: `resident_count` 40 -> 30 marks the tail as
+    /// `stopped`, and growing back to 40 left those instances "stopped" on
+    /// disk. `start_with_config` deliberately preserves that status, so the
+    /// instances were registered but never attached — and because `boot` only
+    /// attaches `all()`'s running entries, ten of them reported `stopped`
+    /// forever while their ports stayed bound from an earlier pass. Measured
+    /// 2026-11-18: `healthy 30/40` with indices 30-39 stuck, 11 stale
+    /// `meta.json` files saying `stopped`.
     pub async fn start_existing(&self, idx: i64) -> Result<()> {
         let dir = wg_store::dir(&self.base, idx);
+        if let Some(mut meta) = Meta::read(&dir)? {
+            if meta.status == status::STOPPED {
+                meta.status = status::RUNNING.to_string();
+                meta.write(&dir)?;
+            }
+        }
         let Some(ucfg) = wg_store::UsqueConfig::read(&dir)? else {
             return Err(PoolError::InstanceError(idx, "缺少 usque.json".into()));
         };
@@ -2655,6 +2674,42 @@ mod tests {
     #[test]
     fn engine_conn_count_handles_missing_pid() {
         assert_eq!(Manager::engine_conn_count(u32::MAX), None);
+    }
+
+    /// A persisted `stopped` must not veto a start request.
+    ///
+    /// `start_with_config` keeps `stopped` on purpose — it means "the operator
+    /// stopped this, do not bring it back on restart". But every caller of
+    /// `start_existing` is explicitly asking for a start, so the flag has to be
+    /// cleared first.
+    ///
+    /// Regression, measured 2026-11-18: scaling 40 -> 30 -> 40 marked the tail
+    /// `stopped` on disk. Growing back registered the instances but never
+    /// attached them (`boot` only attaches running entries), so indices 30-39
+    /// sat at `stopped` while `/api/stats` reported `healthy 30/40` and their
+    /// ports kept answering from an earlier listener. 11 stale `meta.json`
+    /// files were found saying `stopped`.
+    #[test]
+    fn start_existing_clears_a_persisted_stopped_status() {
+        let src = include_str!("lib.rs");
+        let body = src
+            .split("pub async fn start_existing")
+            .nth(1)
+            .and_then(|s| s.split("/// Cold-create").next())
+            .expect("start_existing must exist");
+        assert!(
+            body.contains("status::STOPPED"),
+            "start_existing must look at the persisted status"
+        );
+        assert!(
+            body.contains("meta.write(&dir)"),
+            "clearing it has to be written back, or the next boot sees it again"
+        );
+        // It must happen before the tunnel is built, otherwise the instance is
+        // attached while its metadata still says stopped.
+        let clear = body.find("status::STOPPED").unwrap();
+        let build = body.find("start_with_config").unwrap();
+        assert!(clear < build, "clear the status before starting the tunnel");
     }
 
     /// Health checking must not start before the data plane is attached.
