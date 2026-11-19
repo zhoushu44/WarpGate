@@ -70,6 +70,12 @@ const MIN_IDLE_WAIT: std::time::Duration = std::time::Duration::from_millis(2);
 /// Reader poll interval once the tunnel has gone quiet.
 const MAX_IDLE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Upper bound on `iface.poll` calls per pump round.
+///
+/// One poll moves at most one step, so a burst of new connections needs many.
+/// The cap keeps a single busy round from starving the tokio worker.
+const MAX_POLL_ROUNDS: usize = 64;
+
 /// smoltcp device backed by the CONNECT-IP tunnel.
 struct TunnelDevice {
     queue: Arc<Mutex<PacketQueue>>,
@@ -301,8 +307,8 @@ impl UserspaceStack {
             // past what a proxy client needs. The cost is charged per *live
             // connection*, not per instance: an idle instance has no sockets,
             // so the 184-instance pool does not pay 184 × 1 MB.
-            let rx = tcp::SocketBuffer::new(vec![0u8; 512 * 1024]);
-            let tx = tcp::SocketBuffer::new(vec![0u8; 512 * 1024]);
+            let rx = tcp::SocketBuffer::new(vec![0u8; 64 * 1024]);
+            let tx = tcp::SocketBuffer::new(vec![0u8; 64 * 1024]);
             let mut sock = tcp::Socket::new(rx, tx);
             sock.connect(
                 iface.context(),
@@ -630,7 +636,32 @@ impl UserspaceStack {
         } else {
             Vec::new()
         };
-        let _ = iface.poll(now, &mut dev, &mut set);
+        // Drain as much as this round can: a single `poll` only advances the
+        // stack one step (one receive, one transmit per socket that is ready).
+        // With 40 concurrent connections through one port, one poll per 2 ms
+        // tick capped the whole tunnel at ~500 packets/s, so the queue backed
+        // up and *every* connection timed out — measured 2026-11-19: N=20
+        // concurrent finished in 895 ms, N=40 left 30 of 40 hanging, N=50
+        // failed outright.
+        //
+        // Looping until the stack stops making progress turns that into "as
+        // many packets as are queued", which is what a burst of new
+        // connections needs. The bound stops a pathological peer from
+        // monopolising the driver.
+        let mut rounds = 0usize;
+        loop {
+            let _ = iface.poll(now, &mut dev, &mut set);
+            let (in_left, out_left) = match self.queue.try_lock() {
+                Ok(q) => (q.inbound.len(), q.outbound.len()),
+                Err(_) => (0, 0),
+            };
+            // Progress = something is still queued to move in either direction.
+            let moved = in_left > 0 || out_left > 0;
+            rounds += 1;
+            if !moved || rounds >= MAX_POLL_ROUNDS {
+                break;
+            }
+        }
         let (in_after, out_after) = match self.queue.try_lock() {
             Ok(q) => (q.inbound.len(), q.outbound.len()),
             Err(_) => (usize::MAX, usize::MAX),
@@ -1188,27 +1219,31 @@ mod wiring_tests {
     /// A previous change edited only the definitions and the poll bodies:
     /// register() was called but nothing ever woke those tasks, so the first
     /// write after a half-open handshake slept forever. That variant was 100%
-    /// Socket buffers must be sized for the tunnel's bandwidth-delay product.
+    /// One pump round must drain the queue, not move a single packet.
     ///
-    /// With 64 KB buffers every connection was capped at ~0.47 MB/s: the
-    /// tunnel RTT is ~130 ms, so that window simply cannot fill the link.
-    /// Measured 2026-11-19 — 5 MB download through one port took 18.7 s
-    /// (0.27 MB/s) while the same file direct took 1.06 s (9 MB/s).
-    ///
-    /// The cap is per live connection, not per instance, so a large window
-    /// costs nothing on an idle pool.
+    /// `iface.poll` advances the stack one step, so calling it once per 2 ms
+    /// tick capped a tunnel at roughly 500 packets/second. A burst of new
+    /// connections exceeded that immediately and the queue never drained:
+    /// measured 2026-11-19 through a single port with 10 ms-RTT-style public
+    /// traffic — 20 concurrent finished in 895 ms, 40 concurrent left 30 of 40
+    /// hanging until timeout, 50 concurrent failed outright.
     #[test]
-    fn socket_buffers_are_sized_for_the_bdp() {
+    fn a_pump_round_drains_the_queue() {
         let src = include_str!("stack.rs");
         let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        let body = prod
+            .split("async fn pump_once")
+            .nth(1)
+            .and_then(|s| s.split("/// Snapshot the queue depths").next())
+            .expect("pump_once must exist");
 
         assert!(
-            !prod.contains("SocketBuffer::new(vec![0u8; 64 * 1024])"),
-            "64 KB buffers cap throughput at ~0.5 MB/s at this RTT"
+            body.contains("loop {"),
+            "a single poll per round cannot keep up with concurrent dials"
         );
         assert!(
-            prod.contains("SocketBuffer::new(vec![0u8; 512 * 1024])"),
-            "the tunnel needs a window large enough to keep the link busy"
+            body.contains("MAX_POLL_ROUNDS"),
+            "the drain loop needs a bound, or one peer can starve the driver"
         );
     }
 
