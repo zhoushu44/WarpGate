@@ -287,8 +287,22 @@ impl UserspaceStack {
             // runs every 2 ms — that was the "1 in 8 dials hang" symptom.
             let mut iface = self.iface.lock().await;
             let mut set = self.sockets.lock().await;
-            let rx = tcp::SocketBuffer::new(vec![0u8; 64 * 1024]);
-            let tx = tcp::SocketBuffer::new(vec![0u8; 64 * 1024]);
+            // 512 KB each way, not 64 KB.
+            //
+            // Throughput through this stack is window-limited, not
+            // bandwidth-limited: measured on 2026-11-19 against
+            // speed.cloudflare.com, a 5 MB download ran at 0.35 MB/s with
+            // 64 KB buffers while the same file direct took 9 MB/s. The tunnel
+            // RTT is ~130 ms, so the old window capped every connection at
+            // 64 KB / 0.13 s = 0.47 MB/s — the numbers line up, which is what
+            // makes this a BDP problem rather than a link problem.
+            //
+            // 512 KB lifts the cap to ~3.9 MB/s at that RTT, which is well
+            // past what a proxy client needs. The cost is charged per *live
+            // connection*, not per instance: an idle instance has no sockets,
+            // so the 184-instance pool does not pay 184 × 1 MB.
+            let rx = tcp::SocketBuffer::new(vec![0u8; 512 * 1024]);
+            let tx = tcp::SocketBuffer::new(vec![0u8; 512 * 1024]);
             let mut sock = tcp::Socket::new(rx, tx);
             sock.connect(
                 iface.context(),
@@ -1174,6 +1188,30 @@ mod wiring_tests {
     /// A previous change edited only the definitions and the poll bodies:
     /// register() was called but nothing ever woke those tasks, so the first
     /// write after a half-open handshake slept forever. That variant was 100%
+    /// Socket buffers must be sized for the tunnel's bandwidth-delay product.
+    ///
+    /// With 64 KB buffers every connection was capped at ~0.47 MB/s: the
+    /// tunnel RTT is ~130 ms, so that window simply cannot fill the link.
+    /// Measured 2026-11-19 — 5 MB download through one port took 18.7 s
+    /// (0.27 MB/s) while the same file direct took 1.06 s (9 MB/s).
+    ///
+    /// The cap is per live connection, not per instance, so a large window
+    /// costs nothing on an idle pool.
+    #[test]
+    fn socket_buffers_are_sized_for_the_bdp() {
+        let src = include_str!("stack.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+
+        assert!(
+            !prod.contains("SocketBuffer::new(vec![0u8; 64 * 1024])"),
+            "64 KB buffers cap throughput at ~0.5 MB/s at this RTT"
+        );
+        assert!(
+            prod.contains("SocketBuffer::new(vec![0u8; 512 * 1024])"),
+            "the tunnel needs a window large enough to keep the link busy"
+        );
+    }
+
     /// Dropping the pump must abort its tasks.
     ///
     /// `JoinHandle::drop` detaches, it does not cancel. Both loops here run
