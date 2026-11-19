@@ -179,7 +179,23 @@ impl ResilientTunnel {
             // every 30 idle-tick — exactly the 150 × 200 ms budget below, so
             // the wait always ran to exhaustion while the rebuild flag stayed
             // stuck and the real rebuild never started.
-            for _ in 0..150 {
+            // Wait up to 60 s (300 × 200 ms) for the real rebuild to publish a
+            // live tunnel.
+            //
+            // The budget used to be 150 × 200 ms = 30 s, which is *shorter*
+            // than the worst case for `rebuild()`: four attempts, each paying
+            // 0.5-1.5 s of backoff plus 1-3 s to build a tunnel, is already
+            // over 30 s when it ends in failure. Callers therefore burned the
+            // whole budget and then reported
+            // `tunnel rebuild timed out` on top of a rebuild that had simply
+            // not finished — measured 2026-11-19: 142 of those in one hour,
+            // with `rebuilt` (789) running ahead of `reset` (770), i.e. most
+            // rebuilds were succeeding.
+            //
+            // The loop still returns as soon as a live tunnel appears, and
+            // still fails fast when the rebuilder gives up, so the longer
+            // ceiling only affects the genuinely-slow case.
+            for _ in 0..300 {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 if let Some(t) = self.current.lock().await.clone() {
                     // Only accept a tunnel that is actually alive; otherwise
@@ -394,6 +410,49 @@ mod tests {
     ///
     /// Measured 2026-11-18: boot reported `healthy 30/40` after 3.3 s having
     /// built only 5 tunnels; the rest stayed `unhealthy` for good.
+    /// The rebuild wait budget must outlast a worst-case rebuild.
+    ///
+    /// `rebuild` makes four attempts, each paying 0.5-1.5 s of backoff plus
+    /// 1-3 s to build a tunnel — over 30 s when it ends in failure, which was
+    /// exactly the old ceiling (150 × 200 ms). Callers therefore reported
+    /// `tunnel rebuild timed out` for rebuilds that were still running:
+    /// measured 2026-11-19, 142 of them in an hour while `rebuilt` (789) ran
+    /// ahead of `reset` (770).
+    ///
+    /// The watcher also must not queue a new waiter behind an in-flight
+    /// rebuild, or every 20 s tick adds another one.
+    #[test]
+    fn the_rebuild_wait_outlasts_a_worst_case_rebuild() {
+        let src = include_str!("resilient.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+
+        assert!(
+            prod.contains("for _ in 0..300"),
+            "a 30 s budget is shorter than rebuild's worst case"
+        );
+        // Strip line comments first: the doc explaining this regression quotes
+        // the old budget, and a naive contains() would match that text.
+        let code: String = prod
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("for _ in 0..150"),
+            "the old 150 × 200 ms budget is the regression"
+        );
+        // `prod` only covers the file up to the first `#[cfg(test)]`, and the
+        // idle watcher lives in an `impl` block *after* this test module. The
+        // whole-file source is what must contain it.
+        assert!(
+            src.contains("if me.reconnecting.load(Ordering::SeqCst) {"),
+            "the idle watcher must skip while a rebuild is already running"
+        );
+    }
+
     #[test]
     fn initial_connect_retries() {
         let src = include_str!("resilient.rs");
@@ -429,6 +488,17 @@ impl ResilientTunnel {
                 tick.tick().await;
                 {
                     {
+                        // Skip while a rebuild is already in flight.
+                        //
+                        // The watcher ticks every 20 s while a rebuild can
+                        // legitimately take longer than that; without this
+                        // guard each tick queued another waiter behind the
+                        // same rebuild, and every one that outlived its budget
+                        // logged `idle tunnel rebuild failed` for a rebuild
+                        // that was in fact still running.
+                        if me.reconnecting.load(Ordering::SeqCst) {
+                            continue;
+                        }
                         let alive = match me.current.lock().await.clone() {
                             Some(t) => !t.is_dead(),
                             None => false,
