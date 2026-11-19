@@ -809,6 +809,10 @@
             <div class="stat-label">不健康</div>
             <div class="stat-value unhealthy" id="statUnhealthy">0</div>
           </div>
+          <div class="stat-card" title="运行中但本轮健康巡检还没轮到它。大规模池子一轮巡检需要时间，这里不是故障。">
+            <div class="stat-label">待探测</div>
+            <div class="stat-value" id="statPending">0</div>
+          </div>
           <div class="stat-card">
             <div class="stat-label">独立IP</div>
             <div class="stat-value unique" id="statUniqueIP">0</div>
@@ -1656,6 +1660,7 @@
           document.getElementById('statAvailable').textContent = d.available;
           document.getElementById('statInUse').textContent = d.in_use;
           document.getElementById('statUnhealthy').textContent = d.unhealthy;
+          document.getElementById('statPending').textContent = d.pending || 0;
           document.getElementById('statUniqueIP').textContent = d.unique_ips;
           document.getElementById('statDedicated').textContent = d.dedicated || 0;
           document.getElementById('statSessions').textContent = d.active_sessions;

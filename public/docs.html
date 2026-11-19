@@ -134,6 +134,8 @@
       <a href="#dedicated">🏠 长效静态 IP</a>
       <a href="#rotate-report">🔄 换 IP 与状态上报</a>
       <a href="#manage">⚙️ 实例管理</a>
+      <a href="#stats-fields">📊 统计字段</a>
+      <a href="#perf">⚡ 性能边界</a>
       <a href="#whitelist-creds">🛡️ 白名单与账密</a>
       <a href="#config">📐 配置管理</a>
       <a href="#region">🗺️ 服务区配置</a>
@@ -303,7 +305,7 @@ curl -s {{API_BASE}}/api/job/3
         <tr><th>接口</th><th>方法</th><th>参数</th><th>说明</th></tr>
         <tr><td class="mono">/api/containers</td><td>GET</td><td>-</td><td>全部实例状态（port / ip / endpoint / health / pool_status / ip_risk / dedicated）</td></tr>
         <tr><td class="mono">/api/check</td><td>GET</td><td>-</td><td>服务与关键依赖检查（sing-box/wgcf 是否存在、池容量、可用数）</td></tr>
-        <tr><td class="mono">/api/stats</td><td>GET</td><td>-</td><td>实例统计汇总</td></tr>
+        <tr><td class="mono">/api/stats</td><td>GET</td><td>-</td><td>实例统计汇总（字段说明见下）</td></tr>
         <tr><td class="mono">/api/create</td><td>POST</td><td>{"count":N}</td><td>创建 N 个新实例</td></tr>
         <tr><td class="mono">/api/delete</td><td>POST</td><td>{"name"} 或 {"names":[]}</td><td>删除实例（固定绑定需 force=true）</td></tr>
         <tr><td class="mono">/api/rebuild</td><td>POST</td><td>{"name"} 或 {"names":[]}</td><td>重建实例（重新注册账号 + 轮换接入点）</td></tr>
@@ -311,6 +313,31 @@ curl -s {{API_BASE}}/api/job/3
         <tr><td class="mono">/api/stop</td><td>POST</td><td>{"name"} 或 {"names":[]}</td><td>停止实例</td></tr>
         <tr><td class="mono">/api/job/:id</td><td>GET</td><td>-</td><td>查询创建/重建/换 IP 任务的进度与日志</td></tr>
       </table>
+
+      <h2 id="stats-fields">📊 /api/stats 字段说明</h2>
+      <table>
+        <tr><th>字段</th><th>含义</th><th>接入时怎么用</th></tr>
+        <tr><td class="mono">total_instances</td><td>实例总数</td><td>池子规模</td></tr>
+        <tr><td class="mono">healthy_count</td><td>状态为 running 的实例数</td><td>判断池子是否满编</td></tr>
+        <tr><td class="mono">available</td><td>running 且未被固定绑定占用的数量</td><td>可用于调度的实例数</td></tr>
+        <tr><td class="mono">in_use</td><td>当前被固定绑定占用的实例数</td><td>业务侧独占实例数</td></tr>
+        <tr><td class="mono">unhealthy</td><td><b>真正失败</b>的实例（已停止，或连续探测失败被降级）</td><td><b>&gt;0 且持续两轮才是故障</b></td></tr>
+        <tr><td class="mono">pending</td><td>运行中但<b>本轮健康巡检还没轮到</b>的实例</td><td><b>不是故障</b>，大规模池子常驻几十个属正常</td></tr>
+        <tr><td class="mono">unique_ips</td><td>当前已知的不同出口地址数</td><td>接近 total_instances 说明出口隔离良好</td></tr>
+      </table>
+      <div class="tip"><b>pending 与 unhealthy 的区别很重要。</b>健康巡检每轮只探 <code>health_probe_batch</code> 个实例，184 个实例一轮要十几分钟，所以任何时候都有一批实例在排队等待探测——它们是 <code>pending</code>，不是坏了。早期版本把「还没探测」算成「不健康」，导致控制台在 0 和 10 之间反复跳，实际池子全好。</div>
+
+      <h2 id="perf">⚡ 性能边界（重要）</h2>
+      <p>本服务的数据面有两条可选路径，能力差别很大，接入前请按业务选：</p>
+      <table>
+        <tr><th></th><th>h2（Rust 原生，默认）</th><th>usque（QUIC 子进程）</th></tr>
+        <tr><td>单请求延迟</td><td>+30ms（直连 0.12s → 0.15s）</td><td>+20ms</td></tr>
+        <tr><td><b>单连接吞吐</b></td><td><b>0.1-0.35 MB/s（用户态 TCP 栈，受 H2 流窗口限制）</b></td><td><b>6-7 MB/s（内核 TCP 栈）</b></td></tr>
+        <tr><td><b>单端口并发</b></td><td><b>≤20 稳定；40+ 开始超时</b></td><td>受内核限制，远高于此</td></tr>
+        <tr><td>184 实例内存</td><td>30-45 MB</td><td>≈1 GB</td></tr>
+        <tr><td>进程数</td><td>2</td><td>185</td></tr>
+      </table>
+      <div class="tip"><b>选型建议：</b>API 调用、网页抓取、账号隔离这类<b>小请求</b>场景用 h2，省 95% 内存且延迟几乎无差；<b>大文件下载、视频、高并发单端口</b>必须用 usque（<code>WARP_NATIVE=quic</code>）。</div>
 
       <h2 id="whitelist-creds">🛡️ 白名单与账密</h2>
       <div class="endpoint"><span class="method">GET/POST</span><span class="path">/api/whitelist</span><span class="desc">白名单查询 / 增删（改动后自动热更新全部实例，出口 IP 不变）</span></div>
