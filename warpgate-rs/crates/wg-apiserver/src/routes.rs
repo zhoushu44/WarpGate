@@ -292,7 +292,16 @@ async fn handle_stats(State(st): State<AppState>) -> axum::response::Response {
         // console vocabulary
         "running_containers": running,
         "total_instances": total,
-        "available": running.saturating_sub(sessions),
+        // `available` is "instances that can take a new connection", NOT
+        // "instances minus sessions".
+        //
+        // Sticky sessions do not reserve an instance: several session ids can
+        // share one instance (the map only pins a sid to an instance, it does
+        // not exclude others). Subtracting the session count therefore went
+        // negative under real traffic — measured 2026-11-19 with 184 instances
+        // and 246 live sessions, `available: -62` while every sampled port
+        // answered 200 and no instance was marked `in_use`.
+        "available": running.saturating_sub(dedicated),
         "in_use": sessions,
         "unhealthy": unhealthy,
         // Running but not yet probed this rotation. Reported separately so the

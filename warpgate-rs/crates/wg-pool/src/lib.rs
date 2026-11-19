@@ -570,6 +570,20 @@ impl Manager {
         let Some(ucfg) = wg_store::UsqueConfig::read(&dir)? else {
             return Err(PoolError::InstanceError(idx, "缺少 usque.json".into()));
         };
+        // Release the old listeners before rebinding.
+        //
+        // `start_with_config` reuses the existing `Instance`, and
+        // `attach_dial` treats a non-empty listener list as "already bound"
+        // and returns early. So a restart against a *live* listener kept the
+        // stale one — bound to the dead tunnel — and the new tunnel was never
+        // wired to a port. The port kept accepting SOCKS5 then failing with
+        // "no connect request ack", while `/api/containers` reported healthy.
+        // Measured 2026-11-19 on warp-0: 10010 accepted handshakes and never
+        // relayed, plus `监听失败: Address already in use` on every restart
+        // attempt.
+        if let Some(inst) = self.get(idx).await {
+            Self::close_listeners(&inst).await;
+        }
         self.start_with_config(idx, ucfg, false).await.map(|_| ())
     }
 
@@ -2794,6 +2808,39 @@ mod tests {
                  never binds while the console reports the instance running"
             );
         }
+    }
+
+    /// Restarting an instance must release its old listeners first.
+    ///
+    /// `start_with_config` reuses the existing `Instance`, and `attach_dial`
+    /// returns early when the listener list is non-empty ("already bound"). A
+    /// restart against a live listener therefore kept the stale listener —
+    /// still wired to the dead tunnel — and the fresh tunnel never reached a
+    /// port.
+    ///
+    /// Measured 2026-11-19 (warp-0, port 10010): SOCKS5 handshakes were
+    /// accepted and then hung with "no connect request ack", `/api/containers`
+    /// said `healthy`, and every restart logged `监听失败: Address already in
+    /// use`. 183 of 184 ports were fine, which is exactly what makes a silent
+    /// single-port failure easy to miss.
+    #[test]
+    fn restarting_an_instance_releases_its_listeners() {
+        let src = include_str!("lib.rs");
+        let body = src
+            .split("pub async fn start_existing")
+            .nth(1)
+            .and_then(|s| s.split("/// Cold-create").next())
+            .expect("start_existing must exist");
+        assert!(
+            body.contains("Self::close_listeners"),
+            "start_existing must close the previous listeners before rebinding"
+        );
+        // Match the *call*, not the mention inside the doc comment above it.
+        let close = body.find("Self::close_listeners").unwrap();
+        let start = body
+            .find("self.start_with_config(idx, ucfg, false)")
+            .expect("start_with_config call must exist");
+        assert!(close < start, "close the listeners before starting");
     }
 
     /// A persisted `stopped` must not veto a start request.

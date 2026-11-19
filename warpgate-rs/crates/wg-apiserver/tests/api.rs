@@ -201,6 +201,23 @@ async fn unprobed_instances_are_pending_not_unhealthy() {
     );
 }
 
+/// `available` must never go negative when sessions outnumber instances.
+///
+/// Sticky sessions do not reserve an instance — several session ids can share
+/// one. Deriving `available` as `running - sessions` therefore went negative
+/// under real traffic: 184 instances, 246 live sessions, `available: -62`,
+/// while every sampled port answered 200 and no instance was marked `in_use`.
+#[tokio::test]
+async fn available_never_goes_negative() {
+    let (app, _t) = app_with_one_instance("secret").await;
+    let (status, body) = call(&app, get_with_key("/api/stats", "secret")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(
+        body["data"]["available"].as_i64().unwrap_or(-1) >= 0,
+        "available must not be derived by subtracting sessions: {body}"
+    );
+}
+
 #[tokio::test]
 async fn whitelisted_ip_bypasses_the_key() {
     // Explicitly whitelist loopback so the rule is exercised, not assumed.
