@@ -1943,6 +1943,41 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG\n\
             let c = cancel.clone();
             tokio::spawn(async move { m.health_loop(c).await });
         }
+        {
+            let m = self.clone();
+            let c = cancel.clone();
+            tokio::spawn(async move { m.reconcile_loop(c).await });
+        }
+    }
+
+    /// Keep the pool at `resident_count`.
+    ///
+    /// `reconcile_resident` used to run only from `POST /api/config`, so any
+    /// shortfall after that one call stayed forever: creating accounts is slow
+    /// (registration plus a fresh tunnel each, throttled to
+    /// `max_concurrent_create`), and Cloudflare's registration API stops
+    /// handing out accounts after a burst — `changed: 6` per call, then nothing.
+    /// With no retry loop the pool sat at 197 of a requested 234 for an hour,
+    /// and only a manual POST moved it (measured 2026-11-20).
+    ///
+    /// Retrying every 60 s also rides out the throttling window instead of
+    /// hammering it: each round makes whatever progress the API allows.
+    async fn reconcile_loop(self: &Arc<Self>, cancel: tokio_util::sync::CancellationToken) {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Skip the immediate first tick: boot already reconciled, and a
+        // second pass right away would double-register during bring-up.
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = interval.tick() => {
+                    if let Err(e) = self.reconcile_resident().await {
+                        tracing::warn!(error = %e, "自动补齐实例失败");
+                    }
+                }
+            }
+        }
     }
 
     /// Sweep the pool: probe every instance, and restart the engines of those
@@ -2848,6 +2883,37 @@ mod tests {
                  never binds while the console reports the instance running"
             );
         }
+    }
+
+    /// Growing the pool must not depend on the caller asking again.
+    ///
+    /// `reconcile_resident` used to run only from `POST /api/config`. Creating
+    /// an account costs a registration plus a fresh tunnel, throttled to
+    /// `max_concurrent_create`, and Cloudflare's registration API stops
+    /// issuing accounts after a burst — so one call made partial progress and
+    /// the shortfall stayed forever.
+    ///
+    /// Measured 2026-11-20: asking for 234 reached 197 and then sat there for
+    /// an hour with no error; a manual POST nudged it to 203 (`changed: 6`).
+    #[test]
+    fn reconcile_keeps_running_after_boot() {
+        let src = include_str!("lib.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+
+        let loops = prod
+            .split("pub fn start_loops")
+            .nth(1)
+            .and_then(|s| s.split("/// Sweep the pool").next())
+            .expect("start_loops must exist");
+        assert!(
+            loops.contains("reconcile_loop"),
+            "the pool needs a periodic reconcile, not just the one from \
+             POST /api/config"
+        );
+        assert!(
+            prod.contains("async fn reconcile_loop"),
+            "and that loop must exist"
+        );
     }
 
     /// The live ceiling must be settable, and must gate `set_resident`.
