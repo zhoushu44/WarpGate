@@ -196,6 +196,18 @@ pub struct Manager {
     /// can change it without rebuilding the Manager; `RESIDENT_UNSET` means
     /// "fall back to cfg.resident_count".
     resident_override: std::sync::atomic::AtomicI64,
+    /// Live `max_instances`, same idea as `resident_override`.
+    ///
+    /// `POST /api/config` serialises the *startup* `cfg`, merges the patch into
+    /// it and validates `resident_count <= max_instances`. Without a live
+    /// override, raising the ceiling and the count in one request always
+    /// failed validation (the patch was checked against the old 200), and
+    /// raising `max_instances` alone silently reverted on the next request
+    /// because the merge started from the stale value again. Measured
+    /// 2026-11-20: `{"resident_count":234,"max_instances":250}` reported
+    /// `resident_count: 234` in one response and then `超出范围 [0,200]` on the
+    /// next, with the runtime stuck at 191.
+    max_instances_override: std::sync::atomic::AtomicI64,
     /// Where this Manager was loaded from, so config edits can be written back.
     /// A relative path would resolve against the process CWD, which is not
     /// where the service file points.
@@ -287,6 +299,7 @@ impl Manager {
             create_fn: RwLock::new(None),
             probe_cursor: std::sync::atomic::AtomicUsize::new(0),
             resident_override: std::sync::atomic::AtomicI64::new(RESIDENT_UNSET),
+            max_instances_override: std::sync::atomic::AtomicI64::new(RESIDENT_UNSET),
             config_path,
             live_whitelist: RwLock::new(None),
             nets: Arc::new(std::sync::RwLock::new(nets)),
@@ -336,9 +349,36 @@ impl Manager {
         if n < 0 {
             return Err(PoolError::Config("resident_count 不能为负".into()));
         }
+        let cap = self.max_instances();
+        if cap > 0 && n > cap {
+            return Err(PoolError::Config(format!(
+                "resident_count={n} 超出 max_instances={cap}"
+            )));
+        }
         self.resident_override
             .store(n, std::sync::atomic::Ordering::Relaxed);
         self.reconcile_resident().await
+    }
+
+    /// The effective `max_instances`, honouring a runtime override.
+    pub fn max_instances(&self) -> i64 {
+        let v = self
+            .max_instances_override
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if v == RESIDENT_UNSET {
+            self.cfg.max_instances
+        } else {
+            v
+        }
+    }
+
+    /// Raise/lower the live ceiling without touching the filesystem.
+    ///
+    /// Separate from `resident_count` so a caller can lift the cap first and
+    /// only then grow into it — the two have to be settable in either order.
+    pub fn set_max_instances(&self, n: i64) {
+        self.max_instances_override
+            .store(n, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn base(&self) -> &std::path::Path {
@@ -2808,6 +2848,41 @@ mod tests {
                  never binds while the console reports the instance running"
             );
         }
+    }
+
+    /// The live ceiling must be settable, and must gate `set_resident`.
+    ///
+    /// `POST /api/config` merges into the *startup* config and validates
+    /// `resident_count <= max_instances`. Because nothing kept the ceiling
+    /// live, raising both at once always failed, and raising the ceiling alone
+    /// reverted on the next request.
+    ///
+    /// Measured 2026-11-20: `{"resident_count":234,"max_instances":250}`
+    /// answered `resident_count: 234` once, then `超出范围 [0,200]` forever
+    /// after, with the pool stuck at 191 of the requested 234.
+    #[test]
+    fn the_live_instance_ceiling_is_settable() {
+        let src = include_str!("lib.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+
+        assert!(
+            prod.contains("pub fn max_instances(&self)"),
+            "the ceiling needs a live accessor"
+        );
+        assert!(
+            prod.contains("pub fn set_max_instances(&self"),
+            "and a live setter, or a raise reverts on the next request"
+        );
+        // set_resident must consult the live ceiling, not the boot-time one.
+        let body = prod
+            .split("pub async fn set_resident")
+            .nth(1)
+            .and_then(|s| s.split("/// The effective `max_instances`").next())
+            .expect("set_resident must exist");
+        assert!(
+            body.contains("self.max_instances()"),
+            "set_resident must check the live ceiling"
+        );
     }
 
     /// Restarting an instance must release its old listeners first.

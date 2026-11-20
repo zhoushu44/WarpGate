@@ -194,6 +194,16 @@ async fn handle_set_config(
 ) -> axum::response::Response {
     // Merge the patch into the live config, then validate before committing.
     let mut v = serde_json::to_value(&*st.cfg).unwrap_or(json!({}));
+    // Start from the *live* values, not the values loaded at startup.
+    //
+    // `st.cfg` is the boot-time config and never changes, so a merge rooted in
+    // it silently reverted every earlier edit: setting `max_instances` to 250
+    // was written to disk, then the next request merged from 200 again and
+    // validation rejected `resident_count` > 200 forever.
+    if let Some(o) = v.as_object_mut() {
+        o.insert("resident_count".into(), json!(st.mgr.resident()));
+        o.insert("max_instances".into(), json!(st.mgr.max_instances()));
+    }
     if let (Some(base), Some(patch)) = (v.as_object_mut(), body.rest.as_object()) {
         for (k, val) in patch {
             base.insert(k.clone(), val.clone());
@@ -222,6 +232,10 @@ async fn handle_set_config(
     }
 
     // `resident_count` is the one field that can be reconciled live.
+    //
+    // Apply the ceiling first: a request may raise both at once, and
+    // `set_resident` refuses a count above the current cap.
+    st.mgr.set_max_instances(parsed.max_instances);
     let changed = match st.mgr.set_resident(parsed.resident_count).await {
         Ok(n) => n,
         Err(e) => return internal(format!("应用配置失败: {e}")),
