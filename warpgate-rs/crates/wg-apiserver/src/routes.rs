@@ -174,6 +174,17 @@ async fn handle_login(
 
 async fn handle_get_config(State(st): State<AppState>) -> axum::response::Response {
     let mut v = serde_json::to_value(&*st.cfg).unwrap_or(json!({}));
+    // Report the live values, not the boot-time ones.
+    //
+    // `st.cfg` is what the process started with. `resident_count` and
+    // `max_instances` are changed at runtime through `POST /api/config`, so
+    // echoing `st.cfg` made a successful edit look like it had been rejected:
+    // the POST answered `resident_count: 234` while this GET still said 184,
+    // and the pool kept growing as requested. Measured 2026-11-20.
+    if let Some(o) = v.as_object_mut() {
+        o.insert("resident_count".into(), json!(st.mgr.resident()));
+        o.insert("max_instances".into(), json!(st.mgr.max_instances()));
+    }
     // Never echo the secrets.
     if let Some(o) = v.as_object_mut() {
         o.insert("api_key".into(), json!(crate::auth::mask(&st.cfg.api_key)));
